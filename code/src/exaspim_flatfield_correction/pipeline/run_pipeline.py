@@ -22,7 +22,10 @@ from exaspim_flatfield_correction.flatfield import (
     transform_basic,
     subtract_bkg,
 )
-from exaspim_flatfield_correction.splinefit import proj, get_correction
+from exaspim_flatfield_correction.splinefit import (
+    percentile_project,
+    get_correction_func,
+)
 from exaspim_flatfield_correction.background import estimate_bkg
 from exaspim_flatfield_correction.utils.mask_utils import upscale_mask_nearest
 from exaspim_flatfield_correction.utils.zarr_utils import (
@@ -361,9 +364,13 @@ def flatfield_fitting(
     del low_res, nan_med
 
     percentile = config.get("percentile", 99)
-    xy_proj = proj(low_res_clipped, axis=0, percentile=percentile)
+    xy_proj = percentile_project(
+        low_res_clipped, axis=0, percentile=percentile
+    )
     xy_proj = gaussian_filter(xy_proj, sigma=config.get("gaussian_sigma", 2))
-    yz_proj = proj(low_res_clipped, axis=2, percentile=percentile)
+    yz_proj = percentile_project(
+        low_res_clipped, axis=2, percentile=percentile
+    )
     yz_proj = gaussian_filter(yz_proj, sigma=config.get("gaussian_sigma", 2))
 
     del low_res_clipped
@@ -382,7 +389,7 @@ def flatfield_fitting(
     )
     mask_upscaled = da.from_zarr(mask_path, "0").squeeze()
 
-    fit_x, median_xy = get_correction(
+    fit_x, median_xy = get_correction_func(
         xy_proj,
         mask_2d_xy,
         axis=0,
@@ -395,7 +402,7 @@ def flatfield_fitting(
     else:
         correction_x = fit_x.reshape(1, 1, -1)
         corrected = da.where(mask_upscaled, full_res / correction_x, full_res)
-        fit_z, median_yz = get_correction(
+        fit_z, median_yz = get_correction_func(
             yz_proj,
             mask_2d_yz,
             axis=1,
