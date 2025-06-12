@@ -1,0 +1,2 @@
+# This file tells pip/setuptools where to find the source code for the package
+src/

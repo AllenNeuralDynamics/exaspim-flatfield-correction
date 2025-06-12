@@ -1,0 +1,8 @@
+#!/usr/bin/env bash
+set -ex
+
+git clone https://github.com/AllenNeuralDynamics/aind-data-transfer.git
+cd aind-data-transfer
+git checkout feat-skip-empty-chunks
+pip install .[imaging] 
+pip install hdf5plugin kerchunk==0.2.6 s3fs==2025.5.1 dask==2025.5.1 distributed==2025.5.1 boto3[crt]==1.37.2 ujson dask-image matplotlib zarr==2.18.7

@@ -1,0 +1,335 @@
+import io
+import re
+from pathlib import Path
+
+import boto3
+import tifffile
+import numpy as np
+import dask.array as da
+from skimage.transform import resize as _resize
+from botocore.exceptions import ClientError
+
+
+def compose_image(
+    img: list[da.Array], rows: int = 3, cols: int = 5
+) -> da.Array:
+    """
+    Compose a grid image from a list of 3D Dask arrays (C, Y, X).
+
+    Parameters
+    ----------
+    img : list of dask.array.Array
+        List of 3D Dask arrays to compose (C, Y, X). All arrays must have
+        the same shape.
+    rows : int, optional
+        Number of rows in the composed image grid. Default is 3.
+    cols : int, optional
+        Number of columns in the composed image grid. Default is 5.
+
+    Returns
+    -------
+    dask.array.Array
+        Composed image as a Dask array.
+    """
+    img_composed = da.empty(
+        (
+            img[0].shape[0],
+            img[0].shape[1] * rows,
+            img[0].shape[2] * cols,
+        ),
+        chunks=img[0].chunksize[-3:],
+        dtype=np.uint16,
+    )
+
+    i = 0
+    y = 0
+    x = img[0].shape[2] * (cols - 1)
+    for c in range(cols - 1, -1, -1):
+        x = img[0].shape[2] * c
+        for r in range(rows):
+            y = img[0].shape[1] * r
+            img_composed[
+                :, y : y + img[0].shape[1], x : x + img[0].shape[2]
+            ] = img[i]
+            i += 1
+    return img_composed
+
+
+def get_parent_s3_path(s3_url: str) -> str:
+    """
+    Extract the parent path of an S3 object.
+
+    Parameters
+    ----------
+    s3_url : str
+        The S3 URL in the format 's3://bucket-name/path/to/object'.
+
+    Returns
+    -------
+    str
+        The parent S3 path in the format 's3://bucket-name/path/to', or the
+        bucket root if no parent exists.
+
+    Raises
+    ------
+    ValueError
+        If the provided URL is not a valid S3 URL or does not have a parent.
+    """
+    if not s3_url.startswith("s3://"):
+        raise ValueError("Provided URL is not a valid S3 URL.")
+
+    # Remove 's3://' and split into bucket name and object path
+    parts = s3_url[5:].split("/", 1)
+    if len(parts) != 2 or not parts[1]:
+        raise ValueError("S3 URL does not contain a valid object path.")
+
+    bucket_name, object_path = parts
+
+    # Remove trailing slash if present
+    object_path = object_path.rstrip("/")
+
+    # Check if there's a parent path to extract
+    if "/" not in object_path:
+        # No parent path available
+        return f"s3://{bucket_name}"
+
+    # Extract parent path
+    parent_path = "/".join(object_path.rsplit("/", 1)[:-1])
+
+    return f"s3://{bucket_name}/{parent_path}"
+
+
+def check_s3_path_exists(s3_url: str) -> bool:
+    """
+    Check if a path exists on S3.
+
+    Parameters
+    ----------
+    s3_url : str
+        S3 URL in the format 's3://bucket/key'.
+
+    Returns
+    -------
+    bool
+        True if the path exists, False otherwise.
+    """
+    s3 = boto3.client("s3")
+    if not s3_url.startswith("s3://") or "/" not in s3_url[5:]:
+        return False
+    s3_url_parts = s3_url.replace("s3://", "").split("/", 1)
+    if len(s3_url_parts) != 2:
+        return False
+    bucket = s3_url_parts[0]
+    path = s3_url_parts[1]
+    try:
+        s3.head_object(Bucket=bucket, Key=path)
+        return True
+    except ClientError:
+        return False
+
+
+def get_abs_path(relative_path: str) -> str:
+    """
+    Get an absolute path from a path relative to the script location.
+
+    Parameters
+    ----------
+    relative_path : str
+        Path relative to the project root or script location.
+
+    Returns
+    -------
+    str
+        Absolute path as a string.
+    """
+    return str((Path(__file__).parent.parent.parent / relative_path).resolve())
+
+
+def read_bkg_image(s3_url: str) -> np.ndarray:
+    """
+    Read a TIFF image from an S3 URL and return as a numpy array.
+
+    Parameters
+    ----------
+    s3_url : str
+        S3 URL to the TIFF image.
+
+    Returns
+    -------
+    np.ndarray
+        Image loaded as a numpy array.
+
+    Raises
+    ------
+    ValueError
+        If the S3 URL is malformed.
+    """
+    # Parse the S3 URL
+    if not s3_url.startswith("s3://") or "/" not in s3_url[5:]:
+        raise ValueError(f"Malformed S3 URL: {s3_url}")
+    s3_url_parts = s3_url.replace("s3://", "").split("/", 1)
+    if len(s3_url_parts) != 2:
+        raise ValueError(f"Malformed S3 URL: {s3_url}")
+    bucket = s3_url_parts[0]
+    path = s3_url_parts[1]
+    s3 = boto3.client("s3")
+    response = s3.get_object(Bucket=bucket, Key=path)
+    tiff_file_content = response["Body"].read()
+    numpy_array = tifffile.imread(io.BytesIO(tiff_file_content))
+    return numpy_array
+
+
+def get_bkg_path(raw_tile_path: str) -> str:
+    """
+    Get the S3 path to the background image for a given raw tile path.
+
+    Parameters
+    ----------
+    raw_tile_path : str
+        Path to the raw tile (S3 or local).
+
+    Returns
+    -------
+    str
+        S3 path to the background image.
+
+    Raises
+    ------
+    FileNotFoundError
+        If no background image is found for the tile.
+    """
+    regex1 = re.compile(r"tile_x_\d+_y_\d+_z_\d+_ch_\d+")
+    regex2 = re.compile(r"tile_x_\d+_y_\d+_z_\d+")
+    regex3 = re.compile(r"tile_\d+_ch_\d+")
+
+    p = Path(raw_tile_path).stem
+
+    m = regex1.match(p)
+    if m:
+        match = m.group(0)
+        bkg_tile = f"bkg_{match}.tiff"
+        bkg_path = (
+            get_parent_s3_path(get_parent_s3_path(raw_tile_path))
+            + "/derivatives/"
+            + bkg_tile
+        )
+        if check_s3_path_exists(bkg_path):
+            return bkg_path
+
+    m = regex2.match(p)
+    if m:
+        match = m.group(0)
+        bkg_tile = f"bkg_{match}.tiff"
+        bkg_path = (
+            get_parent_s3_path(get_parent_s3_path(raw_tile_path))
+            + "/derivatives/"
+            + bkg_tile
+        )
+        if check_s3_path_exists(bkg_path):
+            return bkg_path
+
+    m = regex3.match(p)
+    if m:
+        match = m.group(0)
+        bkg_tile = f"{match}_background_collection.tiff"
+        bkg_path = (
+            get_parent_s3_path(get_parent_s3_path(raw_tile_path))
+            + "/derivatives/"
+            + bkg_tile
+        )
+        if check_s3_path_exists(bkg_path):
+            return bkg_path
+
+    raise FileNotFoundError(
+        f"Could not find background image for tile {raw_tile_path}"
+    )
+
+
+def resize(
+    im: np.ndarray, shape: tuple[int, ...], order: int = 3
+) -> np.ndarray:
+    """
+    Resize a numpy array to a new shape using skimage.transform.resize.
+
+    Parameters
+    ----------
+    im : np.ndarray
+        Input image array.
+    shape : tuple of int
+        Desired output shape.
+    order : int, optional
+        Interpolation order (0=nearest, 1=linear, 3=bicubic, etc).
+        Default is 3.
+
+    Returns
+    -------
+    np.ndarray
+        Resized image array.
+    """
+    return _resize(
+        im,
+        shape,
+        anti_aliasing=False,
+        mode="reflect",
+        clip=True,
+        order=order,  # bicubic interpolation
+        preserve_range=True,
+    )
+
+
+def resize_dask(
+    image: da.Array,
+    scale_factor: float,
+    order: int = 1,
+    output_chunks: tuple[int, int, int] = (128, 256, 256),
+) -> da.Array:
+    """
+    Resize a 3D Dask array using an affine transformation.
+
+    Parameters
+    ----------
+    image : dask.array.Array
+        The input 3D Dask array to be resized.
+    scale_factor : float
+        The scaling factor for each axis. For example, 2.0 will double the
+        size.
+    order : int, optional
+        The order of the interpolation. Use order=0 for nearest-neighbor
+        (good for binarymasks), or higher orders for smoother results.
+        Default is 1 (linear interpolation).
+    output_chunks : tuple, optional
+        The desired chunk size for the output Dask array.
+        Default is (128, 256, 256).
+
+    Returns
+    -------
+    dask.array.Array
+        The resized Dask array.
+    """
+    from dask_image.ndinterp import affine_transform
+
+    # Construct a 4x4 homogeneous affine transformation matrix.
+    # The matrix maps output coordinates into input coordinates.
+    # Scaling factors are inverted because of this coordinate mapping.
+    matrix = np.array(
+        [
+            [1 / scale_factor, 0, 0, 0],
+            [0, 1 / scale_factor, 0, 0],
+            [0, 0, 1 / scale_factor, 0],
+            [0, 0, 0, 1],
+        ]
+    )
+
+    # Calculate the new output shape (assumes image has at least 3 dimensions).
+    new_shape = tuple(int(dim * scale_factor) for dim in image.shape[:3])
+
+    # Apply the affine transformation.
+    resized_image = affine_transform(
+        image,
+        matrix=matrix,
+        order=order,
+        output_shape=new_shape,
+        output_chunks=output_chunks,
+    )
+
+    return resized_image
