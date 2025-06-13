@@ -13,6 +13,7 @@ from numcodecs import blosc
 import tifffile
 import dask
 import dask.array as da
+from dask.distributed import performance_report
 from distributed import Client, LocalCluster
 from scipy.ndimage import gaussian_filter
 from dask_image.ndfilters import gaussian_filter as gaussian_filter_dask
@@ -142,9 +143,7 @@ def get_results_dir() -> str:
     """
     return os.environ.get(
         "EXASPIM_RESULTS_DIR",
-        os.path.abspath(
-            os.path.join(os.path.dirname(__file__), "../../../results")
-        ),
+        "/results",
     )
 
 
@@ -609,6 +608,26 @@ def parse_and_validate_args() -> argparse.Namespace:
     return args
 
 
+def create_mask_path(out_zarr_path: str) -> str:
+    """
+    Create the corresponding output mask path for 
+    the input zarr image.
+
+    Parameters
+    -------
+    out_zarr_path: str
+        The output path for the corrected zarr dataset
+
+    Returns
+    -------
+    str
+        The mask path for the corrected zarr dataset
+    """
+    out_zarr_folder = Path(out_zarr_path).name
+    out_mask_path = out_zarr_path.replace(out_zarr_folder, f"mask/{out_zarr_folder}")
+    return out_mask_path
+
+
 def main() -> None:
     """
     Main entry point for the flatfield correction pipeline.
@@ -630,9 +649,6 @@ def main() -> None:
     binned_channel = params["binned_channel"]
 
     set_dask_config()
-
-    start_date_time = datetime.now()
-
     client = Client(
         LocalCluster(
             processes=False, n_workers=1, threads_per_worker=args.num_workers
@@ -640,89 +656,96 @@ def main() -> None:
     )
     _LOGGER.info(f"Dask client: {client}")
 
-    out_mask_path = out_path.replace("/SPIM.ome.zarr", "/mask/SPIM.ome.zarr")
+    out_mask_path = create_mask_path(out_path)
+    
+    start_date_time = datetime.now()
     data_process = create_processing_metadata(
         args, tile_paths[0], out_path, start_date_time, res
     )
+    
+    # TODO: make a parameter
     binned_res = "0"
 
-    for tile_path in tile_paths:
-        tile_name = Path(tile_path).name
-        _LOGGER.info(f"Processing tile: {tile_name}")
-        try:
-            is_binned_channel, resolution = get_channel_resolution(
-                tile_name, binned_channel, binned_res, res
-            )
-            _LOGGER.info(f"{tile_name} is binned: {is_binned_channel}")
+    with performance_report(
+        filename=os.path.join(get_results_dir(), "dask-report.html")
+    ):
+        for tile_path in tile_paths:
+            tile_name = Path(tile_path).name
+            _LOGGER.info(f"Processing tile: {tile_name}")
+            try:
+                is_binned_channel, resolution = get_channel_resolution(
+                    tile_name, binned_channel, binned_res, res
+                )
+                _LOGGER.info(f"{tile_name} is binned: {is_binned_channel}")
 
-            z = zarr.open(tile_path, mode="r")
-            coordinate_transformations = parse_ome_zarr_transformations(
-                z, resolution
-            )
-            _LOGGER.info(
-                f"Coordinate transformations: {coordinate_transformations}"
-            )
-
-            full_res = da.from_zarr(z[resolution]).squeeze().astype(np.float32)
-            _LOGGER.info(f"Full resolution array shape: {full_res.shape}")
-
-            bkg = None
-            if not args.skip_bkg_sub:
-                _LOGGER.info("Performing background subtraction")
-                full_res, bkg = background_subtraction(
-                    tile_path, full_res, z, is_binned_channel
+                z = zarr.open(tile_path, mode="r")
+                coordinate_transformations = parse_ome_zarr_transformations(
+                    z, resolution
+                )
+                _LOGGER.info(
+                    f"Coordinate transformations: {coordinate_transformations}"
                 )
 
-            if not args.skip_flat_field:
-                if method == "reference":
-                    corrected = flatfield_reference(
-                        full_res, args.flatfield_path
+                full_res = da.from_zarr(z[resolution]).squeeze().astype(np.float32)
+                _LOGGER.info(f"Full resolution array shape: {full_res.shape}")
+
+                bkg = None
+                if not args.skip_bkg_sub:
+                    _LOGGER.info("Performing background subtraction")
+                    full_res, bkg = background_subtraction(
+                        tile_path, full_res, z, is_binned_channel
                     )
-                elif method == "basicpy":
-                    corrected = flatfield_basicpy(
-                        full_res, z, is_binned_channel, bkg
-                    )
-                elif method == "fitting":
-                    fitting_config = get_fitting_config()
-                    corrected = flatfield_fitting(
-                        full_res,
-                        z,
-                        is_binned_channel,
-                        args.mask_dir,
-                        tile_name,
-                        out_mask_path,
-                        coordinate_transformations,
-                        args.overwrite,
-                        args.n_levels,
-                        fitting_config,
-                    )
+
+                if not args.skip_flat_field:
+                    if method == "reference":
+                        corrected = flatfield_reference(
+                            full_res, args.flatfield_path
+                        )
+                    elif method == "basicpy":
+                        corrected = flatfield_basicpy(
+                            full_res, z, is_binned_channel, bkg
+                        )
+                    elif method == "fitting":
+                        fitting_config = get_fitting_config()
+                        corrected = flatfield_fitting(
+                            full_res,
+                            z,
+                            is_binned_channel,
+                            args.mask_dir,
+                            tile_name,
+                            out_mask_path,
+                            coordinate_transformations,
+                            args.overwrite,
+                            args.n_levels,
+                            fitting_config,
+                        )
+                    else:
+                        _LOGGER.error(f"Invalid method: {method}")
+                        raise ValueError(f"Invalid method: {method}")
                 else:
-                    _LOGGER.error(f"Invalid method: {method}")
-                    raise ValueError(f"Invalid method: {method}")
-            else:
-                corrected = full_res
+                    corrected = full_res
 
-            corrected = corrected.astype(np.uint16)
-            _LOGGER.info(f"Corrected array dtype: {corrected.dtype}")
+                corrected = corrected.astype(np.uint16)
+                _LOGGER.info(f"Corrected array dtype: {corrected.dtype}")
 
-            t0 = time.time()
-            store_ome_zarr(
-                corrected,
-                out_path.rstrip("/") + f"/{tile_name}",
-                args.n_levels,
-                coordinate_transformations["scale"][-3:],
-                coordinate_transformations["translation"],
-                overwrite=args.overwrite,
-            )
-            _LOGGER.info(f"Storing OME-Zarr took {time.time() - t0:.2f}s")
+                t0 = time.time()
+                store_ome_zarr(
+                    corrected,
+                    out_path.rstrip("/") + f"/{tile_name}",
+                    args.n_levels,
+                    coordinate_transformations["scale"][-3:],
+                    coordinate_transformations["translation"],
+                    overwrite=args.overwrite,
+                )
+                _LOGGER.info(f"Storing OME-Zarr took {time.time() - t0:.2f}s")
 
-            data_process.end_date_time = datetime.now()
-            save_metadata(data_process, out_path, tile_name, tile_path)
-        except Exception as e:
-            _LOGGER.error(
-                f"Error processing tile {tile_name}: {e}", exc_info=True
-            )
-            raise
+                data_process.end_date_time = datetime.now()
+                save_metadata(data_process, out_path, tile_name, tile_path)
+            except Exception as e:
+                _LOGGER.error(
+                    f"Error processing tile {tile_name}: {e}", exc_info=True
+                )
+                raise
 
 
 if __name__ == "__main__":
