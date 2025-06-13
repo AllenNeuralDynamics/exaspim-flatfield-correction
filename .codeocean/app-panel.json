@@ -1,0 +1,43 @@
+{
+	"version": 1,
+	"parameters": [
+		{
+			"id": "GyHrbd3pb7j8PYXM",
+			"name": "zarr",
+			"type": "text",
+			"value_type": "string"
+		},
+		{
+			"id": "JrqFAdKAMvKn9LCO",
+			"name": "output",
+			"type": "text",
+			"value_type": "string"
+		},
+		{
+			"id": "knZxldRIEPB4tg7g",
+			"name": "resolution level",
+			"type": "text",
+			"value_type": "string"
+		},
+		{
+			"id": "l0ea44YX6xnx0iCy",
+			"name": "method",
+			"type": "text",
+			"value_type": "string",
+			"default_value": "fitting"
+		},
+		{
+			"id": "O4RXFXWZzEDOmnAv",
+			"name": "flatfield-path",
+			"type": "text",
+			"value_type": "string"
+		},
+		{
+			"id": "aNYbSSHFxszGaULJ",
+			"name": "num-workers",
+			"type": "text",
+			"value_type": "string",
+			"default_value": "16"
+		}
+	]
+}
