@@ -1,12 +1,6 @@
 #!/usr/bin/env bash
 set -ex
 
-git clone https://github.com/AllenNeuralDynamics/aind-data-transfer.git
-cd aind-data-transfer
-git checkout feat-skip-empty-chunks
-pip install .[imaging] 
-cd ..
-
 git clone https://github.com/AllenNeuralDynamics/exaspim-flatfield-correction.git
 cd exaspim-flatfield-correction/code
 pip install .
