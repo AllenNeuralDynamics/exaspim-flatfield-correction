@@ -38,6 +38,12 @@
 			"type": "text",
 			"value_type": "string",
 			"default_value": "16"
+		},
+		{
+			"id": "NQNXjFGST4vZIt6Z",
+			"name": "mask-dir",
+			"type": "text",
+			"value_type": "string"
 		}
 	]
 }

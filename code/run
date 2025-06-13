@@ -13,10 +13,10 @@ python -u -m exaspim_flatfield_correction.pipeline.run_pipeline \
 --output "$2" \
 --res "$3" \
 --method "$4" \
---overwrite \
 --flatfield-path "$5" \
 --num-workers "$6" \
---mask-dir "/data/masks" \
---n-levels 7
+--mask-dir "$7" \
+--n-levels 7 \
+--overwrite
 
 echo "Done!"
