@@ -5,4 +5,17 @@ git clone https://github.com/AllenNeuralDynamics/aind-data-transfer.git
 cd aind-data-transfer
 git checkout feat-skip-empty-chunks
 pip install .[imaging] 
-pip install hdf5plugin kerchunk==0.2.6 s3fs==2025.5.1 dask==2025.5.1 distributed==2025.5.1 boto3[crt]==1.37.2 ujson dask-image matplotlib zarr==2.18.7
+cd ..
+
+git clone https://github.com/AllenNeuralDynamics/exaspim-flatfield-correction.git
+cd exaspim-flatfield-correction/code
+pip install .
+cd ../..
+
+VERSION=4.100.3
+mkdir /.code-server
+cd /.code-server
+curl -fL "https://github.com/coder/code-server/releases/download/v$VERSION/code-server-$VERSION-linux-amd64.tar.gz" \
+  | tar -xz
+ln -s /.code-server/code-server-$VERSION-linux-amd64/bin/code-server  /usr/bin/code-server
+cd -
