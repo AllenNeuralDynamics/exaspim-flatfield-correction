@@ -8,7 +8,7 @@ export MALLOC_TRIM_THRESHOLD_=0
 
 # This is the master script for the capsule. When you click "Reproducible Run", the code in this file will execute.
 
-python -u run_pipeline.py \
+python -u -m exaspim_flatfield_correction.pipeline.run_pipeline \
 --zarr "$1" \
 --output "$2" \
 --res "$3" \
