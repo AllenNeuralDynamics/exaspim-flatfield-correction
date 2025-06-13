@@ -40,8 +40,8 @@ def create_processing_metadata(
         "code_url": "https://codeocean.allenneuraldynamics.org/capsule/2321427/tree",
         "parameters": {
             "method": args.method,
-            "do_flat_field": args.do_flat_field,
-            "do_bkg_sub": args.do_bkg_sub,
+            "skip_flat_field": args.skip_flat_field,
+            "skip_bkg_sub": args.skip_bkg_sub,
             "resolution": res,
             "overwrite": args.overwrite,
             "flatfield_path": args.flatfield_path,
