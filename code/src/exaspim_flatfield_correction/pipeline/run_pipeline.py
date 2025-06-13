@@ -402,6 +402,7 @@ def flatfield_fitting(
     else:
         correction_x = fit_x.reshape(1, 1, -1)
         corrected = da.where(mask_upscaled, full_res / correction_x, full_res)
+
         fit_z, median_yz = get_correction_func(
             yz_proj,
             mask_2d_yz,
@@ -414,6 +415,7 @@ def flatfield_fitting(
         corrected = da.where(
             mask_upscaled, corrected / correction_z, corrected
         )
+
         _LOGGER.info(f"median xy: {median_xy}")
         global_factor = (
             config.get("global_factor_binned", 9000)
@@ -424,6 +426,7 @@ def flatfield_fitting(
             mask_upscaled, corrected * (global_factor / median_xy), corrected
         )
         corrected = da.clip(corrected, 0, 2**16 - 1)
+
     return corrected
 
 
@@ -632,7 +635,7 @@ def main() -> None:
 
     client = Client(
         LocalCluster(
-            processes=True, n_workers=args.num_workers, threads_per_worker=1
+            processes=False, n_workers=1, threads_per_worker=args.num_workers
         )
     )
     _LOGGER.info(f"Dask client: {client}")
@@ -720,3 +723,7 @@ def main() -> None:
                 f"Error processing tile {tile_name}: {e}", exc_info=True
             )
             raise
+
+
+if __name__ == "__main__":
+    main()
