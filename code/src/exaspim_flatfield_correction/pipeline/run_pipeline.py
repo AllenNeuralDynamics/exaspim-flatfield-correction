@@ -143,9 +143,7 @@ def get_results_dir() -> str:
     """
     return os.environ.get(
         "EXASPIM_RESULTS_DIR",
-        os.path.abspath(
-            os.path.join(os.path.dirname(__file__), "../../../results")
-        ),
+        "/results",
     )
 
 
