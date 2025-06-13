@@ -608,6 +608,26 @@ def parse_and_validate_args() -> argparse.Namespace:
     return args
 
 
+def create_mask_path(out_zarr_path: str) -> str:
+    """
+    Create the corresponding output mask path for 
+    the input zarr image.
+
+    Parameters
+    -------
+    out_zarr_path: str
+        The output path for the corrected zarr dataset
+
+    Returns
+    -------
+    str
+        The mask path for the corrected zarr dataset
+    """
+    out_zarr_folder = Path(out_zarr_path).name
+    out_mask_path = out_zarr_path.replace(out_zarr_folder, f"mask/{out_zarr_folder}")
+    return out_mask_path
+
+
 def main() -> None:
     """
     Main entry point for the flatfield correction pipeline.
@@ -636,7 +656,7 @@ def main() -> None:
     )
     _LOGGER.info(f"Dask client: {client}")
 
-    out_mask_path = out_path.replace("/SPIM.ome.zarr", "/mask/SPIM.ome.zarr")
+    out_mask_path = create_mask_path(out_path)
     
     start_date_time = datetime.now()
     data_process = create_processing_metadata(
