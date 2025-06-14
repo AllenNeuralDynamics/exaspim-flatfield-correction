@@ -33,6 +33,11 @@ def fit_basic(
     sort_intensity: bool = False,
     shuffle_frames: bool = False,
     mask: np.ndarray = None,
+    max_workers: int = 16,
+    resize_mode: str = "skimage",
+    working_size: int = 128,
+    smoothness_flatfield: float = 0.1,
+    smoothness_darkfield: float = 0.1,
 ) -> "BaSiC":
     """
     Fit a BaSiC flatfield/darkfield correction model to an image stack.
@@ -53,6 +58,16 @@ def fit_basic(
         Whether to shuffle frames before fitting. Default is False.
     mask : np.ndarray, optional
         Optional mask for fitting weighting.
+    max_workers : int, optional
+        Number of workers for parallel processing. Default is 16.
+    resize_mode : str, optional
+        Resize mode for BaSiC. Default is 'skimage'.
+    working_size : int, optional
+        Working size for BaSiC. Default is 128.
+    smoothness_flatfield : float, optional
+        Smoothness parameter for flatfield. Default is 0.1.
+    smoothness_darkfield : float, optional
+        Smoothness parameter for darkfield. Default is 0.1.
 
     Returns
     -------
@@ -63,11 +78,11 @@ def fit_basic(
         autosegment=autosegment,
         sort_intensity=sort_intensity,
         get_darkfield=get_darkfield,
-        max_workers=16,
-        resize_mode="skimage",
-        working_size=128,
-        smoothness_flatfield=0.1,
-        smoothness_darkfield=0.1,
+        max_workers=max_workers,
+        resize_mode=resize_mode,
+        working_size=working_size,
+        smoothness_flatfield=smoothness_flatfield,
+        smoothness_darkfield=smoothness_darkfield,
     )
     if shuffle_frames:
         image = image.copy()
