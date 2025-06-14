@@ -26,20 +26,25 @@ except ModuleNotFoundError:
 
 
 def fit_basic(
-    image: np.ndarray,
+    im: np.ndarray,
     autotune: bool = False,
     get_darkfield: bool = False,
     autosegment: bool = False,
     sort_intensity: bool = False,
     shuffle_frames: bool = False,
     mask: np.ndarray = None,
+    max_workers: int = 16,
+    resize_mode: str = "skimage",
+    working_size: int = 128,
+    smoothness_flatfield: float = 0.1,
+    smoothness_darkfield: float = 0.1,
 ) -> "BaSiC":
     """
     Fit a BaSiC flatfield/darkfield correction model to an image stack.
 
     Parameters
     ----------
-    image : np.ndarray
+    im : np.ndarray
         Image stack (frames, Y, X) or (Z, Y, X).
     autotune : bool, optional
         Whether to autotune BaSiC parameters. Default is False.
@@ -53,6 +58,16 @@ def fit_basic(
         Whether to shuffle frames before fitting. Default is False.
     mask : np.ndarray, optional
         Optional mask for fitting weighting.
+    max_workers : int, optional
+        Number of workers for parallel processing. Default is 16.
+    resize_mode : str, optional
+        Resize mode for BaSiC. Default is 'skimage'.
+    working_size : int, optional
+        Working size for BaSiC. Default is 128.
+    smoothness_flatfield : float, optional
+        Smoothness parameter for flatfield. Default is 0.1.
+    smoothness_darkfield : float, optional
+        Smoothness parameter for darkfield. Default is 0.1.
 
     Returns
     -------
@@ -63,38 +78,40 @@ def fit_basic(
         autosegment=autosegment,
         sort_intensity=sort_intensity,
         get_darkfield=get_darkfield,
-        max_workers=16,
-        resize_mode="skimage",
-        working_size=128,
-        smoothness_flatfield=0.1,
-        smoothness_darkfield=0.1,
+        max_workers=max_workers,
+        resize_mode=resize_mode,
+        working_size=working_size,
+        smoothness_flatfield=smoothness_flatfield,
+        smoothness_darkfield=smoothness_darkfield,
     )
     if shuffle_frames:
-        image = image.copy()
-        np.random.shuffle(image)
+        im = im.copy()
+        np.random.shuffle(im)
     if autotune:
-        basic.autotune(image, early_stop=True, n_iter=50)
+        basic.autotune(im, early_stop=True, n_iter=50)
         _LOGGER.info(
             f"Autotune: flatfield={basic.smoothness_flatfield}, \
             darkfield={basic.smoothness_darkfield}, \
             sparse_cost={basic.sparse_cost_darkfield}"
         )
 
-    basic.fit(image, fitting_weight=mask)
+    basic.fit(im, fitting_weight=mask)
 
     return basic
 
 
-def transform_basic(image: da.Array, fit: "BaSiC") -> da.Array:
+def transform_basic(im: da.Array, fit: "BaSiC", chunks: tuple = (256, 256)) -> da.Array:
     """
     Apply a fitted BaSiC flatfield/darkfield correction to an image.
 
     Parameters
     ----------
-    image : dask.array.Array
+    im : dask.array.Array
         Image to correct (C, Y, X) or (Z, Y, X).
     fit : BaSiC
         Fitted BaSiC model object.
+    chunks : tuple, optional
+        Chunk size for Dask arrays. Default is (256, 256).
 
     Returns
     -------
@@ -102,13 +119,13 @@ def transform_basic(image: da.Array, fit: "BaSiC") -> da.Array:
         Flatfield/darkfield corrected image.
     """
     flatfield = da.from_array(
-        resize(fit.flatfield, image.shape[-2:]), chunks=(256, 256)
+        resize(fit.flatfield, im.shape[-2:]), chunks=chunks
     )
     darkfield = da.from_array(
-        resize(fit.darkfield, image.shape[-2:]), chunks=(256, 256)
+        resize(fit.darkfield, im.shape[-2:]), chunks=chunks
     )
 
-    return (image.astype(np.float32) - darkfield[np.newaxis]) / flatfield[
+    return (im.astype(np.float32) - darkfield[np.newaxis]) / flatfield[
         np.newaxis
     ]
 
