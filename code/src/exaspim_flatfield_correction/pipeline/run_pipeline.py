@@ -72,6 +72,11 @@ def load_mask_from_dir(mask_dir: str, tile_name: str) -> np.ndarray:
     Exception
         If no mask file is found for the given tile.
     """
+    if tile_name is None or tile_name == "":
+        raise ValueError("Tile name must be provided to load the mask.")
+    if mask_dir is None or not os.path.isdir(mask_dir):
+        raise ValueError(f"Mask directory {mask_dir} does not exist or is not a directory.")
+    _LOGGER.info(f"Loading mask from directory: {mask_dir} for tile: {tile_name}")
     maskf = None
     for root, _, files in os.walk(mask_dir, followlinks=True):
         for f in files:
