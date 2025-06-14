@@ -1,7 +1,7 @@
 import numpy as np
 import dask.array as da
 from scipy.ndimage import gaussian_filter
-from scipy.interpolate import make_splrep, splev
+from scipy.interpolate import splrep, splev
 from exaspim_flatfield_correction.utils.mask_utils import get_mask
 import logging
 
@@ -37,7 +37,7 @@ def fit_splrep(
     x: np.ndarray, y: np.ndarray, smoothing: float = 0, k: int = 3
 ) -> np.ndarray:
     """
-    Fit a smoothing spline to the data using make_splrep and splev.
+    Fit a smoothing spline to the data using splrep and splev.
 
     Parameters
     ----------
@@ -56,7 +56,7 @@ def fit_splrep(
     np.ndarray
         The fitted spline evaluated at x.
     """
-    tck = make_splrep(x, y, s=smoothing, k=k)
+    tck = splrep(x, y, s=smoothing, k=k)
     fitted = splev(x, tck)
     return fitted
 
@@ -90,7 +90,7 @@ def rescale_spline(
         Rescaled spline values at the new width.
     """
     # Fit the spline using the original x and y data
-    tck = make_splrep(x, y, s=smoothing, k=k)
+    tck = splrep(x, y, s=smoothing, k=k)
 
     # Create new x values for the upscaled image
     new_x = np.linspace(0, new_width, new_width)
