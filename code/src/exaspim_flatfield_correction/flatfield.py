@@ -26,7 +26,7 @@ except ModuleNotFoundError:
 
 
 def fit_basic(
-    image: np.ndarray,
+    im: np.ndarray,
     autotune: bool = False,
     get_darkfield: bool = False,
     autosegment: bool = False,
@@ -44,7 +44,7 @@ def fit_basic(
 
     Parameters
     ----------
-    image : np.ndarray
+    im : np.ndarray
         Image stack (frames, Y, X) or (Z, Y, X).
     autotune : bool, optional
         Whether to autotune BaSiC parameters. Default is False.
@@ -85,31 +85,33 @@ def fit_basic(
         smoothness_darkfield=smoothness_darkfield,
     )
     if shuffle_frames:
-        image = image.copy()
-        np.random.shuffle(image)
+        im = im.copy()
+        np.random.shuffle(im)
     if autotune:
-        basic.autotune(image, early_stop=True, n_iter=50)
+        basic.autotune(im, early_stop=True, n_iter=50)
         _LOGGER.info(
             f"Autotune: flatfield={basic.smoothness_flatfield}, \
             darkfield={basic.smoothness_darkfield}, \
             sparse_cost={basic.sparse_cost_darkfield}"
         )
 
-    basic.fit(image, fitting_weight=mask)
+    basic.fit(im, fitting_weight=mask)
 
     return basic
 
 
-def transform_basic(image: da.Array, fit: "BaSiC") -> da.Array:
+def transform_basic(im: da.Array, fit: "BaSiC", chunks: tuple = (256, 256)) -> da.Array:
     """
     Apply a fitted BaSiC flatfield/darkfield correction to an image.
 
     Parameters
     ----------
-    image : dask.array.Array
+    im : dask.array.Array
         Image to correct (C, Y, X) or (Z, Y, X).
     fit : BaSiC
         Fitted BaSiC model object.
+    chunks : tuple, optional
+        Chunk size for Dask arrays. Default is (256, 256).
 
     Returns
     -------
@@ -117,13 +119,13 @@ def transform_basic(image: da.Array, fit: "BaSiC") -> da.Array:
         Flatfield/darkfield corrected image.
     """
     flatfield = da.from_array(
-        resize(fit.flatfield, image.shape[-2:]), chunks=(256, 256)
+        resize(fit.flatfield, im.shape[-2:]), chunks=chunks
     )
     darkfield = da.from_array(
-        resize(fit.darkfield, image.shape[-2:]), chunks=(256, 256)
+        resize(fit.darkfield, im.shape[-2:]), chunks=chunks
     )
 
-    return (image.astype(np.float32) - darkfield[np.newaxis]) / flatfield[
+    return (im.astype(np.float32) - darkfield[np.newaxis]) / flatfield[
         np.newaxis
     ]
 
