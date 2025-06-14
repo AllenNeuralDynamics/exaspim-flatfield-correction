@@ -28,6 +28,7 @@ except ModuleNotFoundError:
 def fit_basic(
     im: np.ndarray,
     autotune: bool = False,
+    autotune_iter: int = 50,
     get_darkfield: bool = False,
     autosegment: bool = False,
     sort_intensity: bool = False,
@@ -35,9 +36,10 @@ def fit_basic(
     mask: np.ndarray = None,
     max_workers: int = 16,
     resize_mode: str = "skimage",
-    working_size: int = 128,
+    working_size: int = 256,
     smoothness_flatfield: float = 0.1,
     smoothness_darkfield: float = 0.1,
+    max_slices: int = 0,
 ) -> "BaSiC":
     """
     Fit a BaSiC flatfield/darkfield correction model to an image stack.
@@ -63,17 +65,32 @@ def fit_basic(
     resize_mode : str, optional
         Resize mode for BaSiC. Default is 'skimage'.
     working_size : int, optional
-        Working size for BaSiC. Default is 128.
+        Working size for BaSiC. Default is 256.
     smoothness_flatfield : float, optional
         Smoothness parameter for flatfield. Default is 0.1.
     smoothness_darkfield : float, optional
         Smoothness parameter for darkfield. Default is 0.1.
+    max_slices : int, optional
+        If > 0, use only the top N mask slices (by area) and corresponding image slices. Default is 0 (use all).
 
     Returns
     -------
     BaSiC
         Fitted BaSiC model object.
     """
+    # If max_slices > 0 and mask is provided, select top N slices by mask area
+    if max_slices > 0 and mask is not None:
+        # Compute area for each mask slice (sum over each 2D mask)
+        mask_areas = mask.sum(axis=(1, 2))
+        # Get indices of top N slices by area (descending)
+        top_indices = np.argsort(mask_areas)[::-1][:max_slices]
+        # Sort indices to preserve order
+        top_indices = np.sort(top_indices)
+        im = im[top_indices]
+        mask = mask[top_indices]
+        _LOGGER.info("Shape after filtering by mask area: "
+                     f"{im.shape}, mask shape: {mask.shape}")
+
     basic = BaSiC(
         autosegment=autosegment,
         sort_intensity=sort_intensity,
@@ -88,11 +105,11 @@ def fit_basic(
         im = im.copy()
         np.random.shuffle(im)
     if autotune:
-        basic.autotune(im, early_stop=True, n_iter=50)
+        basic.autotune(im, early_stop=True, n_iter=autotune_iter)
         _LOGGER.info(
-            f"Autotune: flatfield={basic.smoothness_flatfield}, \
-            darkfield={basic.smoothness_darkfield}, \
-            sparse_cost={basic.sparse_cost_darkfield}"
+            f"Autotune: flatfield={basic.smoothness_flatfield}, "
+            f"darkfield={basic.smoothness_darkfield}, "
+            f"sparse_cost={basic.sparse_cost_darkfield}"
         )
 
     basic.fit(im, fitting_weight=mask)

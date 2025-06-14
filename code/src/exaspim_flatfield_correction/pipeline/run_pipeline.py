@@ -72,6 +72,11 @@ def load_mask_from_dir(mask_dir: str, tile_name: str) -> np.ndarray:
     Exception
         If no mask file is found for the given tile.
     """
+    if tile_name is None or tile_name == "":
+        raise ValueError("Tile name must be provided to load the mask.")
+    if mask_dir is None or not os.path.isdir(mask_dir):
+        raise ValueError(f"Mask directory {mask_dir} does not exist or is not a directory.")
+    _LOGGER.info(f"Loading mask from directory: {mask_dir} for tile: {tile_name}")
     maskf = None
     for root, _, files in os.walk(mask_dir, followlinks=True):
         for f in files:
@@ -236,6 +241,13 @@ def flatfield_basicpy(
     z: zarr.hierarchy.Group,
     is_binned_channel: bool,
     bkg: np.ndarray = None,
+    mask_dir: str = None,
+    tile_name: str = None,
+    max_slices: int = 100,
+    working_size: int = 512,
+    sort_intensity: bool = True,
+    shuffle_frames: bool = False,
+    autotune: bool = False,
 ) -> da.Array:
     """
     Apply basicpy-based flatfield correction to the image.
@@ -256,8 +268,8 @@ def flatfield_basicpy(
     dask.array.Array
         Flatfield-corrected image as a dask array.
     """
-    basicpy_res = "1" if is_binned_channel else "4"
-    low_res = da.from_zarr(z[basicpy_res]).squeeze()
+    basicpy_res = "0" if is_binned_channel else "3"
+    low_res = da.from_zarr(z[basicpy_res]).squeeze().astype(np.float32)
     if bkg is not None:
         low_res = subtract_bkg(
             low_res,
@@ -265,12 +277,18 @@ def flatfield_basicpy(
                 resize(bkg, low_res.shape[1:]), chunks=low_res.chunksize[1:]
             ),
         )
+    mask = None
+    if mask_dir is not None:
+        mask = _preprocess_mask(mask_dir, tile_name, low_res.shape).compute()
     fit = fit_basic(
         low_res.compute(),
-        autotune=False,
+        autotune=autotune,
         get_darkfield=False,
-        sort_intensity=True,
-        shuffle_frames=False,
+        sort_intensity=sort_intensity,
+        shuffle_frames=shuffle_frames,
+        mask=mask,
+        max_slices=max_slices,
+        working_size=working_size,
     )
     corrected = transform_basic(full_res, fit)
     return corrected
@@ -699,11 +717,17 @@ def main() -> None:
                 if not args.skip_flat_field:
                     if method == "reference":
                         corrected = flatfield_reference(
-                            full_res, args.flatfield_path
+                            full_res, 
+                            args.flatfield_path
                         )
                     elif method == "basicpy":
                         corrected = flatfield_basicpy(
-                            full_res, z, is_binned_channel, bkg
+                            full_res, 
+                            z, 
+                            is_binned_channel, 
+                            bkg, 
+                            args.mask_dir, 
+                            tile_name
                         )
                     elif method == "fitting":
                         fitting_config = get_fitting_config()
