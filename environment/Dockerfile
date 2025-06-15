@@ -15,7 +15,6 @@ RUN apt-get update \
     && apt-get install -y --no-install-recommends \
         build-essential \
         libxml2 \
-        ntp \
     && rm -rf /var/lib/apt/lists/*
 
 COPY postInstall /
