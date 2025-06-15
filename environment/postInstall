@@ -2,8 +2,9 @@
 set -ex
 
 git clone https://github.com/AllenNeuralDynamics/exaspim-flatfield-correction.git
-cd exaspim-flatfield-correction/code
-pip install .
+cd exaspim-flatfield-correction/
+cd code/
+pip install .[basicpy]
 cd ../..
 
 VERSION=4.100.3
