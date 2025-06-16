@@ -141,6 +141,7 @@ def background_subtraction(
     full_res: da.Array,
     z: zarr.hierarchy.Group,
     is_binned_channel: bool = False,
+    use_reference_bkg: bool = False,
 ) -> tuple[da.Array, np.ndarray]:
     """
     Perform background subtraction on the full resolution image.
@@ -155,6 +156,8 @@ def background_subtraction(
         Opened zarr group for the tile.
     is_binned_channel : bool, optional
         Whether the tile is a binned channel, by default False.
+    use_reference_bkg : bool, optional
+        If True, loads the reference background image from S3. If False, estimate background from data. Default is False.
 
     Returns
     -------
@@ -162,8 +165,6 @@ def background_subtraction(
         Tuple of background-subtracted full resolution dask array and the
         estimated background as a numpy array.
     """
-    # Set to true to use the reference background image loaded from S3
-    use_reference_bkg = False
     if use_reference_bkg:
         bkg_path = get_bkg_path(tile_path)
         bkg = read_bkg_image(bkg_path).astype(np.float32)
@@ -247,6 +248,22 @@ def flatfield_basicpy(
         Whether the tile is a binned channel.
     bkg : np.ndarray, optional
         Background image as a numpy array, by default None.
+    mask_dir : str, optional
+        Directory containing mask files, by default None.
+    tile_name : str, optional
+        Name of the tile being processed, by default None.
+    max_slices : int, optional
+        Maximum number of slices for basicpy, by default 100.
+    working_size : int, optional
+        Working size for basicpy, by default 512.
+    sort_intensity : bool, optional
+        Whether to sort by intensity, by default True.
+    shuffle_frames : bool, optional
+        Whether to shuffle frames, by default False.
+    autotune : bool, optional
+        Whether to autotune basicpy, by default False.
+    results_dir : str, optional
+        Directory to store intermediate mask zarr, by default None.
 
     Returns
     -------
@@ -347,6 +364,8 @@ def flatfield_fitting(
         Number of zarr pyramid levels.
     config : dict
         Dictionary of fitting parameters (see get_fitting_config).
+    results_dir : str, optional
+        Directory to store intermediate mask zarr, by default None.
 
     Returns
     -------
@@ -608,6 +627,7 @@ def parse_and_validate_args() -> argparse.Namespace:
         default=1,
         help="Number of zarr pyramid levels (default: 1)",
     )
+    parser.add_argument("--use-reference-bkg", action="store_true", default=False, help="Use reference background image from S3 instead of estimating background.")
     args = parser.parse_args()
 
     if args.method == "fitting" and args.mask_dir is None:
@@ -712,7 +732,7 @@ def main() -> None:
                 if not args.skip_bkg_sub:
                     _LOGGER.info("Performing background subtraction")
                     full_res, bkg = background_subtraction(
-                        tile_path, full_res, z, is_binned_channel
+                        tile_path, full_res, z, is_binned_channel, args.use_reference_bkg
                     )
                     if args.save_outputs:
                         tifffile.imwrite(os.path.join(results_dir, f"{tile_name}_bkg.tif"), bkg, imagej=True)
