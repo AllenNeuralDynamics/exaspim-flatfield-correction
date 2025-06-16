@@ -264,7 +264,12 @@ def flatfield_basicpy(
         )
     mask = None
     if mask_dir is not None and results_dir is not None:
-        mask = _preprocess_mask(mask_dir, tile_name, low_res.shape, results_dir).compute()
+        mask = _preprocess_mask(
+            load_mask_from_dir(mask_dir, tile_name),
+            low_res.shape,
+            results_dir,
+            tile_name
+        ).compute()
     fit = fit_basic(
         low_res.compute(),
         autotune=autotune,
@@ -279,12 +284,11 @@ def flatfield_basicpy(
     return corrected
 
 
-def _preprocess_mask(mask_dir: str, tile_name: str, low_res_shape: tuple, results_dir: str) -> da.Array:
+def _preprocess_mask(mask: np.ndarray, low_res_shape: tuple, results_dir: str, tile_name: str) -> da.Array:
     """
-    Load, upscale, and save mask as zarr, then reload as dask array.
+    Upscale and save mask as zarr, then reload as dask array.
     """
     mask_name = str(Path(results_dir) / f"{tile_name}_mask.zarr")
-    mask = load_mask_from_dir(mask_dir, tile_name)
     if mask.shape != low_res_shape:
         mask = (
             upscale_mask_nearest(
@@ -352,7 +356,12 @@ def flatfield_fitting(
     fitting_res = "0" if is_binned_channel else "3"
     low_res = da.from_zarr(z[fitting_res]).squeeze().astype(np.float32)
 
-    mask = _preprocess_mask(mask_dir, tile_name, low_res.shape, results_dir)
+    mask = _preprocess_mask(
+        load_mask_from_dir(mask_dir, tile_name),
+        low_res.shape,
+        results_dir,
+        tile_name
+    )
     mask_2d_xy = mask.max(axis=0).compute()
     mask_2d_yz = mask.max(axis=2).compute()
 
