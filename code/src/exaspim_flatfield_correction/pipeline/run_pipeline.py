@@ -398,7 +398,7 @@ def flatfield_fitting(
         Flatfield-corrected image as a dask array.
     """
     fitting_res = "0" if is_binned_channel else "3"
-    low_res = da.from_zarr(z[fitting_res]).squeeze()
+    low_res = da.from_zarr(z[fitting_res]).squeeze().astype(np.float32)
 
     mask = _preprocess_mask(
         load_mask_from_dir(mask_dir, tile_name),
@@ -415,7 +415,7 @@ def flatfield_fitting(
         else config.get("med_factor_unbinned", 5)
     )
     nan_med = np.nanmedian(da.where(mask, low_res, np.nan).compute())
-    low_res_clipped = np.clip(low_res, 0, nan_med * med_factor)
+    low_res_clipped = np.clip(low_res, 0, nan_med * med_factor).astype(np.uint16)
 
     del low_res, nan_med
 
