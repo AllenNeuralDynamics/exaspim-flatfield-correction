@@ -332,7 +332,7 @@ def _preprocess_mask(mask_dir: str, tile_name: str, low_res_shape) -> da.Array:
                 low_res_shape,
                 chunks=(128, 256, 256),
             )
-            .astype(np.uint8)
+            .astype(bool)
             .compute()
         )
     zarr.save_array(
@@ -389,7 +389,7 @@ def flatfield_fitting(
         Flatfield-corrected image as a dask array.
     """
     fitting_res = "0" if is_binned_channel else "3"
-    low_res = da.from_zarr(z[fitting_res]).squeeze().astype(np.float32)
+    low_res = da.from_zarr(z[fitting_res]).squeeze()
 
     mask = _preprocess_mask(mask_dir, tile_name, low_res.shape)
     mask_2d_xy = mask.max(axis=0).compute()
@@ -409,18 +409,18 @@ def flatfield_fitting(
     xy_proj = percentile_project(
         low_res_clipped, axis=0, percentile=percentile
     )
-    xy_proj = gaussian_filter(xy_proj, sigma=config.get("gaussian_sigma", 2))
+    xy_proj = gaussian_filter(xy_proj.astype(np.float32), sigma=config.get("gaussian_sigma", 2))
     yz_proj = percentile_project(
         low_res_clipped, axis=2, percentile=percentile
     )
-    yz_proj = gaussian_filter(yz_proj, sigma=config.get("gaussian_sigma", 2))
+    yz_proj = gaussian_filter(yz_proj.astype(np.float32), sigma=config.get("gaussian_sigma", 2))
 
     del low_res_clipped
 
     _LOGGER.info(f"Upscaling mask to full resolution: {full_res.shape}")
     mask_upscaled = upscale_mask_nearest(
         mask, full_res.shape, chunks=(128, 256, 256)
-    ).astype(np.uint8)
+    ).astype(bool)
     mask_path = out_mask_path.rstrip("/") + f"/{tile_name}"
     store_ome_zarr(
         mask_upscaled,
