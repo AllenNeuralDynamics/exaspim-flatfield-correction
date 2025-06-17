@@ -161,27 +161,12 @@ def parse_inputs(args: argparse.Namespace) -> dict:
     return params
 
 
-def get_results_dir() -> str:
-    """
-    Get the results directory from the EXASPIM_RESULTS_DIR environment
-    variable or use the default path.
-
-    Returns
-    -------
-    str
-        Absolute path to the results directory.
-    """
-    return os.environ.get(
-        "EXASPIM_RESULTS_DIR",
-        "/results",
-    )
-
-
 def background_subtraction(
     tile_path: str,
     full_res: da.Array,
     z: zarr.hierarchy.Group,
     is_binned_channel: bool = False,
+    use_reference_bkg: bool = False,
 ) -> tuple[da.Array, np.ndarray]:
     """
     Perform background subtraction on the full resolution image.
@@ -196,6 +181,8 @@ def background_subtraction(
         Opened zarr group for the tile.
     is_binned_channel : bool, optional
         Whether the tile is a binned channel, by default False.
+    use_reference_bkg : bool, optional
+        If True, loads the reference background image from S3. If False, estimate background from data. Default is False.
 
     Returns
     -------
@@ -203,8 +190,6 @@ def background_subtraction(
         Tuple of background-subtracted full resolution dask array and the
         estimated background as a numpy array.
     """
-    # Set to true to use the reference background image loaded from S3
-    use_reference_bkg = False
     if use_reference_bkg:
         bkg_path = get_bkg_path(tile_path)
         bkg = read_bkg_image(bkg_path).astype(np.float32)
@@ -273,6 +258,7 @@ def flatfield_basicpy(
     sort_intensity: bool = True,
     shuffle_frames: bool = False,
     autotune: bool = False,
+    results_dir: str = None,
 ) -> da.Array:
     """
     Apply basicpy-based flatfield correction to the image.
@@ -287,6 +273,22 @@ def flatfield_basicpy(
         Whether the tile is a binned channel.
     bkg : np.ndarray, optional
         Background image as a numpy array, by default None.
+    mask_dir : str, optional
+        Directory containing mask files, by default None.
+    tile_name : str, optional
+        Name of the tile being processed, by default None.
+    max_slices : int, optional
+        Maximum number of slices for basicpy, by default 100.
+    working_size : int, optional
+        Working size for basicpy, by default 512.
+    sort_intensity : bool, optional
+        Whether to sort by intensity, by default True.
+    shuffle_frames : bool, optional
+        Whether to shuffle frames, by default False.
+    autotune : bool, optional
+        Whether to autotune basicpy, by default False.
+    results_dir : str, optional
+        Directory to store intermediate mask zarr, by default None.
 
     Returns
     -------
@@ -303,8 +305,13 @@ def flatfield_basicpy(
             ),
         )
     mask = None
-    if mask_dir is not None:
-        mask = _preprocess_mask(mask_dir, tile_name, low_res.shape).compute()
+    if mask_dir is not None and results_dir is not None:
+        mask = _preprocess_mask(
+            load_mask_from_dir(mask_dir, tile_name),
+            low_res.shape,
+            results_dir,
+            tile_name
+        ).compute()
     fit = fit_basic(
         low_res.compute(),
         autotune=autotune,
@@ -319,12 +326,11 @@ def flatfield_basicpy(
     return corrected
 
 
-def _preprocess_mask(mask_dir: str, tile_name: str, low_res_shape) -> da.Array:
+def _preprocess_mask(mask: np.ndarray, low_res_shape: tuple, results_dir: str, tile_name: str) -> da.Array:
     """
-    Load, upscale, and save mask as zarr, then reload as dask array.
+    Upscale and save mask as zarr, then reload as dask array.
     """
-    mask_name = str(Path(get_results_dir()) / f"{tile_name}_mask.zarr")
-    mask = load_mask_from_dir(mask_dir, tile_name)
+    mask_name = str(Path(results_dir) / f"{tile_name}_mask.zarr")
     if mask.shape != low_res_shape:
         mask = (
             upscale_mask_nearest(
@@ -355,6 +361,7 @@ def flatfield_fitting(
     overwrite: bool,
     n_levels: int,
     config: dict,
+    results_dir: str = None,
 ) -> da.Array:
     """
     Apply fitting-based flatfield correction to the image using a mask
@@ -382,6 +389,8 @@ def flatfield_fitting(
         Number of zarr pyramid levels.
     config : dict
         Dictionary of fitting parameters (see get_fitting_config).
+    results_dir : str, optional
+        Directory to store intermediate mask zarr, by default None.
 
     Returns
     -------
@@ -391,7 +400,12 @@ def flatfield_fitting(
     fitting_res = "0" if is_binned_channel else "3"
     low_res = da.from_zarr(z[fitting_res]).squeeze()
 
-    mask = _preprocess_mask(mask_dir, tile_name, low_res.shape)
+    mask = _preprocess_mask(
+        load_mask_from_dir(mask_dir, tile_name),
+        low_res.shape,
+        results_dir,
+        tile_name
+    )
     mask_2d_xy = mask.max(axis=0).compute()
     mask_2d_yz = mask.max(axis=2).compute()
 
@@ -478,7 +492,7 @@ def flatfield_fitting(
 
 
 def save_metadata(
-    data_process, out_path: str, tile_name: str, tile_path: str
+    data_process, out_path: str, tile_name: str, tile_path: str, results_dir: str
 ) -> None:
     """
     Save process and metadata paths JSON for a tile.
@@ -496,7 +510,7 @@ def save_metadata(
     """
     process_json = data_process.model_dump_json()
     process_json_path = str(
-        Path(get_results_dir())
+        Path(results_dir)
         / f"process_{Path(out_path).parent.name}_{tile_name}.json"
     )
     with open(process_json_path, "w") as f:
@@ -505,7 +519,7 @@ def save_metadata(
     input_metadata_path = get_parent_s3_path(get_parent_s3_path(tile_path))
     output_metadata_path = get_parent_s3_path(out_path)
     metadata_json_path = str(
-        Path(get_results_dir())
+        Path(results_dir)
         / f"metadata_paths_{Path(out_path).parent.name}_{tile_name}.json"
     )
     with open(metadata_json_path, "w") as f:
@@ -569,11 +583,11 @@ def get_channel_resolution(
     return is_binned, binned_res if is_binned else res
 
 
-def set_dask_config():
+def set_dask_config(results_dir: str):
     """
     Set Dask configuration for memory management and temporary directory.
     """
-    dask_tmp_dir = os.path.join(get_results_dir(), "dask-tmp")
+    dask_tmp_dir = os.path.join(results_dir, "dask-tmp")
     dask.config.set(
         {
             "temporary-directory": dask_tmp_dir,
@@ -614,6 +628,8 @@ def parse_and_validate_args() -> argparse.Namespace:
         required=True,
         help="Output zarr path for the corrected data",
     )
+    parser.add_argument("--save-outputs", default=False, action="store_true", help="Save intermediate output files.")
+    parser.add_argument("--results-dir", type=str, default=os.path.join(os.getcwd(), "results"), help="Directory to save results and metadata.")
     parser.add_argument(
         "--res",
         type=str,
@@ -641,6 +657,7 @@ def parse_and_validate_args() -> argparse.Namespace:
         default=1,
         help="Number of zarr pyramid levels (default: 1)",
     )
+    parser.add_argument("--use-reference-bkg", action="store_true", default=False, help="Use reference background image from S3 instead of estimating background.")
     args = parser.parse_args()
 
     if args.method == "fitting" and args.mask_dir is None:
@@ -696,7 +713,14 @@ def main() -> None:
     res = params["res"]
     binned_channel = params["binned_channel"]
 
-    set_dask_config()
+    results_dir = args.results_dir
+    if not os.path.exists(results_dir):
+        os.makedirs(results_dir, exist_ok=True)
+
+    # TODO: make a parameter
+    binned_res = "0"
+
+    set_dask_config(results_dir)
     co_memory = get_mem_limit()
     _LOGGER.info(f"CO_MEMORY: {co_memory}")
     if isinstance(co_memory, int) and co_memory <= 0:
@@ -720,12 +744,9 @@ def main() -> None:
     data_process = create_processing_metadata(
         args, tile_paths[0], out_path, start_date_time, res
     )
-    
-    # TODO: make a parameter
-    binned_res = "0"
 
     with performance_report(
-        filename=os.path.join(get_results_dir(), "dask-report.html")
+        filename=os.path.join(results_dir, "dask-report.html")
     ):
         for tile_path in tile_paths:
             tile_name = Path(tile_path).name
@@ -751,8 +772,10 @@ def main() -> None:
                 if not args.skip_bkg_sub:
                     _LOGGER.info("Performing background subtraction")
                     full_res, bkg = background_subtraction(
-                        tile_path, full_res, z, is_binned_channel
+                        tile_path, full_res, z, is_binned_channel, args.use_reference_bkg
                     )
+                    if args.save_outputs:
+                        tifffile.imwrite(os.path.join(results_dir, f"{tile_name}_bkg.tif"), bkg, imagej=True)
 
                 if not args.skip_flat_field:
                     if method == "reference":
@@ -767,7 +790,8 @@ def main() -> None:
                             is_binned_channel, 
                             bkg, 
                             args.mask_dir, 
-                            tile_name
+                            tile_name,
+                            results_dir=results_dir
                         )
                     elif method == "fitting":
                         fitting_config = get_fitting_config()
@@ -782,6 +806,7 @@ def main() -> None:
                             args.overwrite,
                             args.n_levels,
                             fitting_config,
+                            results_dir=results_dir
                         )
                     else:
                         _LOGGER.error(f"Invalid method: {method}")
@@ -805,7 +830,7 @@ def main() -> None:
                 _LOGGER.info(f"Storing OME-Zarr took {time.time() - t0:.2f}s")
 
                 data_process.end_date_time = datetime.now()
-                save_metadata(data_process, out_path, tile_name, tile_path)
+                save_metadata(data_process, out_path, tile_name, tile_path, results_dir)
             except Exception as e:
                 _LOGGER.error(
                     f"Error processing tile {tile_name}: {e}", exc_info=True
