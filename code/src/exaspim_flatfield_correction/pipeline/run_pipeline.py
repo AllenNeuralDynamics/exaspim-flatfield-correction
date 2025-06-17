@@ -51,6 +51,31 @@ logging.basicConfig(
 _LOGGER = logging.getLogger(__name__)
 
 
+def get_mem_limit() -> int | str:
+    """
+    Return a value suitable for Dask’s LocalCluster(memory_limit=…).
+
+    • If the CO_MEMORY environment variable is set, treat it as **bytes** and
+      return it as an int.
+    • If CO_MEMORY is unset (or empty), return the string 'auto'.
+
+    Raises
+    ------
+    ValueError
+        If CO_MEMORY is set to a non-integer value.
+    """
+    raw = os.getenv("CO_MEMORY")
+    if not raw:
+        return "auto"
+
+    try:
+        return int(raw)
+    except ValueError as exc:
+        raise ValueError(
+            f"CO_MEMORY must be an integer number of bytes; got {raw!r}"
+        ) from exc
+
+
 def load_mask_from_dir(mask_dir: str, tile_name: str) -> np.ndarray:
     """
     Load a mask file for a given tile from a directory.
@@ -392,6 +417,7 @@ def flatfield_fitting(
 
     del low_res_clipped
 
+    _LOGGER.info(f"Upscaling mask to full resolution: {full_res.shape}")
     mask_upscaled = upscale_mask_nearest(
         mask, full_res.shape, chunks=(128, 256, 256)
     ).astype(np.uint8)
@@ -406,6 +432,7 @@ def flatfield_fitting(
     )
     mask_upscaled = da.from_zarr(mask_path, "0").squeeze()
 
+    _LOGGER.info("Computing correction functions")
     fit_x, median_xy = get_correction_func(
         xy_proj,
         mask_2d_xy,
@@ -439,6 +466,9 @@ def flatfield_fitting(
             if is_binned_channel
             else config.get("global_factor_unbinned", 70)
         )
+        _LOGGER.info("Doing global correction with factor: "
+                     f"{global_factor} and median_xy: {median_xy}, ratio = "
+                     f"{global_factor / median_xy}")
         corrected = da.where(
             mask_upscaled, corrected * (global_factor / median_xy), corrected
         )
@@ -667,9 +697,19 @@ def main() -> None:
     binned_channel = params["binned_channel"]
 
     set_dask_config()
+    co_memory = get_mem_limit()
+    _LOGGER.info(f"CO_MEMORY: {co_memory}")
+    if isinstance(co_memory, int) and co_memory <= 0:
+        raise ValueError(
+            "CO_MEMORY must be set to a positive integer value "
+            "to allocate memory for Dask workers."
+        )
     client = Client(
         LocalCluster(
-            processes=False, n_workers=1, threads_per_worker=args.num_workers
+            processes=False, 
+            n_workers=1, 
+            threads_per_worker=args.num_workers,
+            memory_limit=co_memory
         )
     )
     _LOGGER.info(f"Dask client: {client}")
@@ -753,6 +793,7 @@ def main() -> None:
                 _LOGGER.info(f"Corrected array dtype: {corrected.dtype}")
 
                 t0 = time.time()
+                _LOGGER.info(f"Storing OME-Zarr for tile {tile_name}")
                 store_ome_zarr(
                     corrected,
                     out_path.rstrip("/") + f"/{tile_name}",
