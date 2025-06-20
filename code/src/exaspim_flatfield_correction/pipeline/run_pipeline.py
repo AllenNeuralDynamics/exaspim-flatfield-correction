@@ -338,7 +338,7 @@ def _preprocess_mask(mask: np.ndarray, low_res_shape: tuple, results_dir: str, t
                 low_res_shape,
                 chunks=(128, 256, 256),
             )
-            .astype(bool)
+            .astype(np.uint8)
             .compute()
         )
     zarr.save_array(
@@ -434,7 +434,7 @@ def flatfield_fitting(
     _LOGGER.info(f"Upscaling mask to full resolution: {full_res.shape}")
     mask_upscaled = upscale_mask_nearest(
         mask, full_res.shape, chunks=(128, 256, 256)
-    ).astype(bool)
+    ).astype(np.uint8)
     mask_path = out_mask_path.rstrip("/") + f"/{tile_name}"
     store_ome_zarr(
         mask_upscaled,
