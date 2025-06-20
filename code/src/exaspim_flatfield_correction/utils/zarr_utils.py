@@ -30,6 +30,7 @@ def store_ome_zarr(
     reducer: Callable = windowed_rank,
     aws_region: str = "us-west-2",
     s3_use_ssl: bool = False,
+    write_empty_chunks: bool = True
 ) -> None:
     """
     Store a Dask array as an OME-Zarr multiscale dataset, with optional S3
@@ -102,7 +103,7 @@ def store_ome_zarr(
         corrected = corrected[np.newaxis, ...]
 
     _LOGGER.info("storing array")
-    store_array(corrected, root_group, "0", block_shape, codec)
+    store_array(corrected, root_group, "0", block_shape, codec, write_empty_chunks=write_empty_chunks)
     _LOGGER.info("downsampling array")
     if reducer == windowed_rank:
         reducer = partial(reducer, rank=-2)
@@ -114,6 +115,7 @@ def store_ome_zarr(
         block_shape,
         codec,
         reducer,
+        write_empty_chunks=write_empty_chunks
     )
     _LOGGER.info("writing ome metadata")
     write_ome_ngff_metadata(

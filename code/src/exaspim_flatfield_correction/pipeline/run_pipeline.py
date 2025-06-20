@@ -443,6 +443,7 @@ def flatfield_fitting(
         coordinate_transformations["scale"][-3:],
         coordinate_transformations["translation"],
         overwrite=overwrite,
+        write_empty_chunks=False
     )
     mask_upscaled = da.from_zarr(mask_path, "0").squeeze()
 
@@ -826,6 +827,7 @@ def main() -> None:
                     coordinate_transformations["scale"][-3:],
                     coordinate_transformations["translation"],
                     overwrite=args.overwrite,
+                    write_empty_chunks=True
                 )
                 _LOGGER.info(f"Storing OME-Zarr took {time.time() - t0:.2f}s")
 
