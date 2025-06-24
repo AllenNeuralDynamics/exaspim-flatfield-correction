@@ -596,7 +596,7 @@ def set_dask_config(results_dir: str):
             "distributed.worker.memory.spill": 0.8,
             "distributed.worker.memory.pause": 0.9,
             "distributed.worker.memory.terminate": 0.95,
-            "distributed.scheduler.allowed-failures": 100,
+            "distributed.scheduler.allowed-failures": 10,
         }
     )
 
