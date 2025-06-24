@@ -75,7 +75,7 @@ def store_ome_zarr(
                     * 1024,  # 64 MB, avoid multipart upload for small chunks
                 },
                 "retries": {
-                    "total_max_attempts": 1000,
+                    "total_max_attempts": 10,
                     "mode": "adaptive",
                 },
             },
