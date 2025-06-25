@@ -10,6 +10,7 @@ from datetime import datetime
 import numpy as np
 import zarr
 from numcodecs import blosc
+blosc.use_threads = False
 import tifffile
 import dask
 import dask.array as da
