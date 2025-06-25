@@ -747,12 +747,12 @@ def main() -> None:
         args, tile_paths[0], out_path, start_date_time, res
     )
 
-    with performance_report(
-        filename=os.path.join(results_dir, "dask-report.html")
-    ):
-        for tile_path in tile_paths:
-            tile_name = Path(tile_path).name
-            _LOGGER.info(f"Processing tile: {tile_name}")
+    for tile_path in tile_paths:
+        tile_name = Path(tile_path).name
+        _LOGGER.info(f"Processing tile: {tile_name}")
+        with performance_report(
+            filename=os.path.join(results_dir, f"dask-report_{tile_name}.html")
+        ):
             try:
                 is_binned_channel, resolution = get_channel_resolution(
                     tile_name, binned_channel, binned_res, res
