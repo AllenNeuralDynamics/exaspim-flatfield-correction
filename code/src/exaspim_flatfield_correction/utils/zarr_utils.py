@@ -15,6 +15,7 @@ from aind_data_transfer.transformations.ome_zarr import (
     write_ome_ngff_metadata,
 )
 from numcodecs import blosc
+blosc.use_threads = False
 from xarray_multiscale.reducers import windowed_rank
 
 _LOGGER = logging.getLogger(__name__)
