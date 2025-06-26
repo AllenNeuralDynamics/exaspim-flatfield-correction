@@ -609,7 +609,7 @@ def set_dask_config(results_dir: str):
         {
             "temporary-directory": dask_tmp_dir,
             "distributed.worker.memory.target": 0.7,
-            "distributed.worker.memory.spill": 0.8,
+            "distributed.worker.memory.spill": 0.85,
             "distributed.worker.memory.pause": 0.9,
             "distributed.worker.memory.terminate": 0.95,
             "distributed.scheduler.allowed-failures": 10,
