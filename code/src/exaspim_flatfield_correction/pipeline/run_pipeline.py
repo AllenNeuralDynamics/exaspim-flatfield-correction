@@ -415,12 +415,22 @@ def flatfield_fitting(
         if is_binned_channel
         else config.get("med_factor_unbinned", 5)
     )
-    nan_med = np.nanmedian(da.where(mask, low_res, np.nan).compute())
-    low_res_clipped = np.clip(low_res, 0, nan_med * med_factor).astype(np.uint16)
+
+    _LOGGER.info(f"Clipping low_res with median factor: {med_factor}")
+    # Dask implementation can only compute nanmedian along subsets of axes at a time,
+    # so we compute the nanmedian in two steps.
+    nan_med = da.nanmedian(da.nanmedian(da.where(mask, low_res, np.nan), axis=(0,1)), axis=0).compute()
+    # This fails with an OOM
+    # nan_med = da.nanmedian(da.where(mask, low_res, np.nan), axis=tuple(d for d in low_res.ndim)).compute()
+    _LOGGER.info(f"Computed median of tile foreground: {nan_med}")
+
+    # Clamp the intensity values to reduce the impact of very bright neurites on the profile fit
+    low_res_clipped = da.clip(low_res, 0, nan_med * med_factor).astype(np.uint16).compute()
 
     del low_res, nan_med
 
     percentile = config.get("percentile", 99)
+    _LOGGER.info(f"Computing percentile projection with percentile: {percentile}")
     xy_proj = percentile_project(
         low_res_clipped, axis=0, percentile=percentile
     )
@@ -432,10 +442,15 @@ def flatfield_fitting(
 
     del low_res_clipped
 
-    _LOGGER.info(f"Upscaling mask to full resolution: {full_res.shape}")
-    mask_upscaled = upscale_mask_nearest(
-        mask, full_res.shape, chunks=(128, 256, 256)
-    ).astype(np.uint8)
+    if mask.shape == full_res.shape:
+        _LOGGER.info("Mask already at full resolution, skipping upscaling.")
+        mask_upscaled = mask
+    else:
+        _LOGGER.info(f"Upscaling mask to full resolution: {full_res.shape}")
+        mask_upscaled = upscale_mask_nearest(
+            mask, full_res.shape, chunks=(128, 256, 256)
+        ).astype(np.uint8)
+
     mask_path = out_mask_path.rstrip("/") + f"/{tile_name}"
     store_ome_zarr(
         mask_upscaled,
