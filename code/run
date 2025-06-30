@@ -4,6 +4,8 @@ set -ex
 export AWS_REQUEST_CHECKSUM_CALCULATION=when_required
 export AWS_RESPONSE_CHECKSUM_VALIDATION=when_required
 
+export MALLOC_TRIM_THRESHOLD_=0
+
 # This is the master script for the capsule. When you click "Reproducible Run", the code in this file will execute.
 
 python -u -m exaspim_flatfield_correction.pipeline.run_pipeline \
