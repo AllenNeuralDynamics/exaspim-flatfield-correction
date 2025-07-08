@@ -675,6 +675,7 @@ def parse_and_validate_args() -> argparse.Namespace:
         help="Number of zarr pyramid levels (default: 1)",
     )
     parser.add_argument("--use-reference-bkg", action="store_true", default=False, help="Use reference background image from S3 instead of estimating background.")
+    parser.add_argument("--is-binned", action="store_true", default=False)
     args = parser.parse_args()
 
     if args.method == "fitting" and args.mask_dir is None:
@@ -769,9 +770,13 @@ def main() -> None:
             filename=os.path.join(results_dir, f"dask-report_{tile_name}.html")
         ):
             try:
-                is_binned_channel, resolution = get_channel_resolution(
-                    tile_name, binned_channel, binned_res, res
-                )
+                if args.is_binned:
+                    is_binned_channel = True
+                    resolution = "0"
+                else:
+                    is_binned_channel, resolution = get_channel_resolution(
+                        tile_name, binned_channel, binned_res, res
+                    )
                 _LOGGER.info(f"{tile_name} is binned: {is_binned_channel}")
 
                 z = zarr.open(tile_path, mode="r")
