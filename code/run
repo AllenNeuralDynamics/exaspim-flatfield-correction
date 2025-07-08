@@ -8,6 +8,12 @@ export MALLOC_TRIM_THRESHOLD_=65536
 
 # This is the master script for the capsule. When you click "Reproducible Run", the code in this file will execute.
 
+# Check if eighth argument is 1
+BINNED_FLAG=""
+if [ "$8" == "1" ]; then
+  BINNED_FLAG="--is-binned"
+fi
+
 python -u -m exaspim_flatfield_correction.pipeline.run_pipeline \
 --zarr "$1" \
 --output "$2" \
@@ -18,6 +24,7 @@ python -u -m exaspim_flatfield_correction.pipeline.run_pipeline \
 --mask-dir "$7" \
 --n-levels 7 \
 --results-dir "/results" \
---overwrite
+--overwrite \
+$BINNED_FLAG
 
 echo "Done!"
