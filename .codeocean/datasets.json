@@ -2,20 +2,12 @@
 	"version": 1,
 	"attached_datasets": [
 		{
-			"id": "2a3e911d-2d67-43a3-9b09-f6196a72c0ed",
-			"mount": "776235_masks"
+			"id": "30b1e4b0-e4c5-4854-ba06-fb11dc26e3fa",
+			"mount": "759925_masks"
 		},
 		{
-			"id": "5e61ae8b-39d1-4013-9be5-eb3ea6ec7ddf",
-			"mount": "782742_masks"
-		},
-		{
-			"id": "c66e349f-e048-44cb-b639-31db5c961cf0",
-			"mount": "686951_masks"
-		},
-		{
-			"id": "e940bb08-380a-486c-aaba-b8d89a98b7ef",
-			"mount": "760354_masks"
+			"id": "7e34b177-5d8b-421e-ba8e-61930252e73c",
+			"mount": "776241_masks"
 		}
 	]
 }
