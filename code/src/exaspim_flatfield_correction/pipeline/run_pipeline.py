@@ -748,10 +748,10 @@ def main() -> None:
         )
     client = Client(
         LocalCluster(
-            processes=False, 
-            n_workers=1, 
-            threads_per_worker=args.num_workers,
-            memory_limit=co_memory
+            processes=True, 
+            n_workers=args.num_workers, 
+            threads_per_worker=1,
+            memory_limit=int(co_memory / args.num_workers)
         )
     )
     _LOGGER.info(f"Dask client: {client}")
