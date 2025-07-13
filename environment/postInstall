@@ -1,17 +1,35 @@
 #!/usr/bin/env bash
 set -ex
 
-git clone https://github.com/AllenNeuralDynamics/exaspim-flatfield-correction.git
-cd exaspim-flatfield-correction/
-git checkout fix-dask-cluster
-cd code/
-pip install .[basicpy]
-cd ../..
+# git clone https://github.com/AllenNeuralDynamics/exaspim-flatfield-correction.git
+# cd exaspim-flatfield-correction/
+# git checkout fix-dask-cluster
+# cd code/
+# pip install .[basicpy]
+# cd ../..
 
-VERSION=4.100.3
-mkdir /.code-server
-cd /.code-server
-curl -fL "https://github.com/coder/code-server/releases/download/v$VERSION/code-server-$VERSION-linux-amd64.tar.gz" \
-  | tar -xz
-ln -s /.code-server/code-server-$VERSION-linux-amd64/bin/code-server  /usr/bin/code-server
-cd -
+# VERSION=4.100.3
+# mkdir /.code-server
+# cd /.code-server
+# curl -fL "https://github.com/coder/code-server/releases/download/v$VERSION/code-server-$VERSION-linux-amd64.tar.gz" \
+#   | tar -xz
+# ln -s /.code-server/code-server-$VERSION-linux-amd64/bin/code-server  /usr/bin/code-server
+# cd -
+
+conda update conda -y
+conda update mamba -y
+mamba install -c conda-forge python=3.11 pip jupyterlab -y
+
+git clone https://github.com/AllenNeuralDynamics/aind-data-transfer.git
+cd aind-data-transfer
+git checkout fix-aind-data-schema
+pip install .[imaging] 
+./post_install.sh
+pip install ujson "dask[distributed]==2025.3.0" dask-image matplotlib 
+
+#pip install "jax[cuda12-local]==0.4.20" -f https://storage.googleapis.com/jax-releases/jax_cuda_releases.html
+pip install "jax[cpu]==0.4.20" 
+pip install basicpy==1.2.0
+
+pip install scipy==1.15.2
+pip install --upgrade --no-cache-dir notebook==6.*

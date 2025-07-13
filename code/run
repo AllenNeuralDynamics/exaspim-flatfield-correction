@@ -14,7 +14,7 @@ if [ "$8" == "1" ]; then
   BINNED_FLAG="--is-binned"
 fi
 
-python -u -m exaspim_flatfield_correction.pipeline.run_pipeline \
+PYTHONPATH=./src python -u ./src/exaspim_flatfield_correction/pipeline/run_pipeline.py \
 --zarr "$1" \
 --output "$2" \
 --res "$3" \
