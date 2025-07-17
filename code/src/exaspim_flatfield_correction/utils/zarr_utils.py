@@ -73,7 +73,7 @@ def store_ome_zarr(
                 "s3": {
                     "multipart_threshold": 256
                     * 1024
-                    * 1024,  # 64 MB, avoid multipart upload for small chunks
+                    * 1024,  # 256 MB, avoid multipart upload for small chunks
                 },
                 "retries": {
                     "total_max_attempts": 10,
@@ -81,6 +81,7 @@ def store_ome_zarr(
                 },
             },
             use_ssl=s3_use_ssl,
+            s3_additional_kwargs = {"batch_size": 64},
         )
         # Create a Zarr group on S3
         store = s3fs.S3Map(root=output_zarr, s3=s3, check=False)
