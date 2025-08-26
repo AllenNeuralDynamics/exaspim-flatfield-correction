@@ -567,8 +567,8 @@ def get_fitting_config() -> dict:
         "spline_smoothing": 0.01,
         "limits_xy": (0.25, 1.1),
         "limits_z": (0.25, 1.1),
-        "global_factor_binned": 3600,
-        "global_factor_unbinned": 60,
+        "global_factor_binned": 2700,
+        "global_factor_unbinned": 70,
     }
 
 
