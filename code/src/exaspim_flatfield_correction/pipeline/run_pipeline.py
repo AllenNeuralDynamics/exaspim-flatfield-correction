@@ -565,8 +565,8 @@ def get_fitting_config() -> dict:
         "percentile": 99,
         "gaussian_sigma": 2,
         "spline_smoothing": 0.01,
-        "limits_xy": (0.25, 1.1),
-        "limits_z": (0.25, 1.1),
+        "limits_xy": (0.5, 1),
+        "limits_z": (0.5, 1),
         "global_factor_binned": 3200,
         "global_factor_unbinned": 100,
     }
