@@ -561,14 +561,14 @@ def get_fitting_config() -> dict:
     """
     return {
         "med_factor_binned": 2,
-        "med_factor_unbinned": 5,
+        "med_factor_unbinned": 2,
         "percentile": 99,
         "gaussian_sigma": 2,
         "spline_smoothing": 0.01,
         "limits_xy": (0.25, 1.1),
         "limits_z": (0.25, 1.1),
-        "global_factor_binned": 2700,
-        "global_factor_unbinned": 70,
+        "global_factor_binned": 3200,
+        "global_factor_unbinned": 100,
     }
 
 
