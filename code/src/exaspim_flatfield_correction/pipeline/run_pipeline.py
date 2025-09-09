@@ -42,6 +42,7 @@ from exaspim_flatfield_correction.utils.utils import (
     read_bkg_image,
     get_bkg_path,
     resize,
+    save_correction_curve_plot,
 )
 
 
@@ -362,7 +363,7 @@ def flatfield_fitting(
     n_levels: int,
     config: dict,
     results_dir: str = None,
-) -> da.Array:
+) -> tuple[da.Array, np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray | None, np.ndarray | None]:
     """
     Apply fitting-based flatfield correction to the image using a mask
     and configurable parameters.
@@ -485,6 +486,7 @@ def flatfield_fitting(
             spline_smoothing=config.get("spline_smoothing", 0.01),
             limits=config.get("limits_z", (0.25, 1.2)),
         )
+        # fit_z defined in this branch; if median_xy==0 it will remain None
         correction_z = fit_z.reshape(-1, 1, 1)
         corrected = da.where(
             mask_upscaled, corrected / correction_z, corrected
@@ -505,7 +507,10 @@ def flatfield_fitting(
         )
         corrected = da.clip(corrected, 0, 2**16 - 1)
 
-    return corrected
+    # Return corrected image and QC/debug artifacts for saving in main
+    return corrected, mask_2d_xy, mask_2d_yz, xy_proj, yz_proj, fit_x, (
+        fit_z if 'fit_z' in locals() else None
+    )
 
 
 def save_metadata(
@@ -570,6 +575,108 @@ def get_fitting_config() -> dict:
         "global_factor_binned": 3200,
         "global_factor_unbinned": 100,
     }
+
+
+def save_method_outputs(
+    method: str,
+    tile_name: str,
+    results_dir: str,
+    save_outputs: bool,
+    bkg: np.ndarray | None = None,
+    artifacts: dict | None = None,
+) -> None:
+    """
+    Save method-specific QC/debug outputs.
+
+    Parameters
+    ----------
+    method : str
+        The correction method used (e.g., 'fitting', 'basicpy', 'reference').
+    tile_name : str
+        Current tile name for filenames.
+    results_dir : str
+        Directory to write outputs.
+    save_outputs : bool
+        Gate to enable/disable saving.
+    bkg : np.ndarray or None
+        Background image (if computed).
+    artifacts : dict or None
+        Method-specific artifacts; for 'fitting' expects keys:
+          mask2d_xy, mask2d_yz, xy_proj, yz_proj, fit_x, fit_z.
+    """
+    if not save_outputs or results_dir is None:
+        return
+
+    # Always try to save background if provided
+    try:
+        if bkg is not None:
+            tifffile.imwrite(
+                os.path.join(results_dir, f"{tile_name}_bkg.tif"),
+                bkg,
+                imagej=True,
+            )
+    except Exception:
+        _LOGGER.exception("Failed saving background TIFF")
+
+    if method == "fitting" and artifacts:
+        try:
+            mask2d_xy = artifacts.get("mask2d_xy")
+            mask2d_yz = artifacts.get("mask2d_yz")
+            xy_proj = artifacts.get("xy_proj")
+            yz_proj = artifacts.get("yz_proj")
+            fit_x = artifacts.get("fit_x")
+            fit_z = artifacts.get("fit_z")
+
+            if mask2d_xy is not None:
+                tifffile.imwrite(
+                    os.path.join(results_dir, f"{tile_name}_mask2d_xy.tif"),
+                    mask2d_xy.astype(np.uint8),
+                    imagej=True,
+                )
+            if mask2d_yz is not None:
+                tifffile.imwrite(
+                    os.path.join(results_dir, f"{tile_name}_mask2d_yz.tif"),
+                    mask2d_yz.astype(np.uint8),
+                    imagej=True,
+                )
+            if xy_proj is not None:
+                tifffile.imwrite(
+                    os.path.join(results_dir, f"{tile_name}_xy_proj_smooth.tif"),
+                    xy_proj.astype(np.float32),
+                    imagej=True,
+                )
+            if yz_proj is not None:
+                tifffile.imwrite(
+                    os.path.join(results_dir, f"{tile_name}_yz_proj_smooth.tif"),
+                    yz_proj.astype(np.float32),
+                    imagej=True,
+                )
+        except Exception:
+            _LOGGER.exception("Failed saving QC TIFFs for fitting")
+
+        try:
+            if fit_x is not None:
+                save_correction_curve_plot(
+                    fit_x,
+                    title=f"XY correction curve: {tile_name}",
+                    xlabel="X (pixels)",
+                    ylabel="Correction factor",
+                    out_png=os.path.join(results_dir, f"{tile_name}_corr_xy.png"),
+                )
+            if fit_z is not None:
+                save_correction_curve_plot(
+                    fit_z,
+                    title=f"YZ correction curve: {tile_name}",
+                    xlabel="Z (slices)",
+                    ylabel="Correction factor",
+                    out_png=os.path.join(results_dir, f"{tile_name}_corr_yz.png"),
+                )
+        except Exception:
+            _LOGGER.exception("Failed saving correction curve plots for fitting")
+
+    # Placeholders for other methods; can be extended later
+    elif method in ("basicpy", "reference"):
+        _LOGGER.debug(f"No additional QC artifacts to save for method: {method}")
 
 
 def get_channel_resolution(
@@ -803,8 +910,7 @@ def main() -> None:
                     full_res, bkg = background_subtraction(
                         tile_path, full_res, z, is_binned_channel, args.use_reference_bkg
                     )
-                    if args.save_outputs:
-                        tifffile.imwrite(os.path.join(results_dir, f"{tile_name}_bkg.tif"), bkg, imagej=True)
+                    # Background QC saving is centralized at the end per method
 
                 if not args.skip_flat_field:
                     if method == "reference":
@@ -824,7 +930,15 @@ def main() -> None:
                         )
                     elif method == "fitting":
                         fitting_config = get_fitting_config()
-                        corrected = flatfield_fitting(
+                        (
+                            corrected,
+                            mask2d_xy,
+                            mask2d_yz,
+                            xy_proj,
+                            yz_proj,
+                            fit_x,
+                            fit_z,
+                        ) = flatfield_fitting(
                             full_res,
                             z,
                             is_binned_channel,
@@ -835,7 +949,7 @@ def main() -> None:
                             args.overwrite,
                             args.n_levels,
                             fitting_config,
-                            results_dir=results_dir
+                            results_dir=results_dir,
                         )
                     else:
                         _LOGGER.error(f"Invalid method: {method}")
@@ -858,6 +972,26 @@ def main() -> None:
                     # write_empty_chunks=True
                 )
                 _LOGGER.info(f"Storing OME-Zarr took {time.time() - t0:.2f}s")
+
+                # Centralized, method-aware saving of QC outputs
+                artifacts = None
+                if method == "fitting":
+                    artifacts = {
+                        "mask2d_xy": mask2d_xy,
+                        "mask2d_yz": mask2d_yz,
+                        "xy_proj": xy_proj,
+                        "yz_proj": yz_proj,
+                        "fit_x": fit_x,
+                        "fit_z": fit_z,
+                    }
+                save_method_outputs(
+                    method,
+                    tile_name,
+                    results_dir,
+                    args.save_outputs,
+                    bkg=bkg,
+                    artifacts=artifacts,
+                )
 
                 data_process.end_date_time = datetime.now()
                 save_metadata(data_process, out_path, tile_name, tile_path, results_dir)

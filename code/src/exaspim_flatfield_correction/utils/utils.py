@@ -8,6 +8,9 @@ import numpy as np
 import dask.array as da
 from skimage.transform import resize as _resize
 from botocore.exceptions import ClientError
+import matplotlib
+matplotlib.use("Agg")
+import matplotlib.pyplot as plt
 
 
 def compose_image(
@@ -343,3 +346,40 @@ def resize_dask(
     )
 
     return resized_image
+
+
+def save_correction_curve_plot(
+    curve: "np.ndarray | list[float]",
+    title: str,
+    xlabel: str,
+    ylabel: str,
+    out_png: str,
+    dpi: int = 150,
+) -> None:
+    """
+    Save a simple line plot for a 1D correction curve to a PNG file.
+
+    Parameters
+    ----------
+    curve : array-like
+        1D array of correction factors to plot.
+    title : str
+        Plot title.
+    xlabel : str
+        X-axis label.
+    ylabel : str
+        Y-axis label.
+    out_png : str
+        Output PNG path.
+    dpi : int, optional
+        Figure resolution, default 150.
+    """
+    fig, ax = plt.subplots(figsize=(6, 3))
+    ax.plot(curve)
+    ax.set_title(title)
+    ax.set_xlabel(xlabel)
+    ax.set_ylabel(ylabel)
+    ax.grid(True, alpha=0.3)
+    fig.tight_layout()
+    fig.savefig(out_png, dpi=dpi)
+    plt.close(fig)
