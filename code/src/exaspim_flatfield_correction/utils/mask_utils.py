@@ -2,7 +2,7 @@ import numpy as np
 import dask.array as da
 from scipy.ndimage import distance_transform_edt
 from scipy.ndimage import binary_fill_holes, binary_closing
-from scipy.ndimage.measurements import label
+from scipy.ndimage import label
 from skimage.morphology import ball, disk
 import logging
 from typing import Union
@@ -147,13 +147,14 @@ def upscale_mask_nearest(
     dask.array.Array
         The upscaled mask as a Dask array.
     """
-    # Compute uniform scale factor (assumes new_shape[0]/mask.shape[0]
-    # is the same as for other dimensions)
-    scale_factor = new_shape[0] / mask.shape[0]
+    # Compute anisotropic per-axis scale factors
+    sz = new_shape[0] / mask.shape[0]
+    sy = new_shape[1] / mask.shape[1]
+    sx = new_shape[2] / mask.shape[2]
 
     # Use nearest-neighbor interpolation (order=0)
     upscaled = resize_dask(
-        mask, scale_factor=scale_factor, order=0, output_chunks=chunks
+        mask, scale_factor=(sz, sy, sx), order=0, output_chunks=chunks
     )
 
     return upscaled
@@ -203,15 +204,15 @@ def upscale_mask_edt(
     # Convert the SDF to a Dask array.
     sdf_da = da.from_array(sdf.astype(np.float32), chunks=chunks)
 
-    # Compute uniform scale factor (assumes new_shape[0]/mask.shape[0]
-    # is the same for all axes)
-    scale_factor = new_shape[0] / mask.shape[0]
-    print("scale factor:", scale_factor)
+    # Compute anisotropic per-axis scale factors
+    sz = new_shape[0] / mask.shape[0]
+    sy = new_shape[1] / mask.shape[1]
+    sx = new_shape[2] / mask.shape[2]
+    print("scale factors:", sz, sy, sx)
 
-    # Upscale the SDF using the affine transformation based resize with linear
-    # interpolation (order=1).
+    # Upscale the SDF using affine-based resize with linear interpolation (order=1).
     sdf_upscaled = resize_dask(
-        sdf_da, scale_factor=scale_factor, order=1, output_chunks=chunks
+        sdf_da, scale_factor=(sz, sy, sx), order=1, output_chunks=chunks
     )
 
     # values >= 0 are considered inside the mask.

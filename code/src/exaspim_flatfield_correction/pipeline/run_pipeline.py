@@ -103,15 +103,14 @@ def load_mask_from_dir(mask_dir: str, tile_name: str) -> np.ndarray:
     if mask_dir is None or not os.path.isdir(mask_dir):
         raise ValueError(f"Mask directory {mask_dir} does not exist or is not a directory.")
     _LOGGER.info(f"Loading mask from directory: {mask_dir} for tile: {tile_name}")
-    maskf = None
+    tile_prefix = "_".join(tile_name.split("_")[:2])
     for root, _, files in os.walk(mask_dir, followlinks=True):
         for f in files:
-            if "_".join(tile_name.split("_")[:2]) in f:
-                maskf = f
-    if maskf is None:
-        raise Exception(f"No mask file found for tile: {tile_name}")
-    maskp = os.path.join(root, maskf)
-    return tifffile.imread(maskp)
+            if tile_prefix in f:
+                maskp = os.path.join(root, f)
+                _LOGGER.info(f"Found mask file: {maskp}")
+                return tifffile.imread(maskp)
+    raise Exception(f"No mask file found for tile: {tile_name}")
 
 
 def parse_inputs(args: argparse.Namespace) -> dict:
@@ -492,10 +491,11 @@ def flatfield_fitting(
         )
 
         _LOGGER.info(f"median xy: {median_xy}")
+        # Use defaults consistent with get_fitting_config()
         global_factor = (
-            config.get("global_factor_binned", 9000)
+            config.get("global_factor_binned", 3200)
             if is_binned_channel
-            else config.get("global_factor_unbinned", 70)
+            else config.get("global_factor_unbinned", 100)
         )
         _LOGGER.info("Doing global correction with factor: "
                      f"{global_factor} and median_xy: {median_xy}, ratio = "
@@ -741,17 +741,24 @@ def main() -> None:
     set_dask_config(results_dir)
     co_memory = get_mem_limit()
     _LOGGER.info(f"CO_MEMORY: {co_memory}")
-    if isinstance(co_memory, int) and co_memory <= 0:
-        raise ValueError(
-            "CO_MEMORY must be set to a positive integer value "
-            "to allocate memory for Dask workers."
-        )
+
+    # Support CO_MEMORY='auto' or explicit integer bytes
+    if isinstance(co_memory, int):
+        if co_memory <= 0:
+            raise ValueError(
+                "CO_MEMORY must be set to a positive integer value "
+                "to allocate memory for Dask workers."
+            )
+        memory_limit = int(co_memory / max(1, args.num_workers))
+    else:
+        memory_limit = "auto"
+
     client = Client(
         LocalCluster(
-            processes=True, 
-            n_workers=args.num_workers, 
+            processes=True,
+            n_workers=args.num_workers,
             threads_per_worker=1,
-            memory_limit=int(co_memory / args.num_workers)
+            memory_limit=memory_limit,
         )
     )
     _LOGGER.info(f"Dask client: {client}")

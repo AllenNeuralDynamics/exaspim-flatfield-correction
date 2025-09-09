@@ -24,6 +24,7 @@ PYTHONPATH=./src python -u ./src/exaspim_flatfield_correction/pipeline/run_pipel
 --mask-dir "$7" \
 --n-levels 7 \
 --results-dir "/results" \
+--save-outputs \
 --overwrite \
 $BINNED_FLAG
 

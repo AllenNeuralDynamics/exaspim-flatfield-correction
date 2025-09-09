@@ -279,7 +279,7 @@ def resize(
 
 def resize_dask(
     image: da.Array,
-    scale_factor: float,
+    scale_factor: "float | tuple[float, float, float]",
     order: int = 1,
     output_chunks: tuple[int, int, int] = (128, 256, 256),
 ) -> da.Array:
@@ -308,20 +308,30 @@ def resize_dask(
     """
     from dask_image.ndinterp import affine_transform
 
+    # Determine per-axis scaling factors
+    if isinstance(scale_factor, (tuple, list)):
+        sz, sy, sx = map(float, scale_factor)
+    else:
+        sz = sy = sx = float(scale_factor)
+
     # Construct a 4x4 homogeneous affine transformation matrix.
     # The matrix maps output coordinates into input coordinates.
     # Scaling factors are inverted because of this coordinate mapping.
     matrix = np.array(
         [
-            [1 / scale_factor, 0, 0, 0],
-            [0, 1 / scale_factor, 0, 0],
-            [0, 0, 1 / scale_factor, 0],
+            [1 / sz, 0, 0, 0],
+            [0, 1 / sy, 0, 0],
+            [0, 0, 1 / sx, 0],
             [0, 0, 0, 1],
         ]
     )
 
     # Calculate the new output shape (assumes image has at least 3 dimensions).
-    new_shape = tuple(int(dim * scale_factor) for dim in image.shape[:3])
+    new_shape = (
+        int(image.shape[0] * sz),
+        int(image.shape[1] * sy),
+        int(image.shape[2] * sx),
+    )
 
     # Apply the affine transformation.
     resized_image = affine_transform(
