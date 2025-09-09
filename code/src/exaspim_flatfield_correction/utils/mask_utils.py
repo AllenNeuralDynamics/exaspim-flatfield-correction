@@ -87,9 +87,15 @@ def process_mask(
     else:
         raise ValueError("Input volume must be 2D or 3D.")
 
+    mask = binary_fill_holes(binary_closing(mask, selem))
+
+    return size_filter(mask, min_size)
+
+
+def size_filter(mask, min_size = None):
     # Label connected components in the filled mask.
     labeled_array, num_features = label(
-        binary_fill_holes(binary_closing(mask, selem))
+        mask
     )
     _LOGGER.debug(f"Number of connected features: {num_features}")
     if num_features < 2**16:
@@ -101,7 +107,7 @@ def process_mask(
     # Calculate sizes for each component (ignore background label 0).
     component_sizes = np.bincount(labeled_array.ravel())
     component_sizes[0] = 0  # ignore background
-
+    
     if min_size is None:
         # Default: keep only the largest connected component.
         largest_component = np.argmax(component_sizes)

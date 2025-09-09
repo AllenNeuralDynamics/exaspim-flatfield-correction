@@ -29,7 +29,7 @@ from exaspim_flatfield_correction.splinefit import (
     get_correction_func,
 )
 from exaspim_flatfield_correction.background import estimate_bkg
-from exaspim_flatfield_correction.utils.mask_utils import upscale_mask_nearest
+from exaspim_flatfield_correction.utils.mask_utils import upscale_mask_nearest, size_filter
 from exaspim_flatfield_correction.utils.zarr_utils import (
     store_ome_zarr,
     parse_ome_zarr_transformations,
@@ -342,6 +342,7 @@ def _preprocess_mask(mask: np.ndarray, low_res_shape: tuple, results_dir: str, t
             .astype(np.uint8)
             .compute()
         )
+        mask = size_filter(mask, 1000000)
     zarr.save_array(
         str(mask_name),
         mask,
