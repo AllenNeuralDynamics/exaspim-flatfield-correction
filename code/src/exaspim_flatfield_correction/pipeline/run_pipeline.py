@@ -339,7 +339,7 @@ def _preprocess_mask(mask: np.ndarray, low_res_shape: tuple, results_dir: str, t
                 chunks=(128, 256, 256),
         ).compute()
         # keep only the largest connected component
-        mask = size_filter(mask, k_largest=2, min_size=(100*200*200))
+        mask = size_filter(mask, k_largest=1, min_size=None)
     mask = mask.astype(np.uint8)
     zarr.save_array(
         str(mask_name),
