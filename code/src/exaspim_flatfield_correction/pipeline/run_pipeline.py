@@ -333,16 +333,14 @@ def _preprocess_mask(mask: np.ndarray, low_res_shape: tuple, results_dir: str, t
     """
     mask_name = str(Path(results_dir) / f"{tile_name}_mask.zarr")
     if mask.shape != low_res_shape:
-        mask = (
-            upscale_mask_nearest(
+        mask = upscale_mask_nearest(
                 da.from_array(mask, chunks=(128, 256, 256)),
                 low_res_shape,
                 chunks=(128, 256, 256),
-            )
-            .astype(np.uint8)
-            .compute()
-        )
-        mask = size_filter(mask, 1000000)
+        ).compute()
+        # keep only the largest connected component
+        mask = size_filter(mask, k_largest=2, min_size=(100*200*200))
+    mask = mask.astype(np.uint8)
     zarr.save_array(
         str(mask_name),
         mask,
@@ -570,9 +568,9 @@ def get_fitting_config() -> dict:
         "med_factor_unbinned": 2,
         "percentile": 99,
         "gaussian_sigma": 2,
-        "spline_smoothing": 0.01,
-        "limits_xy": (0.5, 1),
-        "limits_z": (0.5, 1),
+        "spline_smoothing": 0,
+        "limits_xy": (0.25, 1.2),
+        "limits_z": (0.25, 1.2),
         "global_factor_binned": 3200,
         "global_factor_unbinned": 100,
     }
