@@ -16,7 +16,7 @@ from aind_data_transfer.transformations.ome_zarr import (
 )
 from numcodecs import blosc
 blosc.use_threads = False
-from xarray_multiscale.reducers import windowed_rank
+from xarray_multiscale.reducers import windowed_rank, windowed_mean
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -28,7 +28,7 @@ def store_ome_zarr(
     voxel_size: tuple[float, float, float] = (1.0, 1.0, 1.0),
     origin: tuple[int, int, int, int, int] = (0, 0, 0, 0, 0),
     overwrite: bool = False,
-    reducer: Callable = windowed_rank,
+    reducer: Callable = windowed_mean,
     aws_region: str = "us-west-2",
     s3_use_ssl: bool = False,
     # write_empty_chunks: bool = True
