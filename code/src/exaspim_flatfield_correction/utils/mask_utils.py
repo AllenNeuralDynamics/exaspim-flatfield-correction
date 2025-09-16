@@ -1,11 +1,16 @@
-import numpy as np
-import dask.array as da
-from scipy.ndimage import distance_transform_edt
-from scipy.ndimage import binary_fill_holes, binary_closing
-from scipy.ndimage import label
-from skimage.morphology import ball, disk
 import logging
 from typing import Union
+
+import dask.array as da
+import numpy as np
+from scipy.ndimage import (
+    binary_closing,
+    binary_fill_holes,
+    distance_transform_edt,
+    label,
+)
+from skimage.morphology import ball, disk
+from sklearn.mixture import GaussianMixture
 
 from exaspim_flatfield_correction.utils.utils import resize_dask
 
@@ -256,3 +261,114 @@ def upscale_mask_edt(
 
     # values >= 0 are considered inside the mask.
     return sdf_upscaled >= 0
+
+
+def gmm_probability_mask(
+    image: np.ndarray,
+    mask: np.ndarray,
+    *,
+    n_components: int = 2,
+    max_samples: int = 500_000,
+    batch_size: int = 50_000,
+    random_state: int | None = 0,
+) -> np.ndarray:
+    """Estimate tissue probabilities inside a mask using a Gaussian mixture.
+
+    The function only fits intensities that are within the provided binary
+    mask. When the mask contains more voxels than ``max_samples`` it randomly
+    subsamples to keep the fitting cost bounded. The fitted model is reused to
+    score the remaining voxels in batches, returning the posterior probability
+    that a voxel belongs to the brightest component (assumed tissue).
+
+    Parameters
+    ----------
+    image : np.ndarray
+        Raw intensity volume. It must have the same shape as ``mask``.
+    mask : np.ndarray
+        Boolean or uint8 segmentation mask. Only True voxels are considered.
+    n_components : int, optional
+        Number of mixture components. Default is 2 (foreground/background).
+    max_samples : int, optional
+        Maximum sample count used for GMM fitting. Default is 5e5.
+    batch_size : int, optional
+        Batch size for probability prediction to reduce peak memory use.
+    random_state : int or None, optional
+        Seed forwarded to ``GaussianMixture`` for reproducibility.
+
+    Returns
+    -------
+    np.ndarray
+        Array of the same shape as ``image`` containing tissue probabilities
+        for voxels inside the mask and zeros outside.
+    """
+
+    if image.shape != mask.shape:
+        raise ValueError("image and mask must share the same shape")
+
+    mask_bool = mask.astype(bool)
+    foreground_idx = np.where(mask_bool.ravel())[0]
+    if foreground_idx.size == 0:
+        raise ValueError("Mask does not contain any foreground voxels")
+
+    rng = np.random.default_rng(random_state)
+    if foreground_idx.size > max_samples:
+        train_idx = rng.choice(foreground_idx, size=max_samples, replace=False)
+    else:
+        train_idx = foreground_idx
+
+    intensities = image.ravel()[train_idx].astype(np.float32)
+    gmm = GaussianMixture(
+        n_components=n_components,
+        covariance_type="full",
+        random_state=random_state,
+    )
+    gmm.fit(intensities.reshape(-1, 1))
+
+    # Identify the component with the highest mean as tissue
+    tissue_component = np.argmax(gmm.means_.ravel())
+
+    probabilities = np.zeros(image.size, dtype=np.float32)
+    remaining_idx = foreground_idx
+    for start in range(0, remaining_idx.size, batch_size):
+        stop = start + batch_size
+        batch_idx = remaining_idx[start:stop]
+        batch_vals = image.ravel()[batch_idx].astype(np.float32)
+        batch_post = gmm.predict_proba(batch_vals.reshape(-1, 1))
+        probabilities[batch_idx] = batch_post[:, tissue_component]
+
+    return probabilities.reshape(image.shape)
+
+
+def project_probability_mask(
+    probability_volume: np.ndarray,
+    axis: int,
+    threshold: float,
+    min_size: int | None = None,
+) -> np.ndarray:
+    """Project a probability volume along one axis and threshold the maximum.
+
+    Parameters
+    ----------
+    probability_volume : np.ndarray
+        Soft mask (values in [0, 1]).
+    axis : int
+        Axis along which to compute the projection.
+    threshold : float
+        Minimum probability to mark a pixel as foreground in the projection.
+
+    Returns
+    -------
+    np.ndarray
+        Binary projection mask with optional small-component removal.
+    """
+
+    if threshold <= 0 or threshold > 1:
+        raise ValueError("threshold must be within (0, 1]")
+
+    max_proj = probability_volume.max(axis=axis)
+    mask_2d = max_proj >= threshold
+
+    if min_size is not None:
+        mask_2d = size_filter(mask_2d, min_size=min_size)
+
+    return mask_2d

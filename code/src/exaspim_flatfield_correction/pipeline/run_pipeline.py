@@ -29,7 +29,12 @@ from exaspim_flatfield_correction.splinefit import (
     get_correction_func,
 )
 from exaspim_flatfield_correction.background import estimate_bkg
-from exaspim_flatfield_correction.utils.mask_utils import upscale_mask_nearest, size_filter
+from exaspim_flatfield_correction.utils.mask_utils import (
+    gmm_probability_mask,
+    project_probability_mask,
+    size_filter,
+    upscale_mask_nearest,
+)
 from exaspim_flatfield_correction.utils.zarr_utils import (
     store_ome_zarr,
     parse_ome_zarr_transformations,
@@ -406,9 +411,6 @@ def flatfield_fitting(
         results_dir,
         tile_name
     )
-    mask_2d_xy = mask.max(axis=0).compute()
-    mask_2d_yz = mask.max(axis=2).compute()
-
     med_factor = (
         config.get("med_factor_binned", 2)
         if is_binned_channel
@@ -427,6 +429,48 @@ def flatfield_fitting(
     low_res_clipped = da.clip(low_res, 0, nan_med * med_factor).astype(np.uint16).compute()
 
     del low_res, nan_med
+
+    mask_np = mask.astype(bool).compute()
+    gmm_n_components = config.get("gmm_n_components", 2)
+    gmm_max_samples = config.get("gmm_max_samples", 1_000_000)
+    gmm_batch_size = config.get("gmm_batch_size", 1_000_000)
+    gmm_random_state = config.get("gmm_random_state", 0)
+
+    _LOGGER.info(
+        "Fitting GMM probabilities with n_components=%d, max_samples=%d, batch_size=%d",
+        gmm_n_components,
+        gmm_max_samples,
+        gmm_batch_size,
+    )
+    probability_volume = gmm_probability_mask(
+        low_res_clipped.astype(np.float32),
+        mask_np,
+        n_components=gmm_n_components,
+        max_samples=gmm_max_samples,
+        batch_size=gmm_batch_size,
+        random_state=gmm_random_state,
+    )
+    prob_threshold = config.get("mask_probability_threshold", 0.2)
+    prob_min_size = config.get("mask_probability_min_size", 250)
+    _LOGGER.info(
+        "Projecting probability mask with threshold %.3f and min_size %s",
+        prob_threshold,
+        prob_min_size,
+    )
+    mask_2d_xy = project_probability_mask(
+        probability_volume,
+        axis=0,
+        threshold=prob_threshold,
+        min_size=prob_min_size,
+    )
+    mask_2d_yz = project_probability_mask(
+        probability_volume,
+        axis=2,
+        threshold=prob_threshold,
+        min_size=prob_min_size,
+    )
+
+    del probability_volume, mask_np
 
     percentile = config.get("percentile", 99)
     _LOGGER.info(f"Computing percentile projection with percentile: {percentile}")
@@ -573,6 +617,12 @@ def get_fitting_config() -> dict:
         "limits_z": (0.25, 1.2),
         "global_factor_binned": 3200,
         "global_factor_unbinned": 100,
+        "mask_probability_threshold": 0.3,
+        "mask_probability_min_size": 1000,
+        "gmm_n_components": 2,
+        "gmm_max_samples": 1_000_000,
+        "gmm_batch_size": 100_000,
+        "gmm_random_state": 0,
     }
 
 
