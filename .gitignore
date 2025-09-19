@@ -3,3 +3,4 @@ notebooks/
 .vscode
 **/__pycache__/
 *.egg-info
+aws/
