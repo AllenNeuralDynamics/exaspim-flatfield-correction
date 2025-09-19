@@ -4,6 +4,7 @@ import time
 import json
 import argparse
 import logging
+import subprocess
 from pathlib import Path
 from datetime import datetime
 
@@ -989,7 +990,19 @@ def main() -> None:
 
     out_mask_path = create_mask_path(out_path)
     out_probability_path = create_probability_path(out_path)
-    
+
+    artifacts_destination = None
+    tile_name_for_artifacts = Path(tile_paths[0]).name if tile_paths else None
+    if tile_name_for_artifacts and out_path.startswith("s3://"):
+        try:
+            parent_output = get_parent_s3_path(out_path)
+            artifacts_destination = f"{parent_output}/artifacts/{tile_name_for_artifacts}"
+        except ValueError:
+            _LOGGER.warning(
+                "Unable to determine artifacts destination from output path %s",
+                out_path,
+            )
+
     start_date_time = datetime.now()
     data_process = create_processing_metadata(
         args, tile_paths[0], out_path, start_date_time, res
@@ -1121,6 +1134,32 @@ def main() -> None:
                     f"Error processing tile {tile_name}: {e}", exc_info=True
                 )
                 raise
+
+    if artifacts_destination:
+        try:
+            _LOGGER.info(
+                "Uploading artifacts from %s to %s",
+                results_dir,
+                artifacts_destination,
+            )
+            subprocess.run(
+                [
+                    "aws",
+                    "s3",
+                    "cp",
+                    "--recursive",
+                    results_dir,
+                    artifacts_destination,
+                ],
+                check=True,
+            )
+        except subprocess.CalledProcessError as exc:
+            _LOGGER.error(
+                "Failed to upload artifacts to %s",
+                artifacts_destination,
+                exc_info=True,
+            )
+            raise
 
 
 if __name__ == "__main__":

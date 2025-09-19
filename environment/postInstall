@@ -323,3 +323,7 @@ conda update mamba -y
 mamba create -n correction -c conda-forge python=3.11 -y
 source $(conda info --base)/etc/profile.d/conda.sh
 conda activate correction
+
+curl "https://awscli.amazonaws.com/awscli-exe-linux-x86_64.zip" -o "awscliv2.zip"
+unzip awscliv2.zip
+./aws/install
