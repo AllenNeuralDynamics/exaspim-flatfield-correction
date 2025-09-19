@@ -277,8 +277,9 @@ def gmm_probability_mask(
     The function only fits intensities that are within the provided binary
     mask. When the mask contains more voxels than ``max_samples`` it randomly
     subsamples to keep the fitting cost bounded. The fitted model is reused to
-    score the remaining voxels in batches, returning the posterior probability
-    that a voxel belongs to the brightest component (assumed tissue).
+        score the remaining voxels in batches, returning the posterior probability
+        that a voxel belongs to any component other than the dimmest one
+        (assumed background).
 
     Parameters
     ----------
@@ -324,8 +325,8 @@ def gmm_probability_mask(
     )
     gmm.fit(intensities.reshape(-1, 1))
 
-    # Identify the component with the highest mean as tissue
-    tissue_component = np.argmax(gmm.means_.ravel())
+    # Treat the dimmest component as background and aggregate all others as tissue.
+    background_component = np.argmin(gmm.means_.ravel())
 
     probabilities = np.zeros(image.size, dtype=np.float32)
     remaining_idx = foreground_idx
@@ -334,7 +335,8 @@ def gmm_probability_mask(
         batch_idx = remaining_idx[start:stop]
         batch_vals = image.ravel()[batch_idx].astype(np.float32)
         batch_post = gmm.predict_proba(batch_vals.reshape(-1, 1))
-        probabilities[batch_idx] = batch_post[:, tissue_component]
+        tissue_prob = 1.0 - batch_post[:, background_component]
+        probabilities[batch_idx] = tissue_prob.astype(np.float32)
 
     return probabilities.reshape(image.shape)
 

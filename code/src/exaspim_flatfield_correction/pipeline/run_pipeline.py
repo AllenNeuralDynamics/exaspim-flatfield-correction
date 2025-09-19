@@ -34,6 +34,7 @@ from exaspim_flatfield_correction.utils.mask_utils import (
     project_probability_mask,
     size_filter,
     upscale_mask_nearest,
+    get_mask
 )
 from exaspim_flatfield_correction.utils.zarr_utils import (
     store_ome_zarr,
@@ -227,8 +228,10 @@ def flatfield_reference(full_res: da.Array, flatfield_path: str) -> da.Array:
 
     Returns
     -------
-    dask.array.Array
-        Flatfield-corrected image as a dask array.
+    tuple
+        Tuple containing the corrected image, GMM probability volume,
+        binary projection masks, percentile projections, and fitted
+        correction curves.
 
     Raises
     ------
@@ -298,8 +301,10 @@ def flatfield_basicpy(
 
     Returns
     -------
-    dask.array.Array
-        Flatfield-corrected image as a dask array.
+    tuple
+        Tuple containing the corrected image, GMM probability volume,
+        binary projection masks, percentile projections, and fitted
+        correction curves.
     """
     basicpy_res = "0" if is_binned_channel else "3"
     low_res = da.from_zarr(z[basicpy_res]).squeeze().astype(np.float32)
@@ -362,12 +367,22 @@ def flatfield_fitting(
     mask_dir: str,
     tile_name: str,
     out_mask_path: str,
+    out_probability_path: str,
     coordinate_transformations: dict,
     overwrite: bool,
     n_levels: int,
     config: dict,
     results_dir: str = None,
-) -> tuple[da.Array, np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray | None, np.ndarray | None]:
+) -> tuple[
+    da.Array,
+    np.ndarray,
+    np.ndarray,
+    np.ndarray,
+    np.ndarray,
+    np.ndarray,
+    np.ndarray | None,
+    np.ndarray | None,
+]:
     """
     Apply fitting-based flatfield correction to the image using a mask
     and configurable parameters.
@@ -386,6 +401,8 @@ def flatfield_fitting(
         Name of the tile being processed.
     out_mask_path : str
         Output path for the mask zarr.
+    out_probability_path : str
+        Output path for the probability volume OME-Zarr.
     coordinate_transformations : dict
         Dictionary of coordinate transformation parameters.
     overwrite : bool
@@ -399,8 +416,10 @@ def flatfield_fitting(
 
     Returns
     -------
-    dask.array.Array
-        Flatfield-corrected image as a dask array.
+    tuple
+        Tuple containing the corrected image, GMM probability volume,
+        binary projection masks, percentile projections, and fitted
+        correction curves.
     """
     fitting_res = "0" if is_binned_channel else "3"
     low_res = da.from_zarr(z[fitting_res]).squeeze().astype(np.float32)
@@ -411,26 +430,7 @@ def flatfield_fitting(
         results_dir,
         tile_name
     )
-    med_factor = (
-        config.get("med_factor_binned", 2)
-        if is_binned_channel
-        else config.get("med_factor_unbinned", 5)
-    )
 
-    _LOGGER.info(f"Clipping low_res with median factor: {med_factor}")
-    # Dask implementation can only compute nanmedian along subsets of axes at a time,
-    # so we compute the nanmedian in two steps.
-    nan_med = da.nanmedian(da.nanmedian(da.where(mask, low_res, np.nan), axis=(0,1)), axis=0).compute()
-    # This fails with an OOM
-    # nan_med = da.nanmedian(da.where(mask, low_res, np.nan), axis=tuple(d for d in low_res.ndim)).compute()
-    _LOGGER.info(f"Computed median of tile foreground: {nan_med}")
-
-    # Clamp the intensity values to reduce the impact of very bright neurites on the profile fit
-    low_res_clipped = da.clip(low_res, 0, nan_med * med_factor).astype(np.uint16).compute()
-
-    del low_res, nan_med
-
-    mask_np = mask.astype(bool).compute()
     gmm_n_components = config.get("gmm_n_components", 2)
     gmm_max_samples = config.get("gmm_max_samples", 1_000_000)
     gmm_batch_size = config.get("gmm_batch_size", 1_000_000)
@@ -443,13 +443,47 @@ def flatfield_fitting(
         gmm_batch_size,
     )
     probability_volume = gmm_probability_mask(
-        low_res_clipped.astype(np.float32),
-        mask_np,
+        low_res.astype(np.float32).compute(),
+        mask.astype(bool).compute(),
         n_components=gmm_n_components,
         max_samples=gmm_max_samples,
         batch_size=gmm_batch_size,
         random_state=gmm_random_state,
+    ).astype(np.float32, copy=False)
+    zarr.save_array(
+        "/results/tmp_prob.zarr",
+        probability_volume,
+        chunks=(128, 128, 128),
+        compressor=blosc.Blosc(cname="zstd", clevel=1),
     )
+
+    # Persist the soft tissue probabilities as an OME-Zarr dataset at the
+    # resolution used for GMM fitting to retain spatial metadata.
+    probability_path = out_probability_path.rstrip("/") + f"/{tile_name}"
+    probability_transformations = parse_ome_zarr_transformations(z, fitting_res)
+    probability_scale = probability_transformations["scale"]
+    probability_translation = probability_transformations["translation"]
+
+    prob_chunks = (
+        min(128, probability_volume.shape[0]),
+        min(128, probability_volume.shape[1]),
+        min(128, probability_volume.shape[2]),
+    )
+
+    probability_volume = da.from_zarr(
+        "/results/tmp_prob.zarr"
+    )
+    print(probability_volume)
+    store_ome_zarr(
+        probability_volume,
+        probability_path,
+        3,
+        tuple(probability_scale[-3:]),
+        tuple(probability_translation),
+        overwrite=overwrite,
+        write_empty_chunks=False
+    )
+
     prob_threshold = config.get("mask_probability_threshold", 0.2)
     prob_min_size = config.get("mask_probability_min_size", 250)
     _LOGGER.info(
@@ -469,8 +503,27 @@ def flatfield_fitting(
         threshold=prob_threshold,
         min_size=prob_min_size,
     )
+    mask = get_mask(probability_volume, threshold=prob_threshold, min_size=prob_min_size)
+    mask = _preprocess_mask(mask, low_res.shape, results_dir, tile_name)
 
-    del probability_volume, mask_np
+    med_factor = (
+        config.get("med_factor_binned", 2)
+        if is_binned_channel
+        else config.get("med_factor_unbinned", 5)
+    )
+
+    _LOGGER.info(f"Clipping low_res with median factor: {med_factor}")
+    # Dask implementation can only compute nanmedian along subsets of axes at a time,
+    # so we compute the nanmedian in two steps.
+    nan_med = da.nanmedian(da.nanmedian(da.where(mask, low_res, np.nan), axis=(0,1)), axis=0).compute()
+    # This fails with an OOM
+    # nan_med = da.nanmedian(da.where(mask, low_res, np.nan), axis=tuple(d for d in low_res.ndim)).compute()
+    _LOGGER.info(f"Computed median of tile foreground: {nan_med}")
+
+    # Clamp the intensity values to reduce the impact of very bright neurites on the profile fit
+    low_res_clipped = da.clip(low_res, 0, nan_med * med_factor).astype(np.uint16).compute()
+
+    del low_res, nan_med
 
     percentile = config.get("percentile", 99)
     _LOGGER.info(f"Computing percentile projection with percentile: {percentile}")
@@ -551,8 +604,15 @@ def flatfield_fitting(
         corrected = da.clip(corrected, 0, 2**16 - 1)
 
     # Return corrected image and QC/debug artifacts for saving in main
-    return corrected, mask_2d_xy, mask_2d_yz, xy_proj, yz_proj, fit_x, (
-        fit_z if 'fit_z' in locals() else None
+    return (
+        corrected,
+        probability_volume,
+        mask_2d_xy,
+        mask_2d_yz,
+        xy_proj,
+        yz_proj,
+        fit_x,
+        fit_z if 'fit_z' in locals() else None,
     )
 
 
@@ -617,11 +677,11 @@ def get_fitting_config() -> dict:
         "limits_z": (0.25, 1.2),
         "global_factor_binned": 3200,
         "global_factor_unbinned": 100,
-        "mask_probability_threshold": 0.3,
+        "mask_probability_threshold": 0.6,
         "mask_probability_min_size": 1000,
-        "gmm_n_components": 2,
-        "gmm_max_samples": 1_000_000,
-        "gmm_batch_size": 100_000,
+        "gmm_n_components": 3,
+        "gmm_max_samples": 2_000_000,
+        "gmm_batch_size": 200_000,
         "gmm_random_state": 0,
     }
 
@@ -651,7 +711,8 @@ def save_method_outputs(
         Background image (if computed).
     artifacts : dict or None
         Method-specific artifacts; for 'fitting' expects keys:
-          mask2d_xy, mask2d_yz, xy_proj, yz_proj, fit_x, fit_z.
+          probability_volume, mask2d_xy, mask2d_yz, xy_proj, yz_proj,
+          fit_x, fit_z.
     """
     if not save_outputs or results_dir is None:
         return
@@ -867,6 +928,13 @@ def create_mask_path(out_zarr_path: str) -> str:
     return out_mask_path
 
 
+def create_probability_path(out_zarr_path: str) -> str:
+    """Derive the output path for storing probability volumes as OME-Zarr."""
+
+    out_zarr_folder = Path(out_zarr_path).name
+    return out_zarr_path.replace(out_zarr_folder, f"probability/{out_zarr_folder}")
+
+
 def main() -> None:
     """
     Main entry point for the flatfield correction pipeline.
@@ -913,13 +981,14 @@ def main() -> None:
         LocalCluster(
             processes=True,
             n_workers=args.num_workers,
-            threads_per_worker=1,
+            threads_per_worker=2,
             memory_limit=memory_limit,
         )
     )
     _LOGGER.info(f"Dask client: {client}")
 
     out_mask_path = create_mask_path(out_path)
+    out_probability_path = create_probability_path(out_path)
     
     start_date_time = datetime.now()
     data_process = create_processing_metadata(
@@ -981,6 +1050,7 @@ def main() -> None:
                         fitting_config = get_fitting_config()
                         (
                             corrected,
+                            probability_volume,
                             mask2d_xy,
                             mask2d_yz,
                             xy_proj,
@@ -994,6 +1064,7 @@ def main() -> None:
                             args.mask_dir,
                             tile_name,
                             out_mask_path,
+                            out_probability_path,
                             coordinate_transformations,
                             args.overwrite,
                             args.n_levels,
@@ -1026,6 +1097,7 @@ def main() -> None:
                 artifacts = None
                 if method == "fitting":
                     artifacts = {
+                        "probability_volume": probability_volume,
                         "mask2d_xy": mask2d_xy,
                         "mask2d_yz": mask2d_yz,
                         "xy_proj": xy_proj,
