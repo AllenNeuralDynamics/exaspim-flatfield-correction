@@ -14,6 +14,13 @@ if [ "$8" == "1" ]; then
   BINNED_FLAG="--is-binned"
 fi
 
+TILE_NUM=$(basename "$1")
+echo "Processing tile: $TILE_NUM"
+
+# create a artifacts directory with the parent directory of the output S3 path
+ARTIFACTS_PATH="$(dirname "$2")/artifacts/$TILE_NUM"
+echo "Creating artifacts directory at: $ARTIFACTS_PATH"
+
 PYTHONPATH=./src python -u ./src/exaspim_flatfield_correction/pipeline/run_pipeline.py \
 --zarr "$1" \
 --output "$2" \
@@ -27,5 +34,7 @@ PYTHONPATH=./src python -u ./src/exaspim_flatfield_correction/pipeline/run_pipel
 --save-outputs \
 --overwrite \
 $BINNED_FLAG
+
+aws s3 cp --recursive /results "$ARTIFACTS_PATH"
 
 echo "Done!"
