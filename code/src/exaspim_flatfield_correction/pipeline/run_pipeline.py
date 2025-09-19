@@ -981,7 +981,7 @@ def main() -> None:
         LocalCluster(
             processes=True,
             n_workers=args.num_workers,
-            threads_per_worker=2,
+            threads_per_worker=1,
             memory_limit=memory_limit,
         )
     )
