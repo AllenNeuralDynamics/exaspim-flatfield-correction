@@ -5,7 +5,7 @@ set -uo pipefail
 # Default extensions dir to match your Docker snippet:
 EXT_DIR="${EXT_DIR:-/.vscode/extensions}"
 CURL_RETRIES="${CURL_RETRIES:-3}"
-MAX_VERSION_TRIES="${MAX_VERSION_TRIES:-8}"  # how many prior versions to try for backoff installs
+MAX_VERSION_TRIES="${MAX_VERSION_TRIES:-5}"  # how many prior versions to try for backoff installs
 
 # ---- Install locations --------------------
 # We install the extracted code-server dir under /.code-server and symlink the binary into /usr/bin
@@ -320,18 +320,6 @@ log "All done!"
 
 conda update conda -y
 conda update mamba -y
-mamba install -c conda-forge python=3.11 pip jupyterlab -y
-
-git clone https://github.com/AllenNeuralDynamics/aind-data-transfer.git
-cd aind-data-transfer
-git checkout fix-aind-data-schema
-pip install .[imaging] 
-./post_install.sh
-pip install ujson "dask[distributed]==2025.3.0" dask-image matplotlib 
-
-#pip install "jax[cuda12-local]==0.4.20" -f https://storage.googleapis.com/jax-releases/jax_cuda_releases.html
-pip install "jax[cpu]==0.4.20" 
-pip install basicpy==1.2.0
-
-pip install scipy==1.15.2
-pip install --upgrade --no-cache-dir notebook==6.*
+mamba create -n correction -c conda-forge python=3.11 -y
+source $(conda info --base)/etc/profile.d/conda.sh
+conda activate correction
