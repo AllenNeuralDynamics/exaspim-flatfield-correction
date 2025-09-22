@@ -1,4 +1,7 @@
 {
 	"version": 1,
-	"resource_class": "large"
+	"resource_class": "dedicated",
+	"machine_config": {
+		"instance_type": "r6a.8xlarge"
+	}
 }

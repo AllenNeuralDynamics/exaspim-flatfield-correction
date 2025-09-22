@@ -9,7 +9,7 @@ def estimate_bkg(
     sigmaFactor: float = 3.0,
     probThresh: float = 0.01,
     nIter: int = 100,
-) -> np.ndarray:
+) -> tuple[np.ndarray, np.ndarray]:
     """
     Flat-field background estimation for scattered light with
     variable background, processing a 3D array.
@@ -29,9 +29,10 @@ def estimate_bkg(
 
     Returns
     -------
-    np.ndarray, shape (y, x)
-        2D array representing the estimated background (median across z).
-        This is the final background estimate after removing outlier slices.
+    tuple[np.ndarray, np.ndarray]
+        Tuple where the first element is the estimated 2D background (median
+        across z) and the second element is the filtered stack of background
+        slices used for subsequent modelling.
     """
 
     # -- Sanity checks --
@@ -79,4 +80,4 @@ def estimate_bkg(
 
     mu_final = np.median(im, axis=0).astype(np.float32)  # (y, x)
 
-    return mu_final
+    return mu_final, im

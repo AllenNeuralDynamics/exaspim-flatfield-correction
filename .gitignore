@@ -4,3 +4,5 @@ notebooks/
 **/__pycache__/
 *.egg-info
 aws/
+code/build/
+code/dist/

@@ -5,12 +5,16 @@ import dask.array as da
 import numpy as np
 from scipy.ndimage import (
     binary_closing,
+    binary_erosion,
     binary_fill_holes,
     distance_transform_edt,
     label,
 )
+import dask_image.ndfilters as di  
+import dask_image.ndmorph as ndm
 from skimage.morphology import ball, disk
 from sklearn.mixture import GaussianMixture
+from scipy.ndimage import gaussian_filter, gaussian_laplace, sobel
 
 from exaspim_flatfield_correction.utils.utils import resize_dask
 
@@ -266,79 +270,142 @@ def upscale_mask_edt(
 def gmm_probability_mask(
     image: np.ndarray,
     mask: np.ndarray,
-    *,
-    n_components: int = 2,
-    max_samples: int = 500_000,
+    background_volume: np.ndarray,
+    n_components_fg: int = 4,
+    n_components_bg: int = 2,
+    max_samples_fg: int = 500_000,
+    max_samples_bg: int = 500_000,
     batch_size: int = 50_000,
+    prior_fg: float = 0.5,
+    reg_covar: float = 1e-6,
+    n_init: int = 3,
     random_state: int | None = 0,
+    erosion_radius: int = 1,
 ) -> np.ndarray:
-    """Estimate tissue probabilities inside a mask using a Gaussian mixture.
-
-    The function only fits intensities that are within the provided binary
-    mask. When the mask contains more voxels than ``max_samples`` it randomly
-    subsamples to keep the fitting cost bounded. The fitted model is reused to
-        score the remaining voxels in batches, returning the posterior probability
-        that a voxel belongs to any component other than the dimmest one
-        (assumed background).
+    """Estimate P(foreground | intensity) inside `mask` using two class-conditional GMMs.
 
     Parameters
     ----------
     image : np.ndarray
-        Raw intensity volume. It must have the same shape as ``mask``.
+        Raw intensity volume. Must have the same shape as `mask`.
     mask : np.ndarray
-        Boolean or uint8 segmentation mask. Only True voxels are considered.
-    n_components : int, optional
-        Number of mixture components. Default is 2 (foreground/background).
-    max_samples : int, optional
-        Maximum sample count used for GMM fitting. Default is 5e5.
-    batch_size : int, optional
-        Batch size for probability prediction to reduce peak memory use.
-    random_state : int or None, optional
-        Seed forwarded to ``GaussianMixture`` for reproducibility.
+        Boolean or uint8 mask defining the foreground region to score.
+    background_volume : np.ndarray
+        Background-only intensities (any shape); used to fit the background GMM.
+    n_components_fg, n_components_bg : int
+        Mixture component counts for the foreground/background models.
+    max_samples_fg, max_samples_bg : int
+        Cap on samples used to fit each model (uniform subsampling if exceeded).
+    batch_size : int
+        Number of voxels per scoring batch to limit peak memory use.
+    prior_fg : float
+        Prior probability of foreground in (0,1); balances precision/recall.
+    reg_covar : float
+        Small diagonal added to covariances for numerical stability.
+    n_init : int
+        Number of EM initializations (best init kept).
+    random_state : int | None
+        Seed for reproducibility.
+    erosion_radius : int
+        Radius of the structuring element used to erode the foreground mask
+        before fitting the foreground GMM. Set to 0 to disable erosion.
 
     Returns
     -------
     np.ndarray
-        Array of the same shape as ``image`` containing tissue probabilities
-        for voxels inside the mask and zeros outside.
+        Float32 array of same shape as `image` with P(foreground) inside `mask`
+        and zeros outside.
     """
-
     if image.shape != mask.shape:
         raise ValueError("image and mask must share the same shape")
+    if not (0.0 < prior_fg < 1.0):
+        raise ValueError("prior_fg must be in (0, 1)")
 
-    mask_bool = mask.astype(bool)
-    foreground_idx = np.where(mask_bool.ravel())[0]
-    if foreground_idx.size == 0:
+    # Foreground samples (from inside mask)
+    mask_bool = mask.astype(bool, copy=False)
+    if not np.any(mask_bool):
         raise ValueError("Mask does not contain any foreground voxels")
 
+    fg_mask = mask_bool
+    if erosion_radius > 0:
+        if mask.ndim == 3:
+            structure = ball(erosion_radius)
+        elif mask.ndim == 2:
+            structure = disk(erosion_radius)
+        else:
+            raise ValueError("Mask must be 2D or 3D for erosion")
+
+        eroded_mask = binary_erosion(mask_bool, structure=structure)
+        if np.any(eroded_mask):
+            fg_mask = eroded_mask
+        else:
+            _LOGGER.warning(
+                "Eroded mask is empty; falling back to the original mask for GMM fitting"
+            )
+
+    flat = image.ravel()
+    fg_idx_all = np.flatnonzero(fg_mask.ravel())
+    fg_finite = np.isfinite(flat[fg_idx_all])
+    if not np.any(fg_finite):
+        raise ValueError("No finite intensities inside mask for GMM fitting")
+    fg_idx_all = fg_idx_all[fg_finite]
+
     rng = np.random.default_rng(random_state)
-    if foreground_idx.size > max_samples:
-        train_idx = rng.choice(foreground_idx, size=max_samples, replace=False)
+    if fg_idx_all.size > max_samples_fg:
+        fg_idx = rng.choice(fg_idx_all, size=max_samples_fg, replace=False)
     else:
-        train_idx = foreground_idx
+        fg_idx = fg_idx_all
+    X_fg = flat[fg_idx].astype(np.float32, copy=False).reshape(-1, 1)
 
-    intensities = image.ravel()[train_idx].astype(np.float32)
-    gmm = GaussianMixture(
-        n_components=n_components,
+    # Background samples (from provided background volume; shape can differ)
+    bg_vals = np.asarray(background_volume, dtype=np.float32).ravel()
+    bg_vals = bg_vals[np.isfinite(bg_vals)]
+    if bg_vals.size == 0:
+        raise ValueError("Background volume has no finite voxels for GMM fitting")
+    if bg_vals.size > max_samples_bg:
+        bg_vals = rng.choice(bg_vals, size=max_samples_bg, replace=False)
+    X_bg = bg_vals.reshape(-1, 1)
+
+    # Fit class-conditional GMMs
+    fg_gmm = GaussianMixture(
+        n_components=n_components_fg,
         covariance_type="full",
+        reg_covar=reg_covar,
+        n_init=n_init,
         random_state=random_state,
-    )
-    gmm.fit(intensities.reshape(-1, 1))
+    ).fit(X_fg)
 
-    # Treat the dimmest component as background and aggregate all others as tissue.
-    background_component = np.argmin(gmm.means_.ravel())
+    bg_gmm = GaussianMixture(
+        n_components=n_components_bg,
+        covariance_type="full",
+        reg_covar=reg_covar,
+        n_init=n_init,
+        random_state=random_state,
+    ).fit(X_bg)
 
-    probabilities = np.zeros(image.size, dtype=np.float32)
-    remaining_idx = foreground_idx
-    for start in range(0, remaining_idx.size, batch_size):
-        stop = start + batch_size
-        batch_idx = remaining_idx[start:stop]
-        batch_vals = image.ravel()[batch_idx].astype(np.float32)
-        batch_post = gmm.predict_proba(batch_vals.reshape(-1, 1))
-        tissue_prob = 1.0 - batch_post[:, background_component]
-        probabilities[batch_idx] = tissue_prob.astype(np.float32)
+    # Bayes posterior, scored only inside the mask
+    out = np.zeros(flat.size, dtype=np.float32)
+    score_idx = np.flatnonzero(mask_bool.ravel())
+    log_pi_fg = np.log(prior_fg)
+    log_pi_bg = np.log(1.0 - prior_fg)
 
-    return probabilities.reshape(image.shape)
+    for start in range(0, score_idx.size, batch_size):
+        bidx = score_idx[start : start + batch_size]
+        x = flat[bidx].astype(np.float32, copy=False)
+        finite = np.isfinite(x)
+        if not np.any(finite):
+            continue
+        x2d = x[finite].reshape(-1, 1)
+
+        log_fg = fg_gmm.score_samples(x2d) + log_pi_fg
+        log_bg = bg_gmm.score_samples(x2d) + log_pi_bg
+        denom = np.logaddexp(log_fg, log_bg)
+        prob = np.exp(log_fg - denom)
+
+        out[bidx[finite]] = prob.astype(np.float32, copy=False)
+
+    return out.reshape(image.shape)
+
 
 
 def project_probability_mask(
@@ -374,3 +441,185 @@ def project_probability_mask(
         mask_2d = size_filter(mask_2d, min_size=min_size)
 
     return mask_2d
+
+def compute_simple_features_dask(
+    x: np.ndarray | da.Array,
+    *,
+    sigma_mean: float = 1.5,
+    sigma_log: float = 1.0,
+    sigma_grad: float = 1.0,
+    chunks: tuple[int, ...] | int | str = "auto",
+) -> list[da.Array]:
+    """
+    Lazily compute 5 features as Dask arrays using dask-image:
+      [ intensity, local mean, local std, gaussian gradient magnitude, -LoG ]
+    """
+    # Local mean & std via Gaussian filtering (E[x^2] - (E[x])^2)
+    m  = di.gaussian_filter(x, sigma=sigma_mean)
+    m2 = di.gaussian_filter(x * x, sigma=sigma_mean)
+    var = da.maximum(m2 - m * m, 0.0).astype(np.float32)
+    std = da.sqrt(var)
+
+    # Edge/texture cues
+    grad_mag = di.gaussian_gradient_magnitude(x, sigma=sigma_grad).astype(np.float32)
+    neg_log  = (-di.gaussian_laplace(x, sigma=sigma_log)).astype(np.float32)
+
+    return [x, m, std, grad_mag, neg_log]
+
+# -------------------- Training utilities --------------------
+
+def _sample_rows_from_dask_stack(
+    feats: list[da.Array],
+    linear_idx: np.ndarray,
+    max_rows: int,
+    rng: np.random.Generator,
+) -> np.ndarray:
+    """Gather up to max_rows rows (feature vectors) from dask feature arrays."""
+    if linear_idx.size > max_rows:
+        linear_idx = rng.choice(linear_idx, size=max_rows, replace=False)
+
+    # Advanced indexing gathers only the needed rows from each feature
+    cols = [da.take(f.ravel(), linear_idx) for f in feats]   # list of dask 1D arrays
+    X = da.stack(cols, axis=1).compute()                     # small NumPy (n_sel, n_feats)
+
+    finite = np.isfinite(X).all(axis=1)
+    if not np.any(finite):
+        raise ValueError("No finite feature vectors in sampled rows")
+    return X[finite].astype(np.float64, copy=False)
+
+# -------------------- Main: Dask 2-GMM with feature vectors --------------------
+
+def gmm_probability_mask_features(
+    img_da: np.ndarray | da.Array,
+    mask_da: np.ndarray,
+    bg_da: np.ndarray | da.Array,
+    n_components_fg: int = 3,
+    n_components_bg: int = 3,
+    max_samples_fg: int = 500_000,
+    max_samples_bg: int = 500_000,
+    prior_fg: float = 0.5,
+    reg_covar: float = 1e-6,
+    n_init: int = 3,
+    random_state: int | None = 0,
+    sigma_mean: float = 1.0,
+    sigma_log: float = 1.0,
+    sigma_grad: float = 1.0,
+    erosion_radius: int = 1,
+) -> da.Array:
+    """
+    Memory-friendly 2-GMM classifier using dask-image filters.
+    Returns a Dask array of P(foreground) you can `.compute()` or `.persist()`.
+    The provided mask is eroded (unless `erosion_radius` is 0) before fitting
+    the foreground model to focus on high-confidence voxels. Output shape ==
+    image.shape, dtype float32.
+    """
+    if not (0.0 < prior_fg < 1.0):
+        raise ValueError("prior_fg must be in (0, 1)")
+
+    # ---- Features (lazy, via dask-image) ----
+    feats_img = compute_simple_features_dask(
+        img_da, sigma_mean=sigma_mean, sigma_log=sigma_log, sigma_grad=sigma_grad, chunks=img_da.chunks
+    )
+    feats_bg  = compute_simple_features_dask(
+        bg_da,  sigma_mean=sigma_mean, sigma_log=sigma_log, sigma_grad=sigma_grad, chunks=bg_da.chunks
+    )
+    n_feats = len(feats_img)  # 5
+
+    # ---- Subsample training rows from Dask (materialize small NumPy arrays) ----
+    rng = np.random.default_rng(random_state)
+    
+    if erosion_radius > 0:
+        if mask_da.ndim == 3:
+            structure = ball(erosion_radius)
+        elif mask_da.ndim == 2:
+            structure = disk(erosion_radius)
+        else:
+            raise ValueError("Mask must be 2D or 3D for erosion")
+
+        mask_da = ndm.binary_erosion(mask_da, structure=structure)
+
+    fg_lin_idx = da.flatnonzero(mask_da.ravel()).compute()
+
+    X_fg = _sample_rows_from_dask_stack(feats_img, fg_lin_idx, max_samples_fg, rng)
+
+    # background: uniform sample across entire background volume
+    bg_size = int(np.prod(bg_da.shape))
+    max_bg = min(max_samples_bg, bg_size)
+    bg_lin_idx = rng.choice(bg_size, size=max_bg, replace=False)
+    X_bg = _sample_rows_from_dask_stack(feats_bg, bg_lin_idx, max_bg, rng)
+
+    # ---- Standardize by combined training stats ----
+    train_stack = np.vstack([X_fg, X_bg])
+    mean_vec = train_stack.mean(axis=0)
+    std_vec  = train_stack.std(axis=0)
+    std_vec[std_vec < 1e-6] = 1.0
+
+    # ---- Fit GMMs ----
+    fg_gmm = GaussianMixture(
+        n_components=n_components_fg, covariance_type="full",
+        reg_covar=reg_covar, n_init=n_init, random_state=random_state
+    ).fit((X_fg - mean_vec) / std_vec)
+
+    bg_gmm = GaussianMixture(
+        n_components=n_components_bg, covariance_type="full",
+        reg_covar=reg_covar, n_init=n_init, random_state=random_state
+    ).fit((X_bg - mean_vec) / std_vec)
+
+    # ---- Stack features lazily for blockwise scoring: (..., F) ----
+    feats_stack = da.stack(feats_img, axis=-1).astype(np.float32)  # same chunks as img
+
+    # ---- Blockwise scoring (mask-aware) ----
+    log_pi_fg = float(np.log(prior_fg))
+    log_pi_bg = float(np.log(1.0 - prior_fg))
+
+    # --- change _score_block to accept a 4D mask with a singleton last axis ---
+    def _score_block(block_feats: np.ndarray,
+                    block_mask: np.ndarray,
+                    fg_gmm: GaussianMixture,
+                    bg_gmm: GaussianMixture,
+                    mean_vec: np.ndarray,
+                    std_vec: np.ndarray,
+                    log_pi_fg: float,
+                    log_pi_bg: float) -> np.ndarray:
+
+        # If mask arrived as (..., 1), squeeze it back to (...)
+        if block_mask.ndim == block_feats.ndim:
+            block_mask = np.squeeze(block_mask, axis=-1)
+
+        out = np.zeros(block_mask.shape, dtype=np.float32)
+        m = block_mask.astype(bool, copy=False)
+        if not np.any(m):
+            return out
+
+        X = block_feats[m].reshape(-1, block_feats.shape[-1]).astype(np.float64, copy=False)
+        X = (X - mean_vec) / std_vec
+        finite = np.isfinite(X).all(axis=1)
+
+        if np.any(finite):
+            Xz   = X[finite]
+            lg_f = fg_gmm.score_samples(Xz) + log_pi_fg
+            lg_b = bg_gmm.score_samples(Xz) + log_pi_bg
+            prob = np.exp(lg_f - np.logaddexp(lg_f, lg_b)).astype(np.float32, copy=False)
+
+            tmp = np.zeros(X.shape[0], dtype=np.float32)
+            tmp[finite] = prob
+            out[m] = tmp
+
+        return out
+
+    probs = da.map_blocks(
+        _score_block,
+        feats_stack,                  # 4D blocks
+        mask_da[..., None],           # 4D blocks with last axis = 1
+        fg_gmm=fg_gmm,
+        bg_gmm=bg_gmm,
+        mean_vec=mean_vec,
+        std_vec=std_vec,
+        log_pi_fg=log_pi_fg,
+        log_pi_bg=log_pi_bg,
+        dtype=np.float32,
+        chunks=img_da.chunks,         # output is 3D like image
+        drop_axis=(-1,),              # drop the feature axis in the output
+    )
+
+    return probs

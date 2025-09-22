@@ -31,6 +31,7 @@ from exaspim_flatfield_correction.splinefit import (
 )
 from exaspim_flatfield_correction.background import estimate_bkg
 from exaspim_flatfield_correction.utils.mask_utils import (
+    gmm_probability_mask_features,
     gmm_probability_mask,
     project_probability_mask,
     size_filter,
@@ -175,7 +176,7 @@ def background_subtraction(
     z: zarr.hierarchy.Group,
     is_binned_channel: bool = False,
     use_reference_bkg: bool = False,
-) -> tuple[da.Array, np.ndarray]:
+) -> tuple[da.Array, np.ndarray, np.ndarray | None]:
     """
     Perform background subtraction on the full resolution image.
 
@@ -194,18 +195,20 @@ def background_subtraction(
 
     Returns
     -------
-    tuple[dask.array.Array, np.ndarray]
-        Tuple of background-subtracted full resolution dask array and the
-        estimated background as a numpy array.
+    tuple[dask.array.Array, np.ndarray, np.ndarray | None]
+        Tuple containing the background-subtracted full resolution array, the
+        estimated 2D background image, and the stack of background-dominated
+        slices used for probability modelling (or None when unavailable).
     """
     if use_reference_bkg:
         bkg_path = get_bkg_path(tile_path)
         bkg = read_bkg_image(bkg_path).astype(np.float32)
+        bkg_slices = None
     else:
         bkg_res = "0" if is_binned_channel else "3"
         _LOGGER.info(f"Using resolution {bkg_res} for background estimation")
         low_res = da.from_zarr(z[bkg_res]).squeeze().astype(np.float32)
-        bkg = estimate_bkg(gaussian_filter_dask(low_res, sigma=1).compute())
+        bkg, bkg_slices = estimate_bkg(gaussian_filter_dask(low_res, sigma=1).compute())
 
     full_res = subtract_bkg(
         full_res,
@@ -213,7 +216,7 @@ def background_subtraction(
             resize(bkg, full_res.shape[1:]), chunks=full_res.chunksize[1:]
         ),
     )
-    return full_res, bkg
+    return full_res, bkg, bkg_slices
 
 
 def flatfield_reference(full_res: da.Array, flatfield_path: str) -> da.Array:
@@ -302,10 +305,8 @@ def flatfield_basicpy(
 
     Returns
     -------
-    tuple
-        Tuple containing the corrected image, GMM probability volume,
-        binary projection masks, percentile projections, and fitted
-        correction curves.
+    dask.array.Array
+        Corrected volume after applying the BasicPy flatfield fit.
     """
     basicpy_res = "0" if is_binned_channel else "3"
     low_res = da.from_zarr(z[basicpy_res]).squeeze().astype(np.float32)
@@ -374,6 +375,7 @@ def flatfield_fitting(
     n_levels: int,
     config: dict,
     results_dir: str = None,
+    bkg_slices: np.ndarray | None = None,
 ) -> tuple[
     da.Array,
     np.ndarray,
@@ -414,6 +416,10 @@ def flatfield_fitting(
         Dictionary of fitting parameters (see get_fitting_config).
     results_dir : str, optional
         Directory to store intermediate mask zarr, by default None.
+    bkg_slices : numpy.ndarray or None, optional
+        Background-dominated slices from background estimation used to fit
+        the background GMM. When None, probabilities revert to the
+        foreground-only model.
 
     Returns
     -------
@@ -432,10 +438,10 @@ def flatfield_fitting(
         tile_name
     )
 
-    gmm_n_components = config.get("gmm_n_components", 2)
-    gmm_max_samples = config.get("gmm_max_samples", 1_000_000)
-    gmm_batch_size = config.get("gmm_batch_size", 1_000_000)
-    gmm_random_state = config.get("gmm_random_state", 0)
+    gmm_n_components = config.get("gmm_n_components")
+    gmm_max_samples = config.get("gmm_max_samples")
+    gmm_batch_size = config.get("gmm_batch_size")
+    gmm_random_state = config.get("gmm_random_state")
 
     _LOGGER.info(
         "Fitting GMM probabilities with n_components=%d, max_samples=%d, batch_size=%d",
@@ -443,20 +449,17 @@ def flatfield_fitting(
         gmm_max_samples,
         gmm_batch_size,
     )
-    probability_volume = gmm_probability_mask(
-        low_res.astype(np.float32).compute(),
-        mask.astype(bool).compute(),
-        n_components=gmm_n_components,
-        max_samples=gmm_max_samples,
-        batch_size=gmm_batch_size,
+    probability_volume = gmm_probability_mask_features(
+        gaussian_filter_dask(low_res.astype(np.float32), sigma=1),
+        mask.astype(bool),
+        da.from_array(bkg_slices, chunks=(128,128,128)),
+        n_components_fg = 3,
+        n_components_bg = 3,
+        max_samples_fg = gmm_max_samples,
+        max_samples_bg = gmm_max_samples,
         random_state=gmm_random_state,
-    ).astype(np.float32, copy=False)
-    zarr.save_array(
-        "/results/tmp_prob.zarr",
-        probability_volume,
-        chunks=(128, 128, 128),
-        compressor=blosc.Blosc(cname="zstd", clevel=1),
-    )
+        erosion_radius=10
+    ).astype(np.float32).persist()
 
     # Persist the soft tissue probabilities as an OME-Zarr dataset at the
     # resolution used for GMM fitting to retain spatial metadata.
@@ -465,16 +468,6 @@ def flatfield_fitting(
     probability_scale = probability_transformations["scale"]
     probability_translation = probability_transformations["translation"]
 
-    prob_chunks = (
-        min(128, probability_volume.shape[0]),
-        min(128, probability_volume.shape[1]),
-        min(128, probability_volume.shape[2]),
-    )
-
-    probability_volume = da.from_zarr(
-        "/results/tmp_prob.zarr"
-    )
-    print(probability_volume)
     store_ome_zarr(
         probability_volume,
         probability_path,
@@ -485,8 +478,8 @@ def flatfield_fitting(
         write_empty_chunks=False
     )
 
-    prob_threshold = config.get("mask_probability_threshold", 0.2)
-    prob_min_size = config.get("mask_probability_min_size", 250)
+    prob_threshold = config.get("mask_probability_threshold")
+    prob_min_size = config.get("mask_probability_min_size")
     _LOGGER.info(
         "Projecting probability mask with threshold %.3f and min_size %s",
         prob_threshold,
@@ -827,7 +820,7 @@ def set_dask_config(results_dir: str):
         {
             "temporary-directory": dask_tmp_dir,
             "distributed.worker.memory.target": 0.7,
-            "distributed.worker.memory.spill": 0.85,
+            "distributed.worker.memory.spill": 0.8,
             "distributed.worker.memory.pause": 0.9,
             "distributed.worker.memory.terminate": 0.95,
             "distributed.scheduler.allowed-failures": 10,
@@ -1036,9 +1029,10 @@ def main() -> None:
                 _LOGGER.info(f"Full resolution array shape: {full_res.shape}")
 
                 bkg = None
+                bkg_slices = None
                 if not args.skip_bkg_sub:
                     _LOGGER.info("Performing background subtraction")
-                    full_res, bkg = background_subtraction(
+                    full_res, bkg, bkg_slices = background_subtraction(
                         tile_path, full_res, z, is_binned_channel, args.use_reference_bkg
                     )
                     # Background QC saving is centralized at the end per method
@@ -1083,6 +1077,7 @@ def main() -> None:
                             args.n_levels,
                             fitting_config,
                             results_dir=results_dir,
+                            bkg_slices=bkg_slices
                         )
                     else:
                         _LOGGER.error(f"Invalid method: {method}")
