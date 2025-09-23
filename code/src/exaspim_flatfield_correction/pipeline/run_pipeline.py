@@ -7,6 +7,7 @@ import logging
 import subprocess
 from pathlib import Path
 from datetime import datetime
+from dataclasses import dataclass
 
 import numpy as np
 import zarr
@@ -59,6 +60,14 @@ logging.basicConfig(
     datefmt="%d-%b-%y %H:%M:%S",
 )
 _LOGGER = logging.getLogger(__name__)
+
+
+@dataclass
+class MaskArtifacts:
+    probability_volume: da.Array
+    mask_low_res: da.Array
+    mask2d_xy: np.ndarray
+    mask2d_yz: np.ndarray
 
 
 def get_mem_limit() -> int | str:
@@ -234,8 +243,8 @@ def flatfield_reference(full_res: da.Array, flatfield_path: str) -> da.Array:
     -------
     tuple
         Tuple containing the corrected image, GMM probability volume,
-        binary projection masks, percentile projections, and fitted
-        correction curves.
+        binary projection masks, percentile projections, fitted
+        correction curves, and the mask artifacts for reuse.
 
     Raises
     ------
@@ -376,6 +385,7 @@ def flatfield_fitting(
     config: dict,
     results_dir: str = None,
     bkg_slices: np.ndarray | None = None,
+    mask_artifacts: MaskArtifacts | None = None,
 ) -> tuple[
     da.Array,
     np.ndarray,
@@ -385,6 +395,7 @@ def flatfield_fitting(
     np.ndarray,
     np.ndarray | None,
     np.ndarray | None,
+    MaskArtifacts,
 ]:
     """
     Apply fitting-based flatfield correction to the image using a mask
@@ -420,6 +431,9 @@ def flatfield_fitting(
         Background-dominated slices from background estimation used to fit
         the background GMM. When None, probabilities revert to the
         foreground-only model.
+    mask_artifacts : MaskArtifacts or None, optional
+        Precomputed mask artifacts to reuse across tiles. When None, the
+        artifacts are created using the current tile and returned for reuse.
 
     Returns
     -------
@@ -431,74 +445,119 @@ def flatfield_fitting(
     fitting_res = "0" if is_binned_channel else "3"
     low_res = da.from_zarr(z[fitting_res]).squeeze().astype(np.float32)
 
-    mask = _preprocess_mask(
-        load_mask_from_dir(mask_dir, tile_name),
-        low_res.shape,
-        results_dir,
-        tile_name
-    )
+    if mask_artifacts is None:
+        _LOGGER.info("Creating mask artifacts using tile %s", tile_name)
+        initial_mask = _preprocess_mask(
+            load_mask_from_dir(mask_dir, tile_name),
+            low_res.shape,
+            results_dir,
+            tile_name,
+        ).astype(bool)
 
-    gmm_n_components = config.get("gmm_n_components")
-    gmm_max_samples = config.get("gmm_max_samples")
-    gmm_batch_size = config.get("gmm_batch_size")
-    gmm_random_state = config.get("gmm_random_state")
+        gmm_n_components = config.get("gmm_n_components")
+        gmm_max_samples = config.get("gmm_max_samples")
+        gmm_batch_size = config.get("gmm_batch_size")
+        gmm_random_state = config.get("gmm_random_state")
 
-    _LOGGER.info(
-        "Fitting GMM probabilities with n_components=%d, max_samples=%d, batch_size=%d",
-        gmm_n_components,
-        gmm_max_samples,
-        gmm_batch_size,
-    )
-    probability_volume = gmm_probability_mask_features(
-        gaussian_filter_dask(low_res.astype(np.float32), sigma=1),
-        mask.astype(bool),
-        da.from_array(bkg_slices, chunks=(128,128,128)),
-        n_components_fg = 3,
-        n_components_bg = 3,
-        max_samples_fg = gmm_max_samples,
-        max_samples_bg = gmm_max_samples,
-        random_state=gmm_random_state,
-        erosion_radius=10
-    ).astype(np.float32).persist()
+        _LOGGER.info(
+            "Fitting GMM probabilities with n_components=%d, max_samples=%d, batch_size=%d",
+            gmm_n_components,
+            gmm_max_samples,
+            gmm_batch_size,
+        )
+        if bkg_slices is None:
+            raise ValueError(
+                "Background slices are required to fit the mask GMM on the reference tile"
+            )
+        probability_volume = gmm_probability_mask_features(
+            gaussian_filter_dask(low_res.astype(np.float32), sigma=1),
+            initial_mask,
+            da.from_array(bkg_slices, chunks=(128, 128, 128)),
+            n_components_fg=3,
+            n_components_bg=3,
+            max_samples_fg=gmm_max_samples,
+            max_samples_bg=gmm_max_samples,
+            random_state=gmm_random_state,
+            erosion_radius=10,
+        ).astype(np.float32).persist()
+        
+        # Persist the soft tissue probabilities as an OME-Zarr dataset at the
+        # resolution used for GMM fitting to retain spatial metadata.
+        probability_path = out_probability_path.rstrip("/") + f"/{tile_name}"
+        probability_transformations = parse_ome_zarr_transformations(z, fitting_res)
+        probability_scale = probability_transformations["scale"]
+        probability_translation = probability_transformations["translation"]
 
-    # Persist the soft tissue probabilities as an OME-Zarr dataset at the
-    # resolution used for GMM fitting to retain spatial metadata.
-    probability_path = out_probability_path.rstrip("/") + f"/{tile_name}"
-    probability_transformations = parse_ome_zarr_transformations(z, fitting_res)
-    probability_scale = probability_transformations["scale"]
-    probability_translation = probability_transformations["translation"]
+        store_ome_zarr(
+            probability_volume,
+            probability_path,
+            3,
+            tuple(probability_scale[-3:]),
+            tuple(probability_translation),
+            overwrite=overwrite,
+            write_empty_chunks=False,
+        )
 
+        prob_threshold = config.get("mask_probability_threshold")
+        prob_min_size = config.get("mask_probability_min_size")
+        _LOGGER.info(
+            "Projecting probability mask with threshold %.3f and min_size %s",
+            prob_threshold,
+            prob_min_size,
+        )
+        mask_2d_xy = project_probability_mask(
+            probability_volume,
+            axis=0,
+            threshold=prob_threshold,
+            min_size=prob_min_size,
+        )
+        mask_2d_yz = project_probability_mask(
+            probability_volume,
+            axis=2,
+            threshold=prob_threshold,
+            min_size=prob_min_size,
+        )
+        mask = get_mask(
+            probability_volume,
+            threshold=prob_threshold,
+            min_size=prob_min_size,
+        )
+        mask = _preprocess_mask(mask, low_res.shape, results_dir, tile_name).astype(bool).persist()
+
+        mask_artifacts = MaskArtifacts(
+            probability_volume=probability_volume,
+            mask_low_res=mask,
+            mask2d_xy=mask_2d_xy,
+            mask2d_yz=mask_2d_yz,
+        )
+    else:
+        _LOGGER.info("Reusing precomputed mask artifacts for tile %s", tile_name)
+        probability_volume = mask_artifacts.probability_volume
+        mask = mask_artifacts.mask_low_res
+        mask_2d_xy = mask_artifacts.mask2d_xy
+        mask_2d_yz = mask_artifacts.mask2d_yz
+
+    if mask.shape == full_res.shape:
+        _LOGGER.info("Mask already at full resolution, skipping upscaling.")
+        mask_upscaled = mask
+    else:
+        _LOGGER.info(f"Upscaling mask to full resolution: {full_res.shape}")
+        mask_upscaled = upscale_mask_nearest(
+            mask,
+            full_res.shape,
+            chunks=(128, 256, 256),
+        )
+
+    mask_path = out_mask_path.rstrip("/") + f"/{tile_name}"
     store_ome_zarr(
-        probability_volume,
-        probability_path,
-        3,
-        tuple(probability_scale[-3:]),
-        tuple(probability_translation),
+        mask_upscaled.astype(np.uint8),
+        mask_path,
+        n_levels,
+        coordinate_transformations["scale"][-3:],
+        coordinate_transformations["translation"],
         overwrite=overwrite,
-        write_empty_chunks=False
+        write_empty_chunks=False,
     )
-
-    prob_threshold = config.get("mask_probability_threshold")
-    prob_min_size = config.get("mask_probability_min_size")
-    _LOGGER.info(
-        "Projecting probability mask with threshold %.3f and min_size %s",
-        prob_threshold,
-        prob_min_size,
-    )
-    mask_2d_xy = project_probability_mask(
-        probability_volume,
-        axis=0,
-        threshold=prob_threshold,
-        min_size=prob_min_size,
-    )
-    mask_2d_yz = project_probability_mask(
-        probability_volume,
-        axis=2,
-        threshold=prob_threshold,
-        min_size=prob_min_size,
-    )
-    mask = get_mask(probability_volume, threshold=prob_threshold, min_size=prob_min_size)
-    mask = _preprocess_mask(mask, low_res.shape, results_dir, tile_name)
 
     med_factor = (
         config.get("med_factor_binned", 2)
@@ -531,27 +590,6 @@ def flatfield_fitting(
     yz_proj = gaussian_filter(yz_proj.astype(np.float32), sigma=config.get("gaussian_sigma", 2))
 
     del low_res_clipped
-
-    if mask.shape == full_res.shape:
-        _LOGGER.info("Mask already at full resolution, skipping upscaling.")
-        mask_upscaled = mask
-    else:
-        _LOGGER.info(f"Upscaling mask to full resolution: {full_res.shape}")
-        mask_upscaled = upscale_mask_nearest(
-            mask, full_res.shape, chunks=(128, 256, 256)
-        ).astype(np.uint8)
-
-    mask_path = out_mask_path.rstrip("/") + f"/{tile_name}"
-    store_ome_zarr(
-        mask_upscaled,
-        mask_path,
-        n_levels,
-        coordinate_transformations["scale"][-3:],
-        coordinate_transformations["translation"],
-        overwrite=overwrite,
-        write_empty_chunks=False
-    )
-    mask_upscaled = da.from_zarr(mask_path, "0").squeeze()
 
     _LOGGER.info("Computing correction functions")
     fit_x, median_xy = get_correction_func(
@@ -607,6 +645,7 @@ def flatfield_fitting(
         yz_proj,
         fit_x,
         fit_z if 'fit_z' in locals() else None,
+        mask_artifacts,
     )
 
 
@@ -1001,6 +1040,8 @@ def main() -> None:
         args, tile_paths[0], out_path, start_date_time, res
     )
 
+    mask_artifacts: MaskArtifacts | None = None
+
     for tile_path in tile_paths:
         tile_name = Path(tile_path).name
         _LOGGER.info(f"Processing tile: {tile_name}")
@@ -1064,6 +1105,7 @@ def main() -> None:
                             yz_proj,
                             fit_x,
                             fit_z,
+                            mask_artifacts,
                         ) = flatfield_fitting(
                             full_res,
                             z,
@@ -1077,7 +1119,8 @@ def main() -> None:
                             args.n_levels,
                             fitting_config,
                             results_dir=results_dir,
-                            bkg_slices=bkg_slices
+                            bkg_slices=bkg_slices,
+                            mask_artifacts=mask_artifacts,
                         )
                     else:
                         _LOGGER.error(f"Invalid method: {method}")
