@@ -537,9 +537,11 @@ def gmm_probability_mask_features(
         else:
             raise ValueError("Mask must be 2D or 3D for erosion")
         print("eroding mask")
-        mask_da = ndm.binary_erosion(mask_da, structure=structure)
+        mask_eroded = ndm.binary_erosion(mask_da, structure=structure)
+    else:
+        mask_eroded = mask_da
 
-    fg_lin_idx = da.flatnonzero(mask_da.ravel()).compute()
+    fg_lin_idx = da.flatnonzero(mask_eroded.ravel()).compute()
     print("sampling fg features")
     X_fg = _sample_rows_from_dask_stack(feats_img, fg_lin_idx, max_samples_fg, rng)
 
