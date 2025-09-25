@@ -1,6 +1,6 @@
 import numpy as np
 import dask.array as da
-from scipy.ndimage import gaussian_filter
+from scipy.ndimage import gaussian_filter, gaussian_filter1d
 from scipy.interpolate import splrep, splev
 from exaspim_flatfield_correction.utils.mask_utils import get_mask
 import logging
@@ -108,9 +108,80 @@ def rescale_spline(
     return new_y
 
 
+def masked_axis_profile(
+    volume: "np.ndarray | da.Array",
+    mask: "np.ndarray | da.Array",
+    axis: int,
+    *,
+    smooth_sigma: "float | None" = None,
+    percentile: "float | None" = None,
+    min_voxels: int = 0,
+) -> tuple[np.ndarray, float]:
+    """
+    Measure a normalized intensity profile along an axis using a 3D mask.
+
+    Parameters
+    ----------
+    volume : np.ndarray or dask.array.Array
+        3D volume containing the intensity values.
+    mask : np.ndarray or dask.array.Array
+        Binary mask with the same shape as ``volume``.
+    axis : int
+        Axis along which to evaluate the profile.
+    smooth_sigma : float, optional
+        Standard deviation for optional 1D Gaussian smoothing of the profile.
+    percentile : float, optional
+        Percentile to use instead of the median when summarising each plane.
+    min_voxels : int, optional
+        Minimum number of mask voxels required for a plane to be trusted.
+
+    Returns
+    -------
+    norm_profile : np.ndarray
+        Profile normalised by the global masked median.
+    global_med : float
+        Global median intensity inside the mask.
+    """
+    if isinstance(volume, da.Array):
+        volume_np = volume.astype(np.float32).compute()
+    else:
+        volume_np = np.asarray(volume, dtype=np.float32)
+
+    if isinstance(mask, da.Array):
+        mask_np = mask.astype(bool).compute()
+    else:
+        mask_np = np.asarray(mask, dtype=bool)
+
+    if volume_np.shape != mask_np.shape:
+        raise ValueError("volume and mask must have the same shape")
+
+    masked = np.where(mask_np, volume_np, np.nan)
+
+    reduce_axes = tuple(i for i in range(mask_np.ndim) if i != axis)
+    coverage = mask_np.sum(axis=reduce_axes)
+
+    if percentile is None:
+        profile = np.nanmedian(masked, axis=reduce_axes)
+    else:
+        profile = np.nanpercentile(masked, percentile, axis=reduce_axes)
+
+    global_med = float(np.nanmedian(masked))
+    if not np.isfinite(global_med) or global_med <= 0:
+        return np.ones(mask_np.shape[axis], dtype=np.float32), 0.0
+
+    profile = np.where(np.isnan(profile), global_med, profile)
+    if min_voxels:
+        profile = np.where(coverage >= min_voxels, profile, global_med)
+
+    if smooth_sigma and smooth_sigma > 0:
+        profile = gaussian_filter1d(profile, sigma=smooth_sigma, mode="nearest")
+
+    norm_profile = (profile / global_med).astype(np.float32, copy=False)
+    return norm_profile, global_med
+
+
 def get_correction_func(
     proj: np.ndarray,
-    mask_2d: np.ndarray,
     axis: int,
     new_width: int,
     spline_smoothing: float = 0,
@@ -124,8 +195,6 @@ def get_correction_func(
     ----------
     proj : np.ndarray
         2D projection of the image.
-    mask_2d : np.ndarray
-        2D binary mask.
     axis : int
         Axis along which to compute the profile.
     new_width : int
@@ -142,7 +211,7 @@ def get_correction_func(
     global_med : float
         The global median value from the projection.
     """
-    norm_med, global_med = get_profile(proj, mask_2d, axis)
+    norm_med, global_med = get_profile(proj, axis)
 
     # Fit a spline to the normalized median profile using make_splrep.
     fitted = rescale_spline(
@@ -158,7 +227,7 @@ def get_correction_func(
 
 
 def get_profile(
-    proj: np.ndarray, mask_2d: np.ndarray, axis: int
+    proj: np.ndarray, axis: int
 ) -> tuple[np.ndarray, float]:
     """
     Compute a normalized median profile and global median from a projection
@@ -168,8 +237,6 @@ def get_profile(
     ----------
     proj : np.ndarray
         2D projection of the image.
-    mask_2d : np.ndarray
-        2D binary mask.
     axis : int
         Axis along which to compute the profile.
 
@@ -180,7 +247,8 @@ def get_profile(
     global_med : float
         Global median value from the projection.
     """
-    m_nan = np.where(mask_2d, proj, np.nan)
+    proj[proj == 0 ] = np.nan
+    m_nan = proj
 
     # Compute a global median from the projection.
     global_med = np.nanmedian(m_nan)

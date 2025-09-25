@@ -27,8 +27,9 @@ from exaspim_flatfield_correction.flatfield import (
     subtract_bkg,
 )
 from exaspim_flatfield_correction.splinefit import (
+    masked_axis_profile,
     percentile_project,
-    get_correction_func,
+    rescale_spline,
 )
 from exaspim_flatfield_correction.background import estimate_bkg
 from exaspim_flatfield_correction.utils.mask_utils import (
@@ -66,9 +67,6 @@ _LOGGER = logging.getLogger(__name__)
 class MaskArtifacts:
     probability_volume: da.Array
     mask_low_res: da.Array
-    mask2d_xy: np.ndarray
-    mask2d_yz: np.ndarray
-
 
 def get_mem_limit() -> int | str:
     """
@@ -386,17 +384,7 @@ def flatfield_fitting(
     results_dir: str = None,
     bkg_slices: np.ndarray | None = None,
     mask_artifacts: MaskArtifacts | None = None,
-) -> tuple[
-    da.Array,
-    np.ndarray,
-    np.ndarray,
-    np.ndarray,
-    np.ndarray,
-    np.ndarray,
-    np.ndarray | None,
-    np.ndarray | None,
-    MaskArtifacts,
-]:
+) -> tuple:
     """
     Apply fitting-based flatfield correction to the image using a mask
     and configurable parameters.
@@ -473,8 +461,8 @@ def flatfield_fitting(
             gaussian_filter_dask(low_res.astype(np.float32), sigma=1),
             initial_mask,
             da.from_array(bkg_slices, chunks=(128, 128, 128)),
-            n_components_fg=3,
-            n_components_bg=3,
+            n_components_fg=4,
+            n_components_bg=2,
             max_samples_fg=gmm_max_samples,
             max_samples_bg=gmm_max_samples,
             random_state=gmm_random_state,
@@ -491,7 +479,7 @@ def flatfield_fitting(
         store_ome_zarr(
             probability_volume,
             probability_path,
-            3,
+            4,
             tuple(probability_scale[-3:]),
             tuple(probability_translation),
             overwrite=overwrite,
@@ -505,18 +493,6 @@ def flatfield_fitting(
             prob_threshold,
             prob_min_size,
         )
-        mask_2d_xy = project_probability_mask(
-            probability_volume,
-            axis=0,
-            threshold=prob_threshold,
-            min_size=prob_min_size,
-        )
-        mask_2d_yz = project_probability_mask(
-            probability_volume,
-            axis=2,
-            threshold=prob_threshold,
-            min_size=prob_min_size,
-        )
         mask = get_mask(
             probability_volume,
             threshold=prob_threshold,
@@ -527,15 +503,11 @@ def flatfield_fitting(
         mask_artifacts = MaskArtifacts(
             probability_volume=probability_volume,
             mask_low_res=mask,
-            mask2d_xy=mask_2d_xy,
-            mask2d_yz=mask_2d_yz,
         )
     else:
         _LOGGER.info("Reusing precomputed mask artifacts for tile %s", tile_name)
         probability_volume = mask_artifacts.probability_volume
         mask = mask_artifacts.mask_low_res
-        mask_2d_xy = mask_artifacts.mask2d_xy
-        mask_2d_yz = mask_artifacts.mask2d_yz
 
     if mask.shape == full_res.shape:
         _LOGGER.info("Mask already at full resolution, skipping upscaling.")
@@ -560,9 +532,9 @@ def flatfield_fitting(
     )
 
     med_factor = (
-        config.get("med_factor_binned", 2)
+        config.get("med_factor_binned")
         if is_binned_channel
-        else config.get("med_factor_unbinned", 5)
+        else config.get("med_factor_unbinned")
     )
 
     _LOGGER.info(f"Clipping low_res with median factor: {med_factor}")
@@ -574,77 +546,111 @@ def flatfield_fitting(
     _LOGGER.info(f"Computed median of tile foreground: {nan_med}")
 
     # Clamp the intensity values to reduce the impact of very bright neurites on the profile fit
-    low_res_clipped = da.clip(low_res, 0, nan_med * med_factor).astype(np.uint16).compute()
+    low_res_clipped = da.clip(low_res * mask, 0, nan_med * med_factor).astype(np.uint16).compute()
 
     del low_res, nan_med
 
-    percentile = config.get("percentile", 99)
-    _LOGGER.info(f"Computing percentile projection with percentile: {percentile}")
-    xy_proj = percentile_project(
-        low_res_clipped, axis=0, percentile=percentile
-    )
-    xy_proj = gaussian_filter(xy_proj.astype(np.float32), sigma=config.get("gaussian_sigma", 2))
-    yz_proj = percentile_project(
-        low_res_clipped, axis=2, percentile=percentile
-    )
-    yz_proj = gaussian_filter(yz_proj.astype(np.float32), sigma=config.get("gaussian_sigma", 2))
+    profile_sigma = config.get("profile_sigma", config.get("gaussian_sigma"))
+    profile_percentile = config.get("profile_percentile")
+    profile_min_voxels = config.get("profile_min_voxels", 0)
 
-    del low_res_clipped
-
-    _LOGGER.info("Computing correction functions")
-    fit_x, median_xy = get_correction_func(
-        xy_proj,
-        mask_2d_xy,
-        axis=0,
-        new_width=full_res.shape[2],
-        spline_smoothing=config.get("spline_smoothing", 0.01),
-        limits=config.get("limits_xy", (0.25, 1.2)),
+    _LOGGER.info(
+        "Computing 3D masked profiles (sigma=%s, percentile=%s, min_voxels=%s)",
+        profile_sigma,
+        profile_percentile,
+        profile_min_voxels,
     )
-    if median_xy == 0:
-        corrected = full_res
-    else:
+    norm_x, median_xy = masked_axis_profile(
+        low_res_clipped,
+        mask,
+        axis=2,
+        smooth_sigma=profile_sigma,
+        percentile=profile_percentile,
+        min_voxels=profile_min_voxels,
+    )
+    _LOGGER.info("Global median from 3D masked profile (axis=X): %s", median_xy)
+
+    fit_x = rescale_spline(
+        np.arange(norm_x.size, dtype=np.float32),
+        norm_x,
+        full_res.shape[2],
+        smoothing=config.get("spline_smoothing"),
+    )
+    limits_xy = config.get("limits_xy")
+    if limits_xy is not None:
+        fit_x = np.clip(fit_x, limits_xy[0], limits_xy[1])
+
+    corrected = full_res
+    fit_z = None
+
+    if median_xy != 0:
         correction_x = fit_x.reshape(1, 1, -1)
         corrected = da.where(mask_upscaled, full_res / correction_x, full_res)
 
-        fit_z, median_yz = get_correction_func(
-            yz_proj,
-            mask_2d_yz,
-            axis=1,
-            new_width=full_res.shape[0],
-            spline_smoothing=config.get("spline_smoothing", 0.01),
-            limits=config.get("limits_z", (0.25, 1.2)),
+        norm_z, median_yz = masked_axis_profile(
+            low_res_clipped,
+            mask,
+            axis=0,
+            smooth_sigma=profile_sigma,
+            percentile=profile_percentile,
+            min_voxels=profile_min_voxels,
         )
-        # fit_z defined in this branch; if median_xy==0 it will remain None
+        _LOGGER.info("Global median from 3D masked profile (axis=Z): %s", median_yz)
+
+        fit_z = rescale_spline(
+            np.arange(norm_z.size, dtype=np.float32),
+            norm_z,
+            full_res.shape[0],
+            smoothing=config.get("spline_smoothing"),
+        )
+        limits_z = config.get("limits_z")
+        if limits_z is not None:
+            fit_z = np.clip(fit_z, limits_z[0], limits_z[1])
+
         correction_z = fit_z.reshape(-1, 1, 1)
         corrected = da.where(
             mask_upscaled, corrected / correction_z, corrected
         )
 
-        _LOGGER.info(f"median xy: {median_xy}")
         # Use defaults consistent with get_fitting_config()
         global_factor = (
-            config.get("global_factor_binned", 3200)
+            config.get("global_factor_binned")
             if is_binned_channel
-            else config.get("global_factor_unbinned", 100)
+            else config.get("global_factor_unbinned")
         )
-        _LOGGER.info("Doing global correction with factor: "
-                     f"{global_factor} and median_xy: {median_xy}, ratio = "
-                     f"{global_factor / median_xy}")
+        ratio = global_factor / median_xy
+        _LOGGER.info(
+            "Doing global correction with factor: %s and median_xy: %s, ratio = %s",
+            global_factor,
+            median_xy,
+            ratio,
+        )
         corrected = da.where(
-            mask_upscaled, corrected * (global_factor / median_xy), corrected
+            mask_upscaled, corrected * ratio, corrected
         )
         corrected = da.clip(corrected, 0, 2**16 - 1)
+
+    percentile = config.get("percentile")
+    _LOGGER.info(f"Computing percentile projection with percentile: {percentile}")
+    xy_proj = percentile_project(
+        low_res_clipped, axis=0, percentile=percentile
+    )
+    xy_proj = gaussian_filter(xy_proj.astype(np.float32), sigma=config.get("gaussian_sigma"))
+    yz_proj = percentile_project(
+        low_res_clipped, axis=2, percentile=percentile
+    )
+    yz_proj = gaussian_filter(yz_proj.astype(np.float32), sigma=config.get("gaussian_sigma"))
+
+    del low_res_clipped
 
     # Return corrected image and QC/debug artifacts for saving in main
     return (
         corrected,
         probability_volume,
-        mask_2d_xy,
-        mask_2d_yz,
         xy_proj,
         yz_proj,
         fit_x,
-        fit_z if 'fit_z' in locals() else None,
+        fit_z,
         mask_artifacts,
     )
 
@@ -710,8 +716,8 @@ def get_fitting_config() -> dict:
         "limits_z": (0.25, 1.2),
         "global_factor_binned": 3200,
         "global_factor_unbinned": 100,
-        "mask_probability_threshold": 0.6,
-        "mask_probability_min_size": 1000,
+        "mask_probability_threshold": 0.9,
+        "mask_probability_min_size": 10000,
         "gmm_n_components": 3,
         "gmm_max_samples": 2_000_000,
         "gmm_batch_size": 200_000,
@@ -725,6 +731,7 @@ def save_method_outputs(
     results_dir: str,
     save_outputs: bool,
     bkg: np.ndarray | None = None,
+    bkg_slices: np.ndarray | None = None,
     artifacts: dict | None = None,
 ) -> None:
     """
@@ -742,20 +749,28 @@ def save_method_outputs(
         Gate to enable/disable saving.
     bkg : np.ndarray or None
         Background image (if computed).
+    bkg_slices : np.ndarray or None
+        Stack of background-dominated slices used for GMM fitting.
     artifacts : dict or None
         Method-specific artifacts; for 'fitting' expects keys:
-          probability_volume, mask2d_xy, mask2d_yz, xy_proj, yz_proj,
+          probability_volume, xy_proj, yz_proj,
           fit_x, fit_z.
     """
     if not save_outputs or results_dir is None:
         return
 
-    # Always try to save background if provided
+    # Always try to save background-derived outputs if provided
     try:
-        if bkg is not None:
+        if bkg_slices is not None:
+            tifffile.imwrite(
+                os.path.join(results_dir, f"{tile_name}_bkg_slices.tif"),
+                np.asarray(bkg_slices, dtype=np.float32),
+                imagej=True,
+            )
+        elif bkg is not None:
             tifffile.imwrite(
                 os.path.join(results_dir, f"{tile_name}_bkg.tif"),
-                bkg,
+                np.asarray(bkg, dtype=np.float32),
                 imagej=True,
             )
     except Exception:
@@ -763,25 +778,11 @@ def save_method_outputs(
 
     if method == "fitting" and artifacts:
         try:
-            mask2d_xy = artifacts.get("mask2d_xy")
-            mask2d_yz = artifacts.get("mask2d_yz")
             xy_proj = artifacts.get("xy_proj")
             yz_proj = artifacts.get("yz_proj")
             fit_x = artifacts.get("fit_x")
             fit_z = artifacts.get("fit_z")
 
-            if mask2d_xy is not None:
-                tifffile.imwrite(
-                    os.path.join(results_dir, f"{tile_name}_mask2d_xy.tif"),
-                    mask2d_xy.astype(np.uint8),
-                    imagej=True,
-                )
-            if mask2d_yz is not None:
-                tifffile.imwrite(
-                    os.path.join(results_dir, f"{tile_name}_mask2d_yz.tif"),
-                    mask2d_yz.astype(np.uint8),
-                    imagej=True,
-                )
             if xy_proj is not None:
                 tifffile.imwrite(
                     os.path.join(results_dir, f"{tile_name}_xy_proj_smooth.tif"),
@@ -1099,8 +1100,6 @@ def main() -> None:
                         (
                             corrected,
                             probability_volume,
-                            mask2d_xy,
-                            mask2d_yz,
                             xy_proj,
                             yz_proj,
                             fit_x,
@@ -1149,8 +1148,6 @@ def main() -> None:
                 if method == "fitting":
                     artifacts = {
                         "probability_volume": probability_volume,
-                        "mask2d_xy": mask2d_xy,
-                        "mask2d_yz": mask2d_yz,
                         "xy_proj": xy_proj,
                         "yz_proj": yz_proj,
                         "fit_x": fit_x,
@@ -1162,6 +1159,7 @@ def main() -> None:
                     results_dir,
                     args.save_outputs,
                     bkg=bkg,
+                    bkg_slices=bkg_slices,
                     artifacts=artifacts,
                 )
 
