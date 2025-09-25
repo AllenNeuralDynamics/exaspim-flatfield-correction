@@ -552,7 +552,7 @@ def flatfield_fitting(
     del low_res, nan_med
 
     profile_sigma = config.get("profile_sigma", config.get("gaussian_sigma"))
-    profile_percentile = config.get("profile_percentile")
+    profile_percentile = config.get("profile_percentile", 75)
     profile_min_voxels = config.get("profile_min_voxels", 0)
 
     _LOGGER.info(
