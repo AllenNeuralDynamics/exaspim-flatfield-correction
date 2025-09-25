@@ -496,7 +496,7 @@ def gmm_probability_mask_features(
     n_components_fg: int = 3,
     n_components_bg: int = 3,
     max_samples_fg: int = 500_000,
-    max_samples_bg: int = 500_000,
+    max_samples_bg: int | None = 500_000,
     prior_fg: float = 0.5,
     reg_covar: float = 1e-6,
     n_init: int = 3,
@@ -511,7 +511,8 @@ def gmm_probability_mask_features(
     Returns a Dask array of P(foreground) you can `.compute()` or `.persist()`.
     The provided mask is eroded (unless `erosion_radius` is 0) before fitting
     the foreground model to focus on high-confidence voxels. Output shape ==
-    image.shape, dtype float32.
+    image.shape, dtype float32. Set `max_samples_bg` to None to use the entire
+    background volume without random sampling.
     """
     if not (0.0 < prior_fg < 1.0):
         raise ValueError("prior_fg must be in (0, 1)")
@@ -535,18 +536,30 @@ def gmm_probability_mask_features(
             structure = disk(erosion_radius)
         else:
             raise ValueError("Mask must be 2D or 3D for erosion")
-
+        print("eroding mask")
         mask_da = ndm.binary_erosion(mask_da, structure=structure)
 
     fg_lin_idx = da.flatnonzero(mask_da.ravel()).compute()
-
+    print("sampling fg features")
     X_fg = _sample_rows_from_dask_stack(feats_img, fg_lin_idx, max_samples_fg, rng)
 
     # background: uniform sample across entire background volume
     bg_size = int(np.prod(bg_da.shape))
-    max_bg = min(max_samples_bg, bg_size)
-    bg_lin_idx = rng.choice(bg_size, size=max_bg, replace=False)
-    X_bg = _sample_rows_from_dask_stack(feats_bg, bg_lin_idx, max_bg, rng)
+
+    if max_samples_bg is not None:
+        if max_samples_bg <= 0:
+            raise ValueError("max_samples_bg must be positive or None")
+        sample_cap = min(max_samples_bg, bg_size)
+        if sample_cap >= bg_size:
+            bg_lin_idx = np.arange(bg_size, dtype=np.int64)
+        else:
+            bg_lin_idx = rng.choice(bg_size, size=sample_cap, replace=False)
+    else:
+        sample_cap = bg_size
+        print("cap ", sample_cap)
+        bg_lin_idx = np.arange(bg_size, dtype=np.int64)
+    print("sampling bg features")
+    X_bg = _sample_rows_from_dask_stack(feats_bg, bg_lin_idx, sample_cap, rng)
 
     # ---- Standardize by combined training stats ----
     train_stack = np.vstack([X_fg, X_bg])
