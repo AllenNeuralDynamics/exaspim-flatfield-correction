@@ -68,6 +68,7 @@ class MaskArtifacts:
     probability_volume: da.Array
     mask_low_res: da.Array
 
+
 def get_mem_limit() -> int | str:
     """
     Return a value suitable for Dask’s LocalCluster(memory_limit=…).
@@ -630,25 +631,9 @@ def flatfield_fitting(
         )
         corrected = da.clip(corrected, 0, 2**16 - 1)
 
-    percentile = config.get("percentile")
-    _LOGGER.info(f"Computing percentile projection with percentile: {percentile}")
-    xy_proj = percentile_project(
-        low_res_clipped, axis=0, percentile=percentile
-    )
-    xy_proj = gaussian_filter(xy_proj.astype(np.float32), sigma=config.get("gaussian_sigma"))
-    yz_proj = percentile_project(
-        low_res_clipped, axis=2, percentile=percentile
-    )
-    yz_proj = gaussian_filter(yz_proj.astype(np.float32), sigma=config.get("gaussian_sigma"))
-
-    del low_res_clipped
-
     # Return corrected image and QC/debug artifacts for saving in main
     return (
         corrected,
-        probability_volume,
-        xy_proj,
-        yz_proj,
         fit_x,
         fit_z,
         mask_artifacts,
@@ -778,27 +763,8 @@ def save_method_outputs(
 
     if method == "fitting" and artifacts:
         try:
-            xy_proj = artifacts.get("xy_proj")
-            yz_proj = artifacts.get("yz_proj")
             fit_x = artifacts.get("fit_x")
             fit_z = artifacts.get("fit_z")
-
-            if xy_proj is not None:
-                tifffile.imwrite(
-                    os.path.join(results_dir, f"{tile_name}_xy_proj_smooth.tif"),
-                    xy_proj.astype(np.float32),
-                    imagej=True,
-                )
-            if yz_proj is not None:
-                tifffile.imwrite(
-                    os.path.join(results_dir, f"{tile_name}_yz_proj_smooth.tif"),
-                    yz_proj.astype(np.float32),
-                    imagej=True,
-                )
-        except Exception:
-            _LOGGER.exception("Failed saving QC TIFFs for fitting")
-
-        try:
             if fit_x is not None:
                 save_correction_curve_plot(
                     fit_x,
@@ -1097,15 +1063,7 @@ def main() -> None:
                         )
                     elif method == "fitting":
                         fitting_config = get_fitting_config()
-                        (
-                            corrected,
-                            probability_volume,
-                            xy_proj,
-                            yz_proj,
-                            fit_x,
-                            fit_z,
-                            mask_artifacts,
-                        ) = flatfield_fitting(
+                        corrected, fit_x, fit_z, mask_artifacts = flatfield_fitting(
                             full_res,
                             z,
                             is_binned_channel,
@@ -1147,9 +1105,6 @@ def main() -> None:
                 artifacts = None
                 if method == "fitting":
                     artifacts = {
-                        "probability_volume": probability_volume,
-                        "xy_proj": xy_proj,
-                        "yz_proj": yz_proj,
                         "fit_x": fit_x,
                         "fit_z": fit_z,
                     }
