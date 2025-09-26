@@ -531,6 +531,7 @@ def flatfield_fitting(
         overwrite=overwrite,
         write_empty_chunks=False,
     )
+    mask_upscaled = da.from_zarr(mask_path, component="0").squeeze()
 
     med_factor = (
         config.get("med_factor_binned")
