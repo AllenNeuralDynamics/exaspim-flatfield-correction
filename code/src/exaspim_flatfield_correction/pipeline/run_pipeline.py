@@ -54,6 +54,10 @@ from exaspim_flatfield_correction.utils.utils import (
     resize,
     save_correction_curve_plot,
 )
+from exaspim_flatfield_correction.pipeline.fitting_config import (
+    FittingConfig,
+    load_fitting_config,
+)
 
 
 logging.basicConfig(
@@ -381,7 +385,7 @@ def flatfield_fitting(
     coordinate_transformations: dict,
     overwrite: bool,
     n_levels: int,
-    config: dict,
+    config: FittingConfig,
     results_dir: str = None,
     bkg_slices: np.ndarray | None = None,
     mask_artifacts: MaskArtifacts | None = None,
@@ -412,8 +416,8 @@ def flatfield_fitting(
         Whether to overwrite existing outputs.
     n_levels : int
         Number of zarr pyramid levels.
-    config : dict
-        Dictionary of fitting parameters (see get_fitting_config).
+    config : FittingConfig
+        Validated parameters controlling the fitting workflow.
     results_dir : str, optional
         Directory to store intermediate mask zarr, by default None.
     bkg_slices : numpy.ndarray or None, optional
@@ -443,10 +447,10 @@ def flatfield_fitting(
             tile_name,
         ).astype(bool)
 
-        gmm_n_components = config.get("gmm_n_components")
-        gmm_max_samples = config.get("gmm_max_samples")
-        gmm_batch_size = config.get("gmm_batch_size")
-        gmm_random_state = config.get("gmm_random_state")
+        gmm_n_components = config.gmm_n_components
+        gmm_max_samples = config.gmm_max_samples
+        gmm_batch_size = config.gmm_batch_size
+        gmm_random_state = config.gmm_random_state
 
         _LOGGER.info(
             "Fitting GMM probabilities with n_components=%d, max_samples=%d, batch_size=%d",
@@ -462,12 +466,12 @@ def flatfield_fitting(
             gaussian_filter_dask(low_res.astype(np.float32), sigma=1),
             initial_mask,
             da.from_array(bkg_slices, chunks=(128, 128, 128)),
-            n_components_fg=4,
-            n_components_bg=2,
+            n_components_fg=gmm_n_components,
+            n_components_bg=gmm_n_components,
             max_samples_fg=gmm_max_samples,
             max_samples_bg=gmm_max_samples,
             random_state=gmm_random_state,
-            erosion_radius=10,
+            erosion_radius=config.erosion_radius,
         ).astype(np.float32).persist()
         
         # Persist the soft tissue probabilities as an OME-Zarr dataset at the
@@ -487,10 +491,10 @@ def flatfield_fitting(
             write_empty_chunks=False,
         )
 
-        prob_threshold = config.get("mask_probability_threshold")
-        prob_min_size = config.get("mask_probability_min_size")
+        prob_threshold = config.mask_probability_threshold
+        prob_min_size = config.mask_probability_min_size
         _LOGGER.info(
-            "Projecting probability mask with threshold %.3f and min_size %s",
+            "Thresholding probability volume with threshold %.3f and min_size %s",
             prob_threshold,
             prob_min_size,
         )
@@ -534,9 +538,7 @@ def flatfield_fitting(
     mask_upscaled = da.from_zarr(mask_path, component="0").squeeze()
 
     med_factor = (
-        config.get("med_factor_binned")
-        if is_binned_channel
-        else config.get("med_factor_unbinned")
+        config.med_factor_binned if is_binned_channel else config.med_factor_unbinned
     )
 
     _LOGGER.info(f"Clipping low_res with median factor: {med_factor}")
@@ -552,12 +554,13 @@ def flatfield_fitting(
 
     del low_res, nan_med
 
-    profile_sigma = config.get("profile_sigma", config.get("gaussian_sigma"))
-    profile_percentile = config.get("profile_percentile", 80)
-    profile_min_voxels = config.get("profile_min_voxels", 0)
+    profile_sigma = config.gaussian_sigma
+    profile_percentile = config.profile_percentile
+    profile_min_voxels = config.profile_min_voxels
+    spline_smoothing = config.spline_smoothing
 
     _LOGGER.info(
-        "Computing 3D masked profiles (sigma=%s, percentile=%s, min_voxels=%s)",
+        "Computing masked profiles (sigma=%s, percentile=%s, min_voxels=%s)",
         profile_sigma,
         profile_percentile,
         profile_min_voxels,
@@ -576,9 +579,9 @@ def flatfield_fitting(
         np.arange(norm_x.size, dtype=np.float32),
         norm_x,
         full_res.shape[2],
-        smoothing=config.get("spline_smoothing"),
+        smoothing=spline_smoothing,
     )
-    limits_xy = config.get("limits_xy")
+    limits_xy = config.limits_xy
     if limits_xy is not None:
         fit_x = np.clip(fit_x, limits_xy[0], limits_xy[1])
 
@@ -604,9 +607,9 @@ def flatfield_fitting(
             np.arange(norm_y.size, dtype=np.float32),
             norm_y,
             full_res.shape[1],
-            smoothing=config.get("spline_smoothing"),
+            smoothing=spline_smoothing,
         )
-        limits_y = config.get("limits_y", config.get("limits_xy"))
+        limits_y = config.limits_xy
         if limits_y is not None:
             fit_y = np.clip(fit_y, limits_y[0], limits_y[1])
 
@@ -627,9 +630,9 @@ def flatfield_fitting(
             np.arange(norm_z.size, dtype=np.float32),
             norm_z,
             full_res.shape[0],
-            smoothing=config.get("spline_smoothing"),
+            smoothing=spline_smoothing,
         )
-        limits_z = config.get("limits_z")
+        limits_z = config.limits_z
         if limits_z is not None:
             fit_z = np.clip(fit_z, limits_z[0], limits_z[1])
 
@@ -638,11 +641,11 @@ def flatfield_fitting(
             mask_upscaled, corrected / correction_z, corrected
         )
 
-        # Use defaults consistent with get_fitting_config()
+        # Use defaults consistent with FittingConfig()
         global_factor = (
-            config.get("global_factor_binned")
+            config.global_factor_binned
             if is_binned_channel
-            else config.get("global_factor_unbinned")
+            else config.global_factor_unbinned
         )
         ratio = global_factor / median_xy
         _LOGGER.info(
@@ -706,36 +709,6 @@ def save_metadata(
                 }
             )
         )
-
-
-def get_fitting_config() -> dict:
-    """
-    Return the default config dictionary for fitting correction.
-
-    Returns
-    -------
-    dict
-        Dictionary of default fitting parameters for flatfield_fitting().
-    """
-    return {
-        "med_factor_binned": 2,
-        "med_factor_unbinned": 2,
-        "percentile": 99,
-        "gaussian_sigma": 2,
-        "spline_smoothing": 0,
-        "limits_xy": (0.25, 1.2),
-        "limits_z": (0.25, 1.2),
-        "global_factor_binned": 3200,
-        "global_factor_unbinned": 100,
-        "mask_probability_threshold": 0.9,
-        "mask_probability_min_size": 10000,
-        "gmm_n_components": 3,
-        "gmm_max_samples": 2_000_000,
-        "gmm_batch_size": 200_000,
-        "gmm_random_state": 0,
-    }
-
-
 def save_method_outputs(
     method: str,
     tile_name: str,
@@ -918,6 +891,12 @@ def parse_and_validate_args() -> argparse.Namespace:
     parser.add_argument("--skip-bkg-sub", action="store_true", default=False)
     parser.add_argument("--flatfield-path", type=str, default=None)
     parser.add_argument("--mask-dir", type=str, default=None)
+    parser.add_argument(
+        "--fitting-config",
+        type=str,
+        default=None,
+        help="Path to a JSON file with fitting configuration overrides.",
+    )
     parser.add_argument("--num-workers", type=int, default=1)
     parser.add_argument("--log-level", type=str, default=logging.INFO)
     parser.add_argument(
@@ -1043,6 +1022,13 @@ def main() -> None:
     )
 
     mask_artifacts: MaskArtifacts | None = None
+    fitting_config: FittingConfig | None = None
+    if method == "fitting":
+        fitting_config = load_fitting_config(args.fitting_config)
+        if args.fitting_config:
+            _LOGGER.info("Loaded fitting config from %s", args.fitting_config)
+        # dump to results folder
+        fitting_config.to_file(os.path.join(results_dir, "fitting_config.json"))
 
     for tile_path in tile_paths:
         tile_name = Path(tile_path).name
@@ -1097,7 +1083,8 @@ def main() -> None:
                             results_dir=results_dir
                         )
                     elif method == "fitting":
-                        fitting_config = get_fitting_config()
+                        if fitting_config is None:
+                            raise ValueError("Fitting configuration failed to initialize")
                         corrected, fit_x, fit_y, fit_z, mask_artifacts = flatfield_fitting(
                             full_res,
                             z,
