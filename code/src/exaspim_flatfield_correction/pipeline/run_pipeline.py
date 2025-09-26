@@ -553,7 +553,7 @@ def flatfield_fitting(
     del low_res, nan_med
 
     profile_sigma = config.get("profile_sigma", config.get("gaussian_sigma"))
-    profile_percentile = config.get("profile_percentile", 25)
+    profile_percentile = config.get("profile_percentile", 80)
     profile_min_voxels = config.get("profile_min_voxels", 0)
 
     _LOGGER.info(
@@ -583,11 +583,35 @@ def flatfield_fitting(
         fit_x = np.clip(fit_x, limits_xy[0], limits_xy[1])
 
     corrected = full_res
+    fit_y = None
     fit_z = None
 
     if median_xy != 0:
         correction_x = fit_x.reshape(1, 1, -1)
         corrected = da.where(mask_upscaled, full_res / correction_x, full_res)
+
+        norm_y, median_xz = masked_axis_profile(
+            low_res_clipped,
+            mask,
+            axis=1,
+            smooth_sigma=profile_sigma,
+            percentile=profile_percentile,
+            min_voxels=profile_min_voxels,
+        )
+        _LOGGER.info("Global median from 3D masked profile (axis=Y): %s", median_xz)
+
+        fit_y = rescale_spline(
+            np.arange(norm_y.size, dtype=np.float32),
+            norm_y,
+            full_res.shape[1],
+            smoothing=config.get("spline_smoothing"),
+        )
+        limits_y = config.get("limits_y", config.get("limits_xy"))
+        if limits_y is not None:
+            fit_y = np.clip(fit_y, limits_y[0], limits_y[1])
+
+        correction_y = fit_y.reshape(1, -1, 1)
+        corrected = da.where(mask_upscaled, corrected / correction_y, corrected)
 
         norm_z, median_yz = masked_axis_profile(
             low_res_clipped,
@@ -636,6 +660,7 @@ def flatfield_fitting(
     return (
         corrected,
         fit_x,
+        fit_y,
         fit_z,
         mask_artifacts,
     )
@@ -740,7 +765,7 @@ def save_method_outputs(
     artifacts : dict or None
         Method-specific artifacts; for 'fitting' expects keys:
           probability_volume, xy_proj, yz_proj,
-          fit_x, fit_z.
+          fit_x, fit_y, fit_z.
     """
     if not save_outputs or results_dir is None:
         return
@@ -765,6 +790,7 @@ def save_method_outputs(
     if method == "fitting" and artifacts:
         try:
             fit_x = artifacts.get("fit_x")
+            fit_y = artifacts.get("fit_y")
             fit_z = artifacts.get("fit_z")
             if fit_x is not None:
                 save_correction_curve_plot(
@@ -773,6 +799,14 @@ def save_method_outputs(
                     xlabel="X (pixels)",
                     ylabel="Correction factor",
                     out_png=os.path.join(results_dir, f"{tile_name}_corr_xy.png"),
+                )
+            if fit_y is not None:
+                save_correction_curve_plot(
+                    fit_y,
+                    title=f"XZ correction curve: {tile_name}",
+                    xlabel="Y (pixels)",
+                    ylabel="Correction factor",
+                    out_png=os.path.join(results_dir, f"{tile_name}_corr_xz.png"),
                 )
             if fit_z is not None:
                 save_correction_curve_plot(
@@ -1064,7 +1098,7 @@ def main() -> None:
                         )
                     elif method == "fitting":
                         fitting_config = get_fitting_config()
-                        corrected, fit_x, fit_z, mask_artifacts = flatfield_fitting(
+                        corrected, fit_x, fit_y, fit_z, mask_artifacts = flatfield_fitting(
                             full_res,
                             z,
                             is_binned_channel,
@@ -1107,6 +1141,7 @@ def main() -> None:
                 if method == "fitting":
                     artifacts = {
                         "fit_x": fit_x,
+                        "fit_y": fit_y,
                         "fit_z": fit_z,
                     }
                 save_method_outputs(
