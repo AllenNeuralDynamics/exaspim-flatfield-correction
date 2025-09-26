@@ -161,9 +161,9 @@ def masked_axis_profile(
     coverage = mask_np.sum(axis=reduce_axes)
 
     if percentile is None:
-        profile = np.nanmedian(masked, axis=reduce_axes)
-    else:
-        profile = np.nanpercentile(masked, percentile, axis=reduce_axes)
+        percentile = 50
+ 
+    profile = np.nanpercentile(masked, percentile, axis=reduce_axes)
 
     global_med = float(np.nanpercentile(masked, percentile))
     if not np.isfinite(global_med) or global_med <= 0:
