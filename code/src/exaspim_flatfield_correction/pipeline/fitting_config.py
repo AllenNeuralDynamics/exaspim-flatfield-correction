@@ -32,15 +32,6 @@ class FittingConfig(BaseModel):
             "unbinned channels before profile extraction."
         ),
     )
-    percentile: float = Field(
-        default=99,
-        ge=0,
-        le=100,
-        description=(
-            "Legacy percentile control kept for backwards compatibility. "
-            "Expose it here so JSON overrides do not fail validation."
-        ),
-    )
     gaussian_sigma: float = Field(
         default=2,
         ge=0,
