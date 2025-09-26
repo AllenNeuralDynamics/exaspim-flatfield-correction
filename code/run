@@ -36,7 +36,7 @@ PYTHONPATH=./src python -u ./src/exaspim_flatfield_correction/pipeline/run_pipel
 --n-levels 7 \
 --results-dir "/results" \
 --save-outputs \
---fitting-config "$8" \
+--fitting-config "$9" \
 --overwrite \
 $BINNED_FLAG
 
