@@ -165,7 +165,7 @@ def masked_axis_profile(
     else:
         profile = np.nanpercentile(masked, percentile, axis=reduce_axes)
 
-    global_med = float(np.nanmedian(masked))
+    global_med = float(np.nanpercentile(masked, percentile))
     if not np.isfinite(global_med) or global_med <= 0:
         return np.ones(mask_np.shape[axis], dtype=np.float32), 0.0
 
