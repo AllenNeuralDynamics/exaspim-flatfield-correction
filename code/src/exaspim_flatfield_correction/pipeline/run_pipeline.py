@@ -33,9 +33,7 @@ from exaspim_flatfield_correction.splinefit import (
 )
 from exaspim_flatfield_correction.background import estimate_bkg
 from exaspim_flatfield_correction.utils.mask_utils import (
-    gmm_probability_mask_features,
-    gmm_probability_mask,
-    project_probability_mask,
+    calc_gmm_prob,
     size_filter,
     upscale_mask_nearest,
     get_mask
@@ -462,10 +460,10 @@ def flatfield_fitting(
             raise ValueError(
                 "Background slices are required to fit the mask GMM on the reference tile"
             )
-        probability_volume = gmm_probability_mask_features(
+        probability_volume = calc_gmm_prob(
             gaussian_filter_dask(low_res.astype(np.float32), sigma=1),
             initial_mask,
-            da.from_array(bkg_slices, chunks=(128, 128, 128)),
+            da.from_array(bkg_slices, chunks=(64,64,64)),
             n_components_fg=gmm_n_components,
             n_components_bg=gmm_n_components,
             max_samples_fg=gmm_max_samples,
