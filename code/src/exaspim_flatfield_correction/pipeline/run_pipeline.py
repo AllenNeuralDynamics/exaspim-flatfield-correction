@@ -52,7 +52,7 @@ from exaspim_flatfield_correction.utils.utils import (
     resize,
     save_correction_curve_plot,
 )
-from exaspim_flatfield_correction.pipeline.fitting_config import (
+from exaspim_flatfield_correction.pipeline.config import (
     FittingConfig,
     load_fitting_config,
 )
