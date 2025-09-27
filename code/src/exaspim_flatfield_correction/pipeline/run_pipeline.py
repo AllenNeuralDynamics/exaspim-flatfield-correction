@@ -18,7 +18,6 @@ import dask
 import dask.array as da
 from dask.distributed import performance_report
 from distributed import Client, LocalCluster
-from scipy.ndimage import gaussian_filter
 from dask_image.ndfilters import gaussian_filter as gaussian_filter_dask
 
 from exaspim_flatfield_correction.flatfield import (
@@ -29,7 +28,6 @@ from exaspim_flatfield_correction.flatfield import (
 from exaspim_flatfield_correction.splinefit import (
     apply_axis_corrections,
     compute_axis_fits,
-    percentile_project,
 )
 from exaspim_flatfield_correction.background import estimate_bkg
 from exaspim_flatfield_correction.utils.mask_utils import (
@@ -671,6 +669,8 @@ def save_metadata(
                 }
             )
         )
+
+
 def save_method_outputs(
     method: str,
     tile_name: str,

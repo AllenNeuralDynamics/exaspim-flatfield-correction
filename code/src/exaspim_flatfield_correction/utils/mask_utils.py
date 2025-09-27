@@ -273,7 +273,6 @@ def compute_simple_features_dask(
     sigma_mean: float = 1.5,
     sigma_log: float = 1.0,
     sigma_grad: float = 1.0,
-    chunks: tuple[int, ...] | int | str = "auto",
 ) -> list[da.Array]:
     """
     Lazily compute 5 features as Dask arrays using dask-image:
