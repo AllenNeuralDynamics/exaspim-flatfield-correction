@@ -134,17 +134,23 @@ def apply_axis_corrections(
         fit_x = axis_fits.get("x")
         if fit_x is not None:
             correction_x = fit_x.reshape(1, 1, -1)
-            corrected = da.where(mask_upscaled, corrected / correction_x, corrected)
+            corrected = da.where(
+                mask_upscaled, corrected / correction_x, corrected
+            )
 
         fit_y = axis_fits.get("y")
         if fit_y is not None:
             correction_y = fit_y.reshape(1, -1, 1)
-            corrected = da.where(mask_upscaled, corrected / correction_y, corrected)
+            corrected = da.where(
+                mask_upscaled, corrected / correction_y, corrected
+            )
 
         fit_z = axis_fits.get("z")
         if fit_z is not None:
             correction_z = fit_z.reshape(-1, 1, 1)
-            corrected = da.where(mask_upscaled, corrected / correction_z, corrected)
+            corrected = da.where(
+                mask_upscaled, corrected / correction_z, corrected
+            )
 
         ratio = global_factor / median_xy
         _LOGGER.info(
@@ -157,7 +163,8 @@ def apply_axis_corrections(
         corrected = da.clip(corrected, 0, clip_max)
     else:
         _LOGGER.warning(
-            "Skipping correction: median_xy is zero or non-finite (%s)", median_xy
+            "Skipping correction: median_xy is zero or non-finite (%s)",
+            median_xy,
         )
 
     return corrected
@@ -217,7 +224,7 @@ def masked_axis_profile(
 
     if percentile is None:
         percentile = 50
- 
+
     profile = np.nanpercentile(masked, percentile, axis=reduce_axes)
 
     global_med = float(np.nanpercentile(masked, percentile))
@@ -229,7 +236,9 @@ def masked_axis_profile(
         profile = np.where(coverage >= min_voxels, profile, global_med)
 
     if smooth_sigma and smooth_sigma > 0:
-        profile = gaussian_filter1d(profile, sigma=smooth_sigma, mode="nearest")
+        profile = gaussian_filter1d(
+            profile, sigma=smooth_sigma, mode="nearest"
+        )
 
     norm_profile = (profile / global_med).astype(np.float32, copy=False)
     return norm_profile, global_med

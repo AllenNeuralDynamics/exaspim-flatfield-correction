@@ -15,6 +15,7 @@ from aind_data_transfer.transformations.ome_zarr import (
     write_ome_ngff_metadata,
 )
 from numcodecs import blosc
+
 blosc.use_threads = False
 from xarray_multiscale.reducers import windowed_rank, windowed_mean
 
@@ -31,7 +32,7 @@ def store_ome_zarr(
     reducer: Callable = windowed_mean,
     aws_region: str = "us-west-2",
     s3_use_ssl: bool = False,
-    write_empty_chunks: bool = True
+    write_empty_chunks: bool = True,
 ) -> None:
     """
     Store a Dask array as an OME-Zarr multiscale dataset, with optional S3
@@ -81,7 +82,7 @@ def store_ome_zarr(
                 },
             },
             use_ssl=s3_use_ssl,
-            s3_additional_kwargs = {"batch_size": 64},
+            s3_additional_kwargs={"batch_size": 64},
         )
         # Create a Zarr group on S3
         store = s3fs.S3Map(root=output_zarr, s3=s3, check=False)
@@ -106,12 +107,12 @@ def store_ome_zarr(
 
     _LOGGER.info("storing array")
     store_array(
-        corrected, 
-        root_group, 
-        "0", 
-        block_shape, 
-        codec, 
-        write_empty_chunks=write_empty_chunks
+        corrected,
+        root_group,
+        "0",
+        block_shape,
+        codec,
+        write_empty_chunks=write_empty_chunks,
     )
     _LOGGER.info("downsampling array")
     if reducer == windowed_rank:
@@ -124,7 +125,7 @@ def store_ome_zarr(
         block_shape,
         codec,
         reducer,
-        write_empty_chunks=write_empty_chunks
+        write_empty_chunks=write_empty_chunks,
     )
     _LOGGER.info("writing ome metadata")
     write_ome_ngff_metadata(

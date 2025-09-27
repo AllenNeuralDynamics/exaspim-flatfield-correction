@@ -10,7 +10,7 @@ from scipy.ndimage import (
     distance_transform_edt,
     label,
 )
-import dask_image.ndfilters as di  
+import dask_image.ndfilters as di
 import dask_image.ndmorph as ndm
 from skimage.morphology import ball, disk
 from sklearn.mixture import GaussianMixture
@@ -165,7 +165,9 @@ def size_filter(
         valid_labels = np.where(component_sizes >= min_size)[0]
         valid_labels = valid_labels[valid_labels != 0]
         if len(valid_labels) == 0:
-            raise ValueError("No connected components meet the specified min_size")
+            raise ValueError(
+                "No connected components meet the specified min_size"
+            )
         final_mask = np.isin(labeled_array, valid_labels)
 
     return final_mask
@@ -279,14 +281,16 @@ def compute_simple_features_dask(
       [ intensity, local mean, local std, gaussian gradient magnitude, -LoG ]
     """
     # Local mean & std via Gaussian filtering (E[x^2] - (E[x])^2)
-    m  = di.gaussian_filter(x, sigma=sigma_mean)
+    m = di.gaussian_filter(x, sigma=sigma_mean)
     m2 = di.gaussian_filter(x * x, sigma=sigma_mean)
     var = da.maximum(m2 - m * m, 0.0).astype(np.float32)
     std = da.sqrt(var)
 
     # Edge/texture cues
-    grad_mag = di.gaussian_gradient_magnitude(x, sigma=sigma_grad).astype(np.float32)
-    neg_log  = (-di.gaussian_laplace(x, sigma=sigma_log)).astype(np.float32)
+    grad_mag = di.gaussian_gradient_magnitude(x, sigma=sigma_grad).astype(
+        np.float32
+    )
+    neg_log = (-di.gaussian_laplace(x, sigma=sigma_log)).astype(np.float32)
 
     return [x, m, std, grad_mag, neg_log]
 
@@ -302,8 +306,10 @@ def _sample_rows_from_dask_stack(
         linear_idx = rng.choice(linear_idx, size=max_rows, replace=False)
 
     # Advanced indexing gathers only the needed rows from each feature
-    cols = [da.take(f.ravel(), linear_idx) for f in feats]   # list of dask 1D arrays
-    X = da.stack(cols, axis=1).compute()                     # small NumPy (n_sel, n_feats)
+    cols = [
+        da.take(f.ravel(), linear_idx) for f in feats
+    ]  # list of dask 1D arrays
+    X = da.stack(cols, axis=1).compute()  # small NumPy (n_sel, n_feats)
 
     finite = np.isfinite(X).all(axis=1)
     if not np.any(finite):
@@ -341,16 +347,24 @@ def calc_gmm_prob(
 
     # ---- Features (lazy, via dask-image) ----
     feats_img = compute_simple_features_dask(
-        img_da, sigma_mean=sigma_mean, sigma_log=sigma_log, sigma_grad=sigma_grad, chunks=img_da.chunks
+        img_da,
+        sigma_mean=sigma_mean,
+        sigma_log=sigma_log,
+        sigma_grad=sigma_grad,
+        chunks=img_da.chunks,
     )
-    feats_bg  = compute_simple_features_dask(
-        bg_da,  sigma_mean=sigma_mean, sigma_log=sigma_log, sigma_grad=sigma_grad, chunks=bg_da.chunks
+    feats_bg = compute_simple_features_dask(
+        bg_da,
+        sigma_mean=sigma_mean,
+        sigma_log=sigma_log,
+        sigma_grad=sigma_grad,
+        chunks=bg_da.chunks,
     )
     n_feats = len(feats_img)  # 5
 
     # ---- Subsample training rows from Dask (materialize small NumPy arrays) ----
     rng = np.random.default_rng(random_state)
-    
+
     if erosion_radius > 0:
         if mask_da.ndim == 3:
             structure = ball(erosion_radius)
@@ -365,7 +379,9 @@ def calc_gmm_prob(
 
     fg_lin_idx = da.flatnonzero(mask_eroded.ravel()).compute()
     print("sampling fg features")
-    X_fg = _sample_rows_from_dask_stack(feats_img, fg_lin_idx, max_samples_fg, rng)
+    X_fg = _sample_rows_from_dask_stack(
+        feats_img, fg_lin_idx, max_samples_fg, rng
+    )
 
     # background: uniform sample across entire background volume
     bg_size = int(np.prod(bg_da.shape))
@@ -388,36 +404,46 @@ def calc_gmm_prob(
     # ---- Standardize by combined training stats ----
     train_stack = np.vstack([X_fg, X_bg])
     mean_vec = train_stack.mean(axis=0)
-    std_vec  = train_stack.std(axis=0)
+    std_vec = train_stack.std(axis=0)
     std_vec[std_vec < 1e-6] = 1.0
 
     # ---- Fit GMMs ----
     fg_gmm = GaussianMixture(
-        n_components=n_components_fg, covariance_type="full",
-        reg_covar=reg_covar, n_init=n_init, random_state=random_state
+        n_components=n_components_fg,
+        covariance_type="full",
+        reg_covar=reg_covar,
+        n_init=n_init,
+        random_state=random_state,
     ).fit((X_fg - mean_vec) / std_vec)
 
     bg_gmm = GaussianMixture(
-        n_components=n_components_bg, covariance_type="full",
-        reg_covar=reg_covar, n_init=n_init, random_state=random_state
+        n_components=n_components_bg,
+        covariance_type="full",
+        reg_covar=reg_covar,
+        n_init=n_init,
+        random_state=random_state,
     ).fit((X_bg - mean_vec) / std_vec)
 
     # ---- Stack features lazily for blockwise scoring: (..., F) ----
-    feats_stack = da.stack(feats_img, axis=-1).astype(np.float32)  # same chunks as img
+    feats_stack = da.stack(feats_img, axis=-1).astype(
+        np.float32
+    )  # same chunks as img
 
     # ---- Blockwise scoring (mask-aware) ----
     log_pi_fg = float(np.log(prior_fg))
     log_pi_bg = float(np.log(1.0 - prior_fg))
 
     # --- change _score_block to accept a 4D mask with a singleton last axis ---
-    def _score_block(block_feats: np.ndarray,
-                    block_mask: np.ndarray,
-                    fg_gmm: GaussianMixture,
-                    bg_gmm: GaussianMixture,
-                    mean_vec: np.ndarray,
-                    std_vec: np.ndarray,
-                    log_pi_fg: float,
-                    log_pi_bg: float) -> np.ndarray:
+    def _score_block(
+        block_feats: np.ndarray,
+        block_mask: np.ndarray,
+        fg_gmm: GaussianMixture,
+        bg_gmm: GaussianMixture,
+        mean_vec: np.ndarray,
+        std_vec: np.ndarray,
+        log_pi_fg: float,
+        log_pi_bg: float,
+    ) -> np.ndarray:
 
         # If mask arrived as (..., 1), squeeze it back to (...)
         if block_mask.ndim == block_feats.ndim:
@@ -428,15 +454,21 @@ def calc_gmm_prob(
         if not np.any(m):
             return out
 
-        X = block_feats[m].reshape(-1, block_feats.shape[-1]).astype(np.float64, copy=False)
+        X = (
+            block_feats[m]
+            .reshape(-1, block_feats.shape[-1])
+            .astype(np.float64, copy=False)
+        )
         X = (X - mean_vec) / std_vec
         finite = np.isfinite(X).all(axis=1)
 
         if np.any(finite):
-            Xz   = X[finite]
+            Xz = X[finite]
             lg_f = fg_gmm.score_samples(Xz) + log_pi_fg
             lg_b = bg_gmm.score_samples(Xz) + log_pi_bg
-            prob = np.exp(lg_f - np.logaddexp(lg_f, lg_b)).astype(np.float32, copy=False)
+            prob = np.exp(lg_f - np.logaddexp(lg_f, lg_b)).astype(
+                np.float32, copy=False
+            )
 
             tmp = np.zeros(X.shape[0], dtype=np.float32)
             tmp[finite] = prob
@@ -446,8 +478,8 @@ def calc_gmm_prob(
 
     probs = da.map_blocks(
         _score_block,
-        feats_stack,                  # 4D blocks
-        mask_da[..., None],           # 4D blocks with last axis = 1
+        feats_stack,  # 4D blocks
+        mask_da[..., None],  # 4D blocks with last axis = 1
         fg_gmm=fg_gmm,
         bg_gmm=bg_gmm,
         mean_vec=mean_vec,
@@ -455,8 +487,8 @@ def calc_gmm_prob(
         log_pi_fg=log_pi_fg,
         log_pi_bg=log_pi_bg,
         dtype=np.float32,
-        chunks=img_da.chunks,         # output is 3D like image
-        drop_axis=(-1,),              # drop the feature axis in the output
+        chunks=img_da.chunks,  # output is 3D like image
+        drop_axis=(-1,),  # drop the feature axis in the output
     )
 
     return probs

@@ -12,6 +12,7 @@ from dataclasses import dataclass
 import numpy as np
 import zarr
 from numcodecs import blosc
+
 blosc.use_threads = False
 import tifffile
 import dask
@@ -34,7 +35,7 @@ from exaspim_flatfield_correction.utils.mask_utils import (
     calc_gmm_prob,
     size_filter,
     upscale_mask_nearest,
-    get_mask
+    get_mask,
 )
 from exaspim_flatfield_correction.utils.zarr_utils import (
     store_ome_zarr,
@@ -118,8 +119,12 @@ def load_mask_from_dir(mask_dir: str, tile_name: str) -> np.ndarray:
     if tile_name is None or tile_name == "":
         raise ValueError("Tile name must be provided to load the mask.")
     if mask_dir is None or not os.path.isdir(mask_dir):
-        raise ValueError(f"Mask directory {mask_dir} does not exist or is not a directory.")
-    _LOGGER.info(f"Loading mask from directory: {mask_dir} for tile: {tile_name}")
+        raise ValueError(
+            f"Mask directory {mask_dir} does not exist or is not a directory."
+        )
+    _LOGGER.info(
+        f"Loading mask from directory: {mask_dir} for tile: {tile_name}"
+    )
     tile_prefix = "_".join(tile_name.split("_")[:2])
     for root, _, files in os.walk(mask_dir, followlinks=True):
         for f in files:
@@ -216,7 +221,9 @@ def background_subtraction(
         bkg_res = "0" if is_binned_channel else "3"
         _LOGGER.info(f"Using resolution {bkg_res} for background estimation")
         low_res = da.from_zarr(z[bkg_res]).squeeze().astype(np.float32)
-        bkg, bkg_slices = estimate_bkg(gaussian_filter_dask(low_res, sigma=1).compute())
+        bkg, bkg_slices = estimate_bkg(
+            gaussian_filter_dask(low_res, sigma=1).compute()
+        )
 
     full_res = subtract_bkg(
         full_res,
@@ -331,7 +338,7 @@ def flatfield_basicpy(
             load_mask_from_dir(mask_dir, tile_name),
             low_res.shape,
             results_dir,
-            tile_name
+            tile_name,
         ).compute()
     fit = fit_basic(
         low_res.compute(),
@@ -347,16 +354,18 @@ def flatfield_basicpy(
     return corrected
 
 
-def _preprocess_mask(mask: np.ndarray, low_res_shape: tuple, results_dir: str, tile_name: str) -> da.Array:
+def _preprocess_mask(
+    mask: np.ndarray, low_res_shape: tuple, results_dir: str, tile_name: str
+) -> da.Array:
     """
     Upscale and save mask as zarr, then reload as dask array.
     """
     mask_name = str(Path(results_dir) / f"{tile_name}_mask.zarr")
     if mask.shape != low_res_shape:
         mask = upscale_mask_nearest(
-                da.from_array(mask, chunks=(128, 256, 256)),
-                low_res_shape,
-                chunks=(128, 256, 256),
+            da.from_array(mask, chunks=(128, 256, 256)),
+            low_res_shape,
+            chunks=(128, 256, 256),
         ).compute()
         # keep only the largest connected component
         mask = size_filter(mask, k_largest=1, min_size=None)
@@ -407,20 +416,26 @@ def _create_mask_artifacts(
             "Background slices are required to fit the mask GMM on the reference tile"
         )
 
-    probability_volume = calc_gmm_prob(
-        gaussian_filter_dask(low_res.astype(np.float32), sigma=1),
-        initial_mask,
-        da.from_array(bkg_slices, chunks=(64, 64, 64)),
-        n_components_fg=gmm_n_components,
-        n_components_bg=gmm_n_components,
-        max_samples_fg=gmm_max_samples,
-        max_samples_bg=gmm_max_samples,
-        random_state=gmm_random_state,
-        erosion_radius=config.erosion_radius,
-    ).astype(np.float32).persist()
+    probability_volume = (
+        calc_gmm_prob(
+            gaussian_filter_dask(low_res.astype(np.float32), sigma=1),
+            initial_mask,
+            da.from_array(bkg_slices, chunks=(64, 64, 64)),
+            n_components_fg=gmm_n_components,
+            n_components_bg=gmm_n_components,
+            max_samples_fg=gmm_max_samples,
+            max_samples_bg=gmm_max_samples,
+            random_state=gmm_random_state,
+            erosion_radius=config.erosion_radius,
+        )
+        .astype(np.float32)
+        .persist()
+    )
 
     probability_path = out_probability_path.rstrip("/") + f"/{tile_name}"
-    probability_transformations = parse_ome_zarr_transformations(z, fitting_res)
+    probability_transformations = parse_ome_zarr_transformations(
+        z, fitting_res
+    )
     probability_scale = probability_transformations["scale"]
     probability_translation = probability_transformations["translation"]
 
@@ -446,7 +461,11 @@ def _create_mask_artifacts(
         threshold=prob_threshold,
         min_size=prob_min_size,
     )
-    mask = _preprocess_mask(mask, low_res.shape, results_dir, tile_name).astype(bool).persist()
+    mask = (
+        _preprocess_mask(mask, low_res.shape, results_dir, tile_name)
+        .astype(bool)
+        .persist()
+    )
 
     return MaskArtifacts(
         probability_volume=probability_volume,
@@ -532,7 +551,9 @@ def flatfield_fitting(
             overwrite=overwrite,
         )
     else:
-        _LOGGER.info("Reusing precomputed mask artifacts for tile %s", tile_name)
+        _LOGGER.info(
+            "Reusing precomputed mask artifacts for tile %s", tile_name
+        )
 
     mask = mask_artifacts.mask_low_res
 
@@ -561,19 +582,27 @@ def flatfield_fitting(
     mask_upscaled = da.from_zarr(mask_path, component="0").squeeze()
 
     med_factor = (
-        config.med_factor_binned if is_binned_channel else config.med_factor_unbinned
+        config.med_factor_binned
+        if is_binned_channel
+        else config.med_factor_unbinned
     )
 
     _LOGGER.info(f"Clipping low_res with median factor: {med_factor}")
     # Dask implementation can only compute nanmedian along subsets of axes at a time,
     # so we compute the nanmedian in two steps.
-    nan_med = da.nanmedian(da.nanmedian(da.where(mask, low_res, np.nan), axis=(0,1)), axis=0).compute()
+    nan_med = da.nanmedian(
+        da.nanmedian(da.where(mask, low_res, np.nan), axis=(0, 1)), axis=0
+    ).compute()
     # This fails with an OOM
     # nan_med = da.nanmedian(da.where(mask, low_res, np.nan), axis=tuple(d for d in low_res.ndim)).compute()
     _LOGGER.info(f"Computed median of tile foreground: {nan_med}")
 
     # Clamp the intensity values to reduce the impact of very bright neurites on the profile fit
-    low_res_clipped = da.clip(low_res * mask, 0, nan_med * med_factor).astype(np.uint16).compute()
+    low_res_clipped = (
+        da.clip(low_res * mask, 0, nan_med * med_factor)
+        .astype(np.uint16)
+        .compute()
+    )
 
     del low_res, nan_med
 
@@ -603,9 +632,15 @@ def flatfield_fitting(
     median_xy = axis_medians["x"]
     median_xz = axis_medians["y"]
     median_yz = axis_medians["z"]
-    _LOGGER.info("Global median from 3D masked profile (axis=X): %s", median_xy)
-    _LOGGER.info("Global median from 3D masked profile (axis=Y): %s", median_xz)
-    _LOGGER.info("Global median from 3D masked profile (axis=Z): %s", median_yz)
+    _LOGGER.info(
+        "Global median from 3D masked profile (axis=X): %s", median_xy
+    )
+    _LOGGER.info(
+        "Global median from 3D masked profile (axis=Y): %s", median_xz
+    )
+    _LOGGER.info(
+        "Global median from 3D masked profile (axis=Z): %s", median_yz
+    )
 
     global_factor = (
         config.global_factor_binned
@@ -630,7 +665,11 @@ def flatfield_fitting(
 
 
 def save_metadata(
-    data_process, out_path: str, tile_name: str, tile_path: str, results_dir: str
+    data_process,
+    out_path: str,
+    tile_name: str,
+    tile_path: str,
+    results_dir: str,
 ) -> None:
     """
     Save process and metadata paths JSON for a tile.
@@ -730,7 +769,9 @@ def save_method_outputs(
                     title=f"XY correction curve: {tile_name}",
                     xlabel="X (pixels)",
                     ylabel="Correction factor",
-                    out_png=os.path.join(results_dir, f"{tile_name}_corr_xy.png"),
+                    out_png=os.path.join(
+                        results_dir, f"{tile_name}_corr_xy.png"
+                    ),
                 )
             if axis_fits and "y" in axis_fits:
                 save_correction_curve_plot(
@@ -738,7 +779,9 @@ def save_method_outputs(
                     title=f"XZ correction curve: {tile_name}",
                     xlabel="Y (pixels)",
                     ylabel="Correction factor",
-                    out_png=os.path.join(results_dir, f"{tile_name}_corr_xz.png"),
+                    out_png=os.path.join(
+                        results_dir, f"{tile_name}_corr_xz.png"
+                    ),
                 )
             if axis_fits and "z" in axis_fits:
                 save_correction_curve_plot(
@@ -746,14 +789,20 @@ def save_method_outputs(
                     title=f"YZ correction curve: {tile_name}",
                     xlabel="Z (slices)",
                     ylabel="Correction factor",
-                    out_png=os.path.join(results_dir, f"{tile_name}_corr_yz.png"),
+                    out_png=os.path.join(
+                        results_dir, f"{tile_name}_corr_yz.png"
+                    ),
                 )
         except Exception:
-            _LOGGER.exception("Failed saving correction curve plots for fitting")
+            _LOGGER.exception(
+                "Failed saving correction curve plots for fitting"
+            )
 
     # Placeholders for other methods; can be extended later
     elif method in ("basicpy", "reference"):
-        _LOGGER.debug(f"No additional QC artifacts to save for method: {method}")
+        _LOGGER.debug(
+            f"No additional QC artifacts to save for method: {method}"
+        )
 
 
 def get_channel_resolution(
@@ -829,8 +878,18 @@ def parse_and_validate_args() -> argparse.Namespace:
         required=True,
         help="Output zarr path for the corrected data",
     )
-    parser.add_argument("--save-outputs", default=False, action="store_true", help="Save intermediate output files.")
-    parser.add_argument("--results-dir", type=str, default=os.path.join(os.getcwd(), "results"), help="Directory to save results and metadata.")
+    parser.add_argument(
+        "--save-outputs",
+        default=False,
+        action="store_true",
+        help="Save intermediate output files.",
+    )
+    parser.add_argument(
+        "--results-dir",
+        type=str,
+        default=os.path.join(os.getcwd(), "results"),
+        help="Directory to save results and metadata.",
+    )
     parser.add_argument(
         "--res",
         type=str,
@@ -864,7 +923,12 @@ def parse_and_validate_args() -> argparse.Namespace:
         default=1,
         help="Number of zarr pyramid levels (default: 1)",
     )
-    parser.add_argument("--use-reference-bkg", action="store_true", default=False, help="Use reference background image from S3 instead of estimating background.")
+    parser.add_argument(
+        "--use-reference-bkg",
+        action="store_true",
+        default=False,
+        help="Use reference background image from S3 instead of estimating background.",
+    )
     parser.add_argument("--is-binned", action="store_true", default=False)
     args = parser.parse_args()
 
@@ -883,7 +947,7 @@ def parse_and_validate_args() -> argparse.Namespace:
 
 def create_mask_path(out_zarr_path: str) -> str:
     """
-    Create the corresponding output mask path for 
+    Create the corresponding output mask path for
     the input zarr image.
 
     Parameters
@@ -897,7 +961,9 @@ def create_mask_path(out_zarr_path: str) -> str:
         The mask path for the corrected zarr dataset
     """
     out_zarr_folder = Path(out_zarr_path).name
-    out_mask_path = out_zarr_path.replace(out_zarr_folder, f"mask/{out_zarr_folder}")
+    out_mask_path = out_zarr_path.replace(
+        out_zarr_folder, f"mask/{out_zarr_folder}"
+    )
     return out_mask_path
 
 
@@ -905,7 +971,9 @@ def create_probability_path(out_zarr_path: str) -> str:
     """Derive the output path for storing probability volumes as OME-Zarr."""
 
     out_zarr_folder = Path(out_zarr_path).name
-    return out_zarr_path.replace(out_zarr_folder, f"probability/{out_zarr_folder}")
+    return out_zarr_path.replace(
+        out_zarr_folder, f"probability/{out_zarr_folder}"
+    )
 
 
 def main() -> None:
@@ -968,7 +1036,9 @@ def main() -> None:
     if tile_name_for_artifacts and out_path.startswith("s3://"):
         try:
             parent_output = get_parent_s3_path(out_path)
-            artifacts_destination = f"{parent_output}/artifacts/{tile_name_for_artifacts}"
+            artifacts_destination = (
+                f"{parent_output}/artifacts/{tile_name_for_artifacts}"
+            )
         except ValueError:
             _LOGGER.warning(
                 "Unable to determine artifacts destination from output path %s",
@@ -987,7 +1057,9 @@ def main() -> None:
         if args.fitting_config:
             _LOGGER.info("Loaded fitting config from %s", args.fitting_config)
         # dump to results folder
-        fitting_config.to_file(os.path.join(results_dir, "fitting_config.json"))
+        fitting_config.to_file(
+            os.path.join(results_dir, "fitting_config.json")
+        )
 
     for tile_path in tile_paths:
         tile_name = Path(tile_path).name
@@ -1012,7 +1084,9 @@ def main() -> None:
                     f"Coordinate transformations: {coordinate_transformations}"
                 )
 
-                full_res = da.from_zarr(z[resolution]).squeeze().astype(np.float32)
+                full_res = (
+                    da.from_zarr(z[resolution]).squeeze().astype(np.float32)
+                )
                 _LOGGER.info(f"Full resolution array shape: {full_res.shape}")
 
                 bkg = None
@@ -1020,7 +1094,11 @@ def main() -> None:
                 if not args.skip_bkg_sub:
                     _LOGGER.info("Performing background subtraction")
                     full_res, bkg, bkg_slices = background_subtraction(
-                        tile_path, full_res, z, is_binned_channel, args.use_reference_bkg
+                        tile_path,
+                        full_res,
+                        z,
+                        is_binned_channel,
+                        args.use_reference_bkg,
                     )
                     # Background QC saving is centralized at the end per method
 
@@ -1028,37 +1106,40 @@ def main() -> None:
                 if not args.skip_flat_field:
                     if method == "reference":
                         corrected = flatfield_reference(
-                            full_res, 
-                            args.flatfield_path
+                            full_res, args.flatfield_path
                         )
                     elif method == "basicpy":
                         corrected = flatfield_basicpy(
-                            full_res, 
-                            z, 
-                            is_binned_channel, 
-                            bkg, 
-                            args.mask_dir, 
-                            tile_name,
-                            results_dir=results_dir
-                        )
-                    elif method == "fitting":
-                        if fitting_config is None:
-                            raise ValueError("Fitting configuration failed to initialize")
-                        corrected, axis_fits, mask_artifacts = flatfield_fitting(
                             full_res,
                             z,
                             is_binned_channel,
+                            bkg,
                             args.mask_dir,
                             tile_name,
-                            out_mask_path,
-                            out_probability_path,
-                            coordinate_transformations,
-                            args.overwrite,
-                            args.n_levels,
-                            fitting_config,
                             results_dir=results_dir,
-                            bkg_slices=bkg_slices,
-                            mask_artifacts=mask_artifacts,
+                        )
+                    elif method == "fitting":
+                        if fitting_config is None:
+                            raise ValueError(
+                                "Fitting configuration failed to initialize"
+                            )
+                        corrected, axis_fits, mask_artifacts = (
+                            flatfield_fitting(
+                                full_res,
+                                z,
+                                is_binned_channel,
+                                args.mask_dir,
+                                tile_name,
+                                out_mask_path,
+                                out_probability_path,
+                                coordinate_transformations,
+                                args.overwrite,
+                                args.n_levels,
+                                fitting_config,
+                                results_dir=results_dir,
+                                bkg_slices=bkg_slices,
+                                mask_artifacts=mask_artifacts,
+                            )
                         )
                     else:
                         _LOGGER.error(f"Invalid method: {method}")
@@ -1078,7 +1159,7 @@ def main() -> None:
                     coordinate_transformations["scale"][-3:],
                     coordinate_transformations["translation"],
                     overwrite=args.overwrite,
-                    write_empty_chunks=True
+                    write_empty_chunks=True,
                 )
                 _LOGGER.info(f"Storing OME-Zarr took {time.time() - t0:.2f}s")
 
@@ -1099,7 +1180,9 @@ def main() -> None:
                 )
 
                 data_process.end_date_time = datetime.now()
-                save_metadata(data_process, out_path, tile_name, tile_path, results_dir)
+                save_metadata(
+                    data_process, out_path, tile_name, tile_path, results_dir
+                )
             except Exception as e:
                 _LOGGER.error(
                     f"Error processing tile {tile_name}: {e}", exc_info=True

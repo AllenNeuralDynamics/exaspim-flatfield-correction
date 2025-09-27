@@ -9,6 +9,7 @@ import dask.array as da
 from skimage.transform import resize as _resize
 from botocore.exceptions import ClientError
 import matplotlib
+
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 

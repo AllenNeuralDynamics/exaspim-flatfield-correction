@@ -86,8 +86,10 @@ def fit_basic(
         top_indices = np.sort(top_indices)
         im = im[top_indices]
         mask = mask[top_indices]
-        _LOGGER.info("Shape after filtering by mask area: "
-                     f"{im.shape}, mask shape: {mask.shape}")
+        _LOGGER.info(
+            "Shape after filtering by mask area: "
+            f"{im.shape}, mask shape: {mask.shape}"
+        )
 
     basic = BaSiC(
         autosegment=autosegment,
@@ -115,7 +117,9 @@ def fit_basic(
     return basic
 
 
-def transform_basic(im: da.Array, fit: "BaSiC", chunks: tuple = (256, 256)) -> da.Array:
+def transform_basic(
+    im: da.Array, fit: "BaSiC", chunks: tuple = (256, 256)
+) -> da.Array:
     """
     Apply a fitted BaSiC flatfield/darkfield correction to an image.
 
