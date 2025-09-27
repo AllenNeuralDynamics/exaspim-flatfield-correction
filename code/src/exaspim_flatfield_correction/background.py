@@ -6,9 +6,9 @@ _LOGGER = logging.getLogger(__name__)
 
 def estimate_bkg(
     im: np.ndarray,
-    sigmaFactor: float = 3.0,
-    probThresh: float = 0.01,
-    nIter: int = 100,
+    sigma_factor: float = 3.0,
+    prob_thresh: float = 0.01,
+    n_iter: int = 100,
 ) -> tuple[np.ndarray, np.ndarray]:
     """
     Flat-field background estimation for scattered light with
@@ -19,12 +19,12 @@ def estimate_bkg(
     im : np.ndarray, shape (z, y, x)
         3D array where each slice is im[z, :, :].
         Typically loaded from Zarr or elsewhere.
-    sigmaFactor : float
+    sigma_factor : float
         Multiplier for pixel-level std to identify high pixels.
-    probThresh : float
+    prob_thresh : float
         Probability threshold: fraction of pixels in a slice that
-        exceed (mu + sigmaFactor*sigma).
-    nIter : int
+        exceed (mu + sigma_factor*sigma).
+    n_iter : int
         Number of iterations for outlier slice removal.
 
     Returns
@@ -49,21 +49,21 @@ def estimate_bkg(
     initial = im.copy()
 
     # Iterative outlier-slice removal
-    for _ in range(nIter):
+    for _ in range(n_iter):
         # Compute mean & std across slices (axis=0) => shape (y, x)
         # Remember, after removing slices, we have new z' dimension
         mu = np.median(im)
         sigma = np.std(im)
 
         # fraction of "high" pixels in each slice => shape (z',)
-        threshold_2d = mu + sigmaFactor * sigma  # shape (y, x)
+        threshold_2d = mu + sigma_factor * sigma  # shape (y, x)
         # Broadcast threshold over each slice
         high_count = im > threshold_2d  # shape (z', y, x)
         frac_high = np.mean(high_count, axis=(1, 2))
 
         # We remove slices if:
-        #   fraction of high pixels > probThresh
-        inds_remove = frac_high > probThresh
+        #   fraction of high pixels > prob_thresh
+        inds_remove = frac_high > prob_thresh
 
         keep_mask = ~inds_remove
         im = im[keep_mask, :, :]
