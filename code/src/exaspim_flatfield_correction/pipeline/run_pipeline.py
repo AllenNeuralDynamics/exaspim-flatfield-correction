@@ -66,7 +66,7 @@ _LOGGER = logging.getLogger(__name__)
 
 @dataclass
 class MaskArtifacts:
-    probability_volume: da.Array
+    probability_volume: da.Array | None
     mask_low_res: da.Array
 
 
@@ -400,76 +400,81 @@ def _create_mask_artifacts(
         tile_name,
     ).astype(bool)
 
-    gmm_n_components = config.gmm_n_components
-    gmm_max_samples = config.gmm_max_samples
-    gmm_batch_size = config.gmm_batch_size
-    gmm_random_state = config.gmm_random_state
+    probability_volume = None
+    mask_low_res = initial_mask
 
-    _LOGGER.info(
-        "Fitting GMM probabilities with n_components=%d, max_samples=%d, batch_size=%d",
-        gmm_n_components,
-        gmm_max_samples,
-        gmm_batch_size,
-    )
-    if bkg_slices is None:
-        raise ValueError(
-            "Background slices are required to fit the mask GMM on the reference tile"
+    if config.enable_gmm_refinement:
+        if bkg_slices is None:
+            raise ValueError(
+                "Background slices are required to fit the mask GMM on the reference tile"
+            )
+
+        gmm_n_components = config.gmm_n_components
+        gmm_max_samples = config.gmm_max_samples
+        gmm_batch_size = config.gmm_batch_size
+        gmm_random_state = config.gmm_random_state
+
+        _LOGGER.info(
+            "Fitting GMM probabilities with n_components=%d, max_samples=%d, batch_size=%d",
+            gmm_n_components,
+            gmm_max_samples,
+            gmm_batch_size,
         )
 
-    probability_volume = (
-        calc_gmm_prob(
-            gaussian_filter_dask(low_res.astype(np.float32), sigma=1),
-            initial_mask,
-            da.from_array(bkg_slices, chunks=(64, 64, 64)),
-            n_components_fg=gmm_n_components,
-            n_components_bg=gmm_n_components,
-            max_samples_fg=gmm_max_samples,
-            max_samples_bg=gmm_max_samples,
-            random_state=gmm_random_state,
-            erosion_radius=config.erosion_radius,
+        probability_volume = (
+            calc_gmm_prob(
+                gaussian_filter_dask(low_res.astype(np.float32), sigma=1),
+                initial_mask,
+                da.from_array(bkg_slices, chunks=(64, 64, 64)),
+                n_components_fg=gmm_n_components,
+                n_components_bg=gmm_n_components,
+                max_samples_fg=gmm_max_samples,
+                max_samples_bg=gmm_max_samples,
+                random_state=gmm_random_state,
+                erosion_radius=config.erosion_radius,
+            )
+            .astype(np.float32)
+            .persist()
         )
-        .astype(np.float32)
-        .persist()
-    )
 
-    probability_path = out_probability_path.rstrip("/") + f"/{tile_name}"
-    probability_transformations = parse_ome_zarr_transformations(
-        z, fitting_res
-    )
-    probability_scale = probability_transformations["scale"]
-    probability_translation = probability_transformations["translation"]
+        probability_path = out_probability_path.rstrip("/") + f"/{tile_name}"
+        probability_transformations = parse_ome_zarr_transformations(
+            z, fitting_res
+        )
+        probability_scale = probability_transformations["scale"]
+        probability_translation = probability_transformations["translation"]
 
-    store_ome_zarr(
-        probability_volume,
-        probability_path,
-        4,
-        tuple(probability_scale[-3:]),
-        tuple(probability_translation),
-        overwrite=overwrite,
-        write_empty_chunks=False,
-    )
+        store_ome_zarr(
+            probability_volume,
+            probability_path,
+            4,
+            tuple(probability_scale[-3:]),
+            tuple(probability_translation),
+            overwrite=overwrite,
+            write_empty_chunks=False,
+        )
 
-    prob_threshold = config.mask_probability_threshold
-    prob_min_size = config.mask_probability_min_size
-    _LOGGER.info(
-        "Thresholding probability volume with threshold %.3f and min_size %s",
-        prob_threshold,
-        prob_min_size,
-    )
-    mask = get_mask(
-        probability_volume,
-        threshold=prob_threshold,
-        min_size=prob_min_size,
-    )
-    mask = (
-        _preprocess_mask(mask, low_res.shape, results_dir, tile_name)
-        .astype(bool)
-        .persist()
-    )
+        prob_threshold = config.mask_probability_threshold
+        prob_min_size = config.mask_probability_min_size
+        _LOGGER.info(
+            "Thresholding probability volume with threshold %.3f and min_size %s",
+            prob_threshold,
+            prob_min_size,
+        )
+        refined_mask = get_mask(
+            probability_volume,
+            threshold=prob_threshold,
+            min_size=prob_min_size,
+        )
+        mask_low_res = (
+            _preprocess_mask(refined_mask, low_res.shape, results_dir, tile_name)
+            .astype(bool)
+            .persist()
+        )
 
     return MaskArtifacts(
         probability_volume=probability_volume,
-        mask_low_res=mask,
+        mask_low_res=mask_low_res,
     )
 
 

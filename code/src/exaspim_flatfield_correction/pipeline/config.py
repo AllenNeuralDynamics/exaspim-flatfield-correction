@@ -112,6 +112,13 @@ class FittingConfig(BaseModel):
             "mask projection."
         ),
     )
+    enable_gmm_refinement: bool = Field(
+        default=False,
+        description=(
+            "When true, compute a probability volume via GMM and refine the "
+            "initial mask; when false, skip the refinement and use the precomputed mask."
+        ),
+    )
     gmm_n_components: int = Field(
         default=3,
         ge=1,
