@@ -5,7 +5,6 @@ import dask.array as da
 import numpy as np
 from scipy.ndimage import (
     binary_closing,
-    binary_erosion,
     binary_fill_holes,
     distance_transform_edt,
     label,
@@ -14,7 +13,6 @@ import dask_image.ndfilters as di
 import dask_image.ndmorph as ndm
 from skimage.morphology import ball, disk
 from sklearn.mixture import GaussianMixture
-from scipy.ndimage import gaussian_filter, gaussian_laplace, sobel
 
 from exaspim_flatfield_correction.utils.utils import resize_dask
 
@@ -351,14 +349,12 @@ def calc_gmm_prob(
         sigma_mean=sigma_mean,
         sigma_log=sigma_log,
         sigma_grad=sigma_grad,
-        chunks=img_da.chunks,
     )
     feats_bg = compute_simple_features_dask(
         bg_da,
         sigma_mean=sigma_mean,
         sigma_log=sigma_log,
         sigma_grad=sigma_grad,
-        chunks=bg_da.chunks,
     )
     n_feats = len(feats_img)  # 5
 
