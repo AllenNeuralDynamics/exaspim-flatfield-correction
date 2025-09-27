@@ -41,7 +41,7 @@ class FittingConfig(BaseModel):
         ),
     )
     profile_percentile: float = Field(
-        default=80,
+        default=50,
         ge=0,
         le=100,
         description=(
@@ -144,7 +144,7 @@ class FittingConfig(BaseModel):
         ),
     )
     erosion_radius: int = Field(
-        default=10,
+        default=2,
         ge=0,
         description=(
             "Binary erosion radius applied to the initial mask before "
