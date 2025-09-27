@@ -66,7 +66,6 @@ _LOGGER = logging.getLogger(__name__)
 
 @dataclass
 class MaskArtifacts:
-    probability_volume: da.Array | None
     mask_low_res: da.Array
 
 
@@ -360,15 +359,13 @@ def _preprocess_mask(
     """
     Upscale and save mask as zarr, then reload as dask array.
     """
-    mask_name = str(Path(results_dir) / f"{tile_name}_mask.zarr")
+    mask_name = str(Path(results_dir) / f"{tile_name}_mask_low_res.zarr")
     if mask.shape != low_res_shape:
         mask = upscale_mask_nearest(
             da.from_array(mask, chunks=(128, 256, 256)),
             low_res_shape,
             chunks=(128, 256, 256),
         ).compute()
-        # keep only the largest connected component
-        mask = size_filter(mask, k_largest=1, min_size=None)
     mask = mask.astype(np.uint8)
     zarr.save_array(
         str(mask_name),
@@ -394,13 +391,12 @@ def _create_mask_artifacts(
     """Generate probability and mask artifacts for the reference tile."""
     _LOGGER.info("Creating mask artifacts using tile %s", tile_name)
     initial_mask = _preprocess_mask(
-        load_mask_from_dir(mask_dir, tile_name),
+        size_filter(load_mask_from_dir(mask_dir, tile_name), k_largest=1, min_size=None),
         low_res.shape,
         results_dir,
         tile_name,
     ).astype(bool)
 
-    probability_volume = None
     mask_low_res = initial_mask
 
     if config.enable_gmm_refinement:
@@ -434,7 +430,6 @@ def _create_mask_artifacts(
                 erosion_radius=config.erosion_radius,
             )
             .astype(np.float32)
-            .persist()
         )
 
         probability_path = out_probability_path.rstrip("/") + f"/{tile_name}"
@@ -453,6 +448,9 @@ def _create_mask_artifacts(
             overwrite=overwrite,
             write_empty_chunks=False,
         )
+        probability_volume = da.from_zarr(
+            probability_path, component="0"
+        ).compute()
 
         prob_threshold = config.mask_probability_threshold
         prob_min_size = config.mask_probability_min_size
@@ -461,19 +459,18 @@ def _create_mask_artifacts(
             prob_threshold,
             prob_min_size,
         )
-        refined_mask = get_mask(
+        mask_low_res = get_mask(
             probability_volume,
             threshold=prob_threshold,
             min_size=prob_min_size,
+            k_largest=1
         )
         mask_low_res = (
-            _preprocess_mask(refined_mask, low_res.shape, results_dir, tile_name)
+            _preprocess_mask(mask_low_res, low_res.shape, results_dir, tile_name)
             .astype(bool)
-            .persist()
         )
 
     return MaskArtifacts(
-        probability_volume=probability_volume,
         mask_low_res=mask_low_res,
     )
 
@@ -609,7 +606,7 @@ def flatfield_fitting(
         .compute()
     )
 
-    del low_res, nan_med
+    del low_res
 
     profile_sigma = config.gaussian_sigma
     profile_percentile = config.profile_percentile
