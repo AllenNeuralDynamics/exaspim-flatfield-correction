@@ -256,7 +256,7 @@ def upscale_mask_edt(
     sz = new_shape[0] / mask.shape[0]
     sy = new_shape[1] / mask.shape[1]
     sx = new_shape[2] / mask.shape[2]
-    print("scale factors:", sz, sy, sx)
+    _LOGGER.debug("scale factors: %s %s %s", sz, sy, sx)
 
     # Upscale the SDF using affine-based resize with linear interpolation (order=1).
     sdf_upscaled = resize_dask(
@@ -368,13 +368,13 @@ def calc_gmm_prob(
             structure = disk(erosion_radius)
         else:
             raise ValueError("Mask must be 2D or 3D for erosion")
-        print("eroding mask")
+        _LOGGER.debug("Applying binary erosion to mask with radius %s", erosion_radius)
         mask_eroded = ndm.binary_erosion(mask_da, structure=structure)
     else:
         mask_eroded = mask_da
 
     fg_lin_idx = da.flatnonzero(mask_eroded.ravel()).compute()
-    print("sampling fg features")
+    _LOGGER.debug("Sampling foreground feature vectors")
     X_fg = _sample_rows_from_dask_stack(
         feats_img, fg_lin_idx, max_samples_fg, rng
     )
@@ -392,9 +392,9 @@ def calc_gmm_prob(
             bg_lin_idx = rng.choice(bg_size, size=sample_cap, replace=False)
     else:
         sample_cap = bg_size
-        print("cap ", sample_cap)
+        _LOGGER.debug("Sampling full background volume (cap=%s)", sample_cap)
         bg_lin_idx = np.arange(bg_size, dtype=np.int64)
-    print("sampling bg features")
+    _LOGGER.debug("Sampling background feature vectors")
     X_bg = _sample_rows_from_dask_stack(feats_bg, bg_lin_idx, sample_cap, rng)
 
     # ---- Standardize by combined training stats ----
