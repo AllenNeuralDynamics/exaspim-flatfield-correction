@@ -108,6 +108,114 @@ def rescale_spline(
     return new_y
 
 
+def generate_axis_fit(
+    profile: "np.ndarray | da.Array",
+    new_width: int,
+    smoothing: float,
+    limits: "tuple[float, float] | None" = None,
+) -> np.ndarray:
+    """Scale a 1D normalized profile to a new width with optional clipping."""
+    if isinstance(profile, da.Array):
+        profile_np = profile.astype(np.float32).compute()
+    else:
+        profile_np = np.asarray(profile, dtype=np.float32)
+    x = np.arange(profile_np.size, dtype=np.float32)
+    fitted = rescale_spline(x, profile_np, new_width, smoothing=smoothing)
+    if limits is not None:
+        fitted = np.clip(fitted, limits[0], limits[1])
+    return fitted
+
+
+def compute_axis_fits(
+    volume: "np.ndarray | da.Array",
+    mask: "np.ndarray | da.Array",
+    full_shape: tuple[int, int, int],
+    *,
+    smooth_sigma: "float | None" = None,
+    percentile: "float | None" = None,
+    min_voxels: int = 0,
+    spline_smoothing: float = 0,
+    limits_xy: "tuple[float, float] | None" = None,
+    limits_z: "tuple[float, float] | None" = None,
+) -> tuple[dict[str, np.ndarray], dict[str, float]]:
+    """Compute normalized profiles and spline fits along x, y, and z axes."""
+
+    axis_specs = (
+        ("x", 2, full_shape[2], limits_xy),
+        ("y", 1, full_shape[1], limits_xy),
+        ("z", 0, full_shape[0], limits_z),
+    )
+
+    fits: dict[str, np.ndarray] = {}
+    medians: dict[str, float] = {}
+
+    for axis_label, axis_idx, width, limits in axis_specs:
+        profile, median = masked_axis_profile(
+            volume,
+            mask,
+            axis=axis_idx,
+            smooth_sigma=smooth_sigma,
+            percentile=percentile,
+            min_voxels=min_voxels,
+        )
+        fits[axis_label] = generate_axis_fit(
+            profile,
+            width,
+            spline_smoothing,
+            limits,
+        )
+        medians[axis_label] = median
+
+    return fits, medians
+
+
+def apply_axis_corrections(
+    full_res: da.Array,
+    mask_upscaled: da.Array,
+    axis_fits: dict[str, np.ndarray],
+    axis_medians: dict[str, float],
+    *,
+    global_factor: float,
+    clip_max: float = 2**16 - 1,
+) -> da.Array:
+    """Apply per-axis correction profiles and global scaling to a volume."""
+
+    corrected = full_res
+    median_xy = float(axis_medians.get("x", 0.0))
+
+    if median_xy != 0 and np.isfinite(median_xy):
+        fit_x = axis_fits.get("x")
+        if fit_x is not None:
+            correction_x = fit_x.reshape(1, 1, -1)
+            corrected = da.where(mask_upscaled, corrected / correction_x, corrected)
+
+        fit_y = axis_fits.get("y")
+        if fit_y is not None:
+            correction_y = fit_y.reshape(1, -1, 1)
+            corrected = da.where(mask_upscaled, corrected / correction_y, corrected)
+
+        fit_z = axis_fits.get("z")
+        if fit_z is not None:
+            correction_z = fit_z.reshape(-1, 1, 1)
+            corrected = da.where(mask_upscaled, corrected / correction_z, corrected)
+
+        ratio = global_factor / median_xy
+        _LOGGER.info(
+            "Doing global correction with factor: %s and median_xy: %s, ratio = %s",
+            global_factor,
+            median_xy,
+            ratio,
+        )
+        corrected = da.where(mask_upscaled, corrected * ratio, corrected)
+        corrected = da.clip(corrected, 0, clip_max)
+    else:
+        _LOGGER.warning(
+            "Skipping correction: median_xy is zero or non-finite (%s)", median_xy
+        )
+
+    return corrected
+
+
 def masked_axis_profile(
     volume: "np.ndarray | da.Array",
     mask: "np.ndarray | da.Array",

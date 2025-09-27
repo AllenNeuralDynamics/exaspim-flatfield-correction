@@ -27,9 +27,9 @@ from exaspim_flatfield_correction.flatfield import (
     subtract_bkg,
 )
 from exaspim_flatfield_correction.splinefit import (
-    masked_axis_profile,
+    apply_axis_corrections,
+    compute_axis_fits,
     percentile_project,
-    rescale_spline,
 )
 from exaspim_flatfield_correction.background import estimate_bkg
 from exaspim_flatfield_correction.utils.mask_utils import (
@@ -372,6 +372,90 @@ def _preprocess_mask(mask: np.ndarray, low_res_shape: tuple, results_dir: str, t
     return da.from_zarr(mask_name, chunks=(128, 256, 256))
 
 
+def _create_mask_artifacts(
+    low_res: da.Array,
+    z: zarr.hierarchy.Group,
+    fitting_res: str,
+    mask_dir: str,
+    tile_name: str,
+    results_dir: str,
+    config: FittingConfig,
+    bkg_slices: np.ndarray | None,
+    out_probability_path: str,
+    overwrite: bool,
+) -> MaskArtifacts:
+    """Generate probability and mask artifacts for the reference tile."""
+    _LOGGER.info("Creating mask artifacts using tile %s", tile_name)
+    initial_mask = _preprocess_mask(
+        load_mask_from_dir(mask_dir, tile_name),
+        low_res.shape,
+        results_dir,
+        tile_name,
+    ).astype(bool)
+
+    gmm_n_components = config.gmm_n_components
+    gmm_max_samples = config.gmm_max_samples
+    gmm_batch_size = config.gmm_batch_size
+    gmm_random_state = config.gmm_random_state
+
+    _LOGGER.info(
+        "Fitting GMM probabilities with n_components=%d, max_samples=%d, batch_size=%d",
+        gmm_n_components,
+        gmm_max_samples,
+        gmm_batch_size,
+    )
+    if bkg_slices is None:
+        raise ValueError(
+            "Background slices are required to fit the mask GMM on the reference tile"
+        )
+
+    probability_volume = calc_gmm_prob(
+        gaussian_filter_dask(low_res.astype(np.float32), sigma=1),
+        initial_mask,
+        da.from_array(bkg_slices, chunks=(64, 64, 64)),
+        n_components_fg=gmm_n_components,
+        n_components_bg=gmm_n_components,
+        max_samples_fg=gmm_max_samples,
+        max_samples_bg=gmm_max_samples,
+        random_state=gmm_random_state,
+        erosion_radius=config.erosion_radius,
+    ).astype(np.float32).persist()
+
+    probability_path = out_probability_path.rstrip("/") + f"/{tile_name}"
+    probability_transformations = parse_ome_zarr_transformations(z, fitting_res)
+    probability_scale = probability_transformations["scale"]
+    probability_translation = probability_transformations["translation"]
+
+    store_ome_zarr(
+        probability_volume,
+        probability_path,
+        4,
+        tuple(probability_scale[-3:]),
+        tuple(probability_translation),
+        overwrite=overwrite,
+        write_empty_chunks=False,
+    )
+
+    prob_threshold = config.mask_probability_threshold
+    prob_min_size = config.mask_probability_min_size
+    _LOGGER.info(
+        "Thresholding probability volume with threshold %.3f and min_size %s",
+        prob_threshold,
+        prob_min_size,
+    )
+    mask = get_mask(
+        probability_volume,
+        threshold=prob_threshold,
+        min_size=prob_min_size,
+    )
+    mask = _preprocess_mask(mask, low_res.shape, results_dir, tile_name).astype(bool).persist()
+
+    return MaskArtifacts(
+        probability_volume=probability_volume,
+        mask_low_res=mask,
+    )
+
+
 def flatfield_fitting(
     full_res: da.Array,
     z: zarr.hierarchy.Group,
@@ -387,7 +471,7 @@ def flatfield_fitting(
     results_dir: str = None,
     bkg_slices: np.ndarray | None = None,
     mask_artifacts: MaskArtifacts | None = None,
-) -> tuple:
+) -> tuple[da.Array, dict[str, np.ndarray], MaskArtifacts | None]:
     """
     Apply fitting-based flatfield correction to the image using a mask
     and configurable parameters.
@@ -429,88 +513,30 @@ def flatfield_fitting(
     Returns
     -------
     tuple
-        Tuple containing the corrected image, GMM probability volume,
-        binary projection masks, percentile projections, and fitted
-        correction curves.
+        Tuple containing the corrected image, a dictionary of per-axis
+        correction profiles (keys 'x', 'y', 'z'), and any mask artifacts for
+        reuse.
     """
     fitting_res = "0" if is_binned_channel else "3"
     low_res = da.from_zarr(z[fitting_res]).squeeze().astype(np.float32)
 
     if mask_artifacts is None:
-        _LOGGER.info("Creating mask artifacts using tile %s", tile_name)
-        initial_mask = _preprocess_mask(
-            load_mask_from_dir(mask_dir, tile_name),
-            low_res.shape,
-            results_dir,
-            tile_name,
-        ).astype(bool)
-
-        gmm_n_components = config.gmm_n_components
-        gmm_max_samples = config.gmm_max_samples
-        gmm_batch_size = config.gmm_batch_size
-        gmm_random_state = config.gmm_random_state
-
-        _LOGGER.info(
-            "Fitting GMM probabilities with n_components=%d, max_samples=%d, batch_size=%d",
-            gmm_n_components,
-            gmm_max_samples,
-            gmm_batch_size,
-        )
-        if bkg_slices is None:
-            raise ValueError(
-                "Background slices are required to fit the mask GMM on the reference tile"
-            )
-        probability_volume = calc_gmm_prob(
-            gaussian_filter_dask(low_res.astype(np.float32), sigma=1),
-            initial_mask,
-            da.from_array(bkg_slices, chunks=(64,64,64)),
-            n_components_fg=gmm_n_components,
-            n_components_bg=gmm_n_components,
-            max_samples_fg=gmm_max_samples,
-            max_samples_bg=gmm_max_samples,
-            random_state=gmm_random_state,
-            erosion_radius=config.erosion_radius,
-        ).astype(np.float32).persist()
-        
-        # Persist the soft tissue probabilities as an OME-Zarr dataset at the
-        # resolution used for GMM fitting to retain spatial metadata.
-        probability_path = out_probability_path.rstrip("/") + f"/{tile_name}"
-        probability_transformations = parse_ome_zarr_transformations(z, fitting_res)
-        probability_scale = probability_transformations["scale"]
-        probability_translation = probability_transformations["translation"]
-
-        store_ome_zarr(
-            probability_volume,
-            probability_path,
-            4,
-            tuple(probability_scale[-3:]),
-            tuple(probability_translation),
+        mask_artifacts = _create_mask_artifacts(
+            low_res=low_res,
+            z=z,
+            fitting_res=fitting_res,
+            mask_dir=mask_dir,
+            tile_name=tile_name,
+            results_dir=results_dir,
+            config=config,
+            bkg_slices=bkg_slices,
+            out_probability_path=out_probability_path,
             overwrite=overwrite,
-            write_empty_chunks=False,
-        )
-
-        prob_threshold = config.mask_probability_threshold
-        prob_min_size = config.mask_probability_min_size
-        _LOGGER.info(
-            "Thresholding probability volume with threshold %.3f and min_size %s",
-            prob_threshold,
-            prob_min_size,
-        )
-        mask = get_mask(
-            probability_volume,
-            threshold=prob_threshold,
-            min_size=prob_min_size,
-        )
-        mask = _preprocess_mask(mask, low_res.shape, results_dir, tile_name).astype(bool).persist()
-
-        mask_artifacts = MaskArtifacts(
-            probability_volume=probability_volume,
-            mask_low_res=mask,
         )
     else:
         _LOGGER.info("Reusing precomputed mask artifacts for tile %s", tile_name)
-        probability_volume = mask_artifacts.probability_volume
-        mask = mask_artifacts.mask_low_res
+
+    mask = mask_artifacts.mask_low_res
 
     if mask.shape == full_res.shape:
         _LOGGER.info("Mask already at full resolution, skipping upscaling.")
@@ -533,6 +559,7 @@ def flatfield_fitting(
         overwrite=overwrite,
         write_empty_chunks=False,
     )
+    # Re-read the computed mask back from S3 for performance
     mask_upscaled = da.from_zarr(mask_path, component="0").squeeze()
 
     med_factor = (
@@ -563,106 +590,43 @@ def flatfield_fitting(
         profile_percentile,
         profile_min_voxels,
     )
-    norm_x, median_xy = masked_axis_profile(
+    axis_fits, axis_medians = compute_axis_fits(
         low_res_clipped,
         mask,
-        axis=2,
+        full_res.shape,
         smooth_sigma=profile_sigma,
         percentile=profile_percentile,
         min_voxels=profile_min_voxels,
+        spline_smoothing=spline_smoothing,
+        limits_xy=config.limits_xy,
+        limits_z=config.limits_z,
     )
+
+    median_xy = axis_medians["x"]
+    median_xz = axis_medians["y"]
+    median_yz = axis_medians["z"]
     _LOGGER.info("Global median from 3D masked profile (axis=X): %s", median_xy)
+    _LOGGER.info("Global median from 3D masked profile (axis=Y): %s", median_xz)
+    _LOGGER.info("Global median from 3D masked profile (axis=Z): %s", median_yz)
 
-    fit_x = rescale_spline(
-        np.arange(norm_x.size, dtype=np.float32),
-        norm_x,
-        full_res.shape[2],
-        smoothing=spline_smoothing,
+    global_factor = (
+        config.global_factor_binned
+        if is_binned_channel
+        else config.global_factor_unbinned
     )
-    limits_xy = config.limits_xy
-    if limits_xy is not None:
-        fit_x = np.clip(fit_x, limits_xy[0], limits_xy[1])
 
-    corrected = full_res
-    fit_y = None
-    fit_z = None
-
-    if median_xy != 0:
-        correction_x = fit_x.reshape(1, 1, -1)
-        corrected = da.where(mask_upscaled, full_res / correction_x, full_res)
-
-        norm_y, median_xz = masked_axis_profile(
-            low_res_clipped,
-            mask,
-            axis=1,
-            smooth_sigma=profile_sigma,
-            percentile=profile_percentile,
-            min_voxels=profile_min_voxels,
-        )
-        _LOGGER.info("Global median from 3D masked profile (axis=Y): %s", median_xz)
-
-        fit_y = rescale_spline(
-            np.arange(norm_y.size, dtype=np.float32),
-            norm_y,
-            full_res.shape[1],
-            smoothing=spline_smoothing,
-        )
-        limits_y = config.limits_xy
-        if limits_y is not None:
-            fit_y = np.clip(fit_y, limits_y[0], limits_y[1])
-
-        correction_y = fit_y.reshape(1, -1, 1)
-        corrected = da.where(mask_upscaled, corrected / correction_y, corrected)
-
-        norm_z, median_yz = masked_axis_profile(
-            low_res_clipped,
-            mask,
-            axis=0,
-            smooth_sigma=profile_sigma,
-            percentile=profile_percentile,
-            min_voxels=profile_min_voxels,
-        )
-        _LOGGER.info("Global median from 3D masked profile (axis=Z): %s", median_yz)
-
-        fit_z = rescale_spline(
-            np.arange(norm_z.size, dtype=np.float32),
-            norm_z,
-            full_res.shape[0],
-            smoothing=spline_smoothing,
-        )
-        limits_z = config.limits_z
-        if limits_z is not None:
-            fit_z = np.clip(fit_z, limits_z[0], limits_z[1])
-
-        correction_z = fit_z.reshape(-1, 1, 1)
-        corrected = da.where(
-            mask_upscaled, corrected / correction_z, corrected
-        )
-
-        # Use defaults consistent with FittingConfig()
-        global_factor = (
-            config.global_factor_binned
-            if is_binned_channel
-            else config.global_factor_unbinned
-        )
-        ratio = global_factor / median_xy
-        _LOGGER.info(
-            "Doing global correction with factor: %s and median_xy: %s, ratio = %s",
-            global_factor,
-            median_xy,
-            ratio,
-        )
-        corrected = da.where(
-            mask_upscaled, corrected * ratio, corrected
-        )
-        corrected = da.clip(corrected, 0, 2**16 - 1)
+    corrected = apply_axis_corrections(
+        full_res,
+        mask_upscaled,
+        axis_fits,
+        axis_medians,
+        global_factor=global_factor,
+    )
 
     # Return corrected image and QC/debug artifacts for saving in main
     return (
         corrected,
-        fit_x,
-        fit_y,
-        fit_z,
+        axis_fits,
         mask_artifacts,
     )
 
@@ -734,9 +698,8 @@ def save_method_outputs(
     bkg_slices : np.ndarray or None
         Stack of background-dominated slices used for GMM fitting.
     artifacts : dict or None
-        Method-specific artifacts; for 'fitting' expects keys:
-          probability_volume, xy_proj, yz_proj,
-          fit_x, fit_y, fit_z.
+        Method-specific artifacts; for 'fitting' expects keys such as
+        axis_fits, fit_x, fit_y, fit_z.
     """
     if not save_outputs or results_dir is None:
         return
@@ -760,28 +723,26 @@ def save_method_outputs(
 
     if method == "fitting" and artifacts:
         try:
-            fit_x = artifacts.get("fit_x")
-            fit_y = artifacts.get("fit_y")
-            fit_z = artifacts.get("fit_z")
-            if fit_x is not None:
+            axis_fits = artifacts.get("axis_fits")
+            if axis_fits and "x" in axis_fits:
                 save_correction_curve_plot(
-                    fit_x,
+                    axis_fits["x"],
                     title=f"XY correction curve: {tile_name}",
                     xlabel="X (pixels)",
                     ylabel="Correction factor",
                     out_png=os.path.join(results_dir, f"{tile_name}_corr_xy.png"),
                 )
-            if fit_y is not None:
+            if axis_fits and "y" in axis_fits:
                 save_correction_curve_plot(
-                    fit_y,
+                    axis_fits["y"],
                     title=f"XZ correction curve: {tile_name}",
                     xlabel="Y (pixels)",
                     ylabel="Correction factor",
                     out_png=os.path.join(results_dir, f"{tile_name}_corr_xz.png"),
                 )
-            if fit_z is not None:
+            if axis_fits and "z" in axis_fits:
                 save_correction_curve_plot(
-                    fit_z,
+                    axis_fits["z"],
                     title=f"YZ correction curve: {tile_name}",
                     xlabel="Z (slices)",
                     ylabel="Correction factor",
@@ -1043,7 +1004,6 @@ def main() -> None:
                         tile_name, binned_channel, binned_res, res
                     )
                 _LOGGER.info(f"{tile_name} is binned: {is_binned_channel}")
-
                 z = zarr.open(tile_path, mode="r")
                 coordinate_transformations = parse_ome_zarr_transformations(
                     z, resolution
@@ -1064,6 +1024,7 @@ def main() -> None:
                     )
                     # Background QC saving is centralized at the end per method
 
+                axis_fits = None
                 if not args.skip_flat_field:
                     if method == "reference":
                         corrected = flatfield_reference(
@@ -1083,7 +1044,7 @@ def main() -> None:
                     elif method == "fitting":
                         if fitting_config is None:
                             raise ValueError("Fitting configuration failed to initialize")
-                        corrected, fit_x, fit_y, fit_z, mask_artifacts = flatfield_fitting(
+                        corrected, axis_fits, mask_artifacts = flatfield_fitting(
                             full_res,
                             z,
                             is_binned_channel,
@@ -1125,9 +1086,7 @@ def main() -> None:
                 artifacts = None
                 if method == "fitting":
                     artifacts = {
-                        "fit_x": fit_x,
-                        "fit_y": fit_y,
-                        "fit_z": fit_z,
+                        "axis_fits": axis_fits,
                     }
                 save_method_outputs(
                     method,
