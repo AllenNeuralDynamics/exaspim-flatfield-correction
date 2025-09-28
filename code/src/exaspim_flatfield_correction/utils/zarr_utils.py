@@ -15,6 +15,7 @@ from aind_data_transfer.transformations.ome_zarr import (
     write_ome_ngff_metadata,
 )
 from numcodecs import blosc
+from numcodecs.abc import Codec
 
 blosc.use_threads = False
 from xarray_multiscale.reducers import windowed_rank, windowed_mean
@@ -33,6 +34,13 @@ def store_ome_zarr(
     aws_region: str = "us-west-2",
     s3_use_ssl: bool = False,
     write_empty_chunks: bool = True,
+    scale_factors: tuple[int, ...] | None = None,
+    block_shape: tuple[int, ...] | None = None,
+    codec: Codec | None = None,
+    s3_batch_size: int = 64,
+    s3_multipart_threshold: int = 256 * 1024 * 1024,
+    s3_total_max_attempts: int = 10,
+    s3_retry_mode: str = "adaptive",
 ) -> None:
     """
     Store a Dask array as an OME-Zarr multiscale dataset, with optional S3
@@ -59,10 +67,36 @@ def store_ome_zarr(
         AWS region name for S3 access. Default is 'us-west-2'.
     s3_use_ssl : bool, optional
         Whether to use SSL for S3 access. Default is False.
+    write_empty_chunks : bool, optional
+        Whether to write empty chunks to the store. Default is True.
+    scale_factors : tuple of int, optional
+        Per-axis scale factors used when generating the image pyramid.
+        Defaults to (1, 1, 2, 2, 2).
+    block_shape : tuple of int, optional
+        Chunk shape to use when storing the arrays (TCZYX order).
+        Defaults to (1, 1, 4096, 4096, 4096).
+    codec : numcodecs.abc.Codec, optional
+        Compressor to use when writing the arrays. Defaults to
+        blosc.Blosc(cname="zstd", clevel=1, shuffle=blosc.SHUFFLE).
+    s3_batch_size : int, optional
+        Batch size for S3 multipart uploads. Default is 64.
+    s3_multipart_threshold : int, optional
+        Size threshold in bytes that triggers multipart uploads.
+        Default is 256 * 1024 * 1024 (256 MB).
+    s3_total_max_attempts : int, optional
+        Maximum number of retry attempts for S3 operations. Default is 10.
+    s3_retry_mode : str, optional
+        Retry mode passed to the S3 client. Default is "adaptive".
 
     Returns
     -------
     None
+
+    Raises
+    ------
+    ValueError
+        If the provided scale_factors has fewer than three elements or the
+        block_shape does not describe all five TCZYX axes.
     """
     if output_zarr.startswith("s3://"):
         s3 = s3fs.S3FileSystem(
@@ -72,17 +106,16 @@ def store_ome_zarr(
             },
             config_kwargs={
                 "s3": {
-                    "multipart_threshold": 256
-                    * 1024
-                    * 1024,  # 256 MB, avoid multipart upload for small chunks
+                    "multipart_threshold": s3_multipart_threshold,
+                    # Avoid multipart upload for small chunks
                 },
                 "retries": {
-                    "total_max_attempts": 10,
-                    "mode": "adaptive",
+                    "total_max_attempts": s3_total_max_attempts,
+                    "mode": s3_retry_mode,
                 },
             },
             use_ssl=s3_use_ssl,
-            s3_additional_kwargs={"batch_size": 64},
+            s3_additional_kwargs={"batch_size": s3_batch_size},
         )
         # Create a Zarr group on S3
         store = s3fs.S3Map(root=output_zarr, s3=s3, check=False)
@@ -96,11 +129,20 @@ def store_ome_zarr(
         _LOGGER.info(f"Not overwriting tile {output_zarr}")
         return
 
-    codec = blosc.Blosc(cname="zstd", clevel=1, shuffle=blosc.SHUFFLE)
+    if codec is None:
+        codec = blosc.Blosc(cname="zstd", clevel=1, shuffle=blosc.SHUFFLE)
 
-    scale_factors = (1, 1, 2, 2, 2)
-    # TODO: hardcoded block shape, should be configurable
-    block_shape = (1, 1, 4096, 4096, 4096)
+    if scale_factors is None:
+        scale_factors = (1, 1, 2, 2, 2)
+
+    if block_shape is None:
+        block_shape = (1, 1, 4096, 4096, 4096)
+
+    if len(scale_factors) < 3:
+        raise ValueError("scale_factors must contain at least three elements")
+
+    if len(block_shape) != 5:
+        raise ValueError("block_shape must be a tuple of length 5")
 
     while corrected.ndim < 5:
         corrected = corrected[np.newaxis, ...]
