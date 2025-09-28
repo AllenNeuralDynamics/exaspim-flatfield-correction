@@ -635,7 +635,8 @@ def flatfield_fitting(
         percentile=profile_percentile,
         min_voxels=profile_min_voxels,
         spline_smoothing=spline_smoothing,
-        limits_xy=config.limits_xy,
+        limits_x=config.limits_x,
+        limits_y=config.limits_y,
         limits_z=config.limits_z,
     )
 

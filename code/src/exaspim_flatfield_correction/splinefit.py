@@ -82,14 +82,15 @@ def compute_axis_fits(
     percentile: "float | None" = None,
     min_voxels: int = 0,
     spline_smoothing: float = 0,
-    limits_xy: "tuple[float, float] | None" = None,
+    limits_x: "tuple[float, float] | None" = None,
+    limits_y: "tuple[float, float] | None" = None,
     limits_z: "tuple[float, float] | None" = None,
 ) -> tuple[dict[str, np.ndarray], dict[str, float]]:
     """Compute normalized profiles and spline fits along x, y, and z axes."""
 
     axis_specs = (
-        ("x", 2, full_shape[2], limits_xy),
-        ("y", 1, full_shape[1], limits_xy),
+        ("x", 2, full_shape[2], limits_x),
+        ("y", 1, full_shape[1], limits_y),
         ("z", 0, full_shape[0], limits_z),
     )
 

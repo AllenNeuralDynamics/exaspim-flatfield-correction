@@ -65,11 +65,18 @@ class FittingConfig(BaseModel):
             "regularize the fitted correction curves."
         ),
     )
-    limits_xy: tuple[float, float] | None = Field(
+    limits_x: tuple[float, float] | None = Field(
         default=(0.25, 1.2),
         description=(
-            "Lower and upper clipping bounds applied to the X and Y "
-            "correction curves; set to null to disable clamping."
+            "Lower and upper clipping bounds applied to the X "
+            "correction curve; set to null to disable clamping."
+        ),
+    )
+    limits_y: tuple[float, float] | None = Field(
+        default=(0.25, 1.2),
+        description=(
+            "Lower and upper clipping bounds applied to the Y "
+            "correction curve; set to null to disable clamping."
         ),
     )
     limits_z: tuple[float, float] | None = Field(
