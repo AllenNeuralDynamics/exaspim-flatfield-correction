@@ -2,7 +2,6 @@ import numpy as np
 import dask.array as da
 from scipy.ndimage import gaussian_filter1d
 from scipy.interpolate import splrep, splev
-from exaspim_flatfield_correction.utils.mask_utils import get_mask
 import logging
 
 _LOGGER = logging.getLogger(__name__)

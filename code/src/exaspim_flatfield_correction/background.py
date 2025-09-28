@@ -1,6 +1,8 @@
 import numpy as np
 import logging
 
+import dask.array as da
+
 _LOGGER = logging.getLogger(__name__)
 
 
@@ -81,3 +83,22 @@ def estimate_bkg(
     mu_final = np.median(im, axis=0).astype(np.float32)  # (y, x)
 
     return mu_final, im
+
+
+def subtract_bkg(im: da.Array, bkg_da: da.Array) -> da.Array:
+    """
+    Subtract a background image from an image and clip to valid range.
+
+    Parameters
+    ----------
+    im : dask.array.Array
+        Input image.
+    bkg_da : dask.array.Array
+        Background image to subtract.
+
+    Returns
+    -------
+    dask.array.Array
+        Background-subtracted and clipped image.
+    """
+    return da.clip(im - bkg_da, 0, None)

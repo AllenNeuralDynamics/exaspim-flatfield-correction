@@ -21,16 +21,18 @@ from dask.distributed import performance_report
 from distributed import Client, LocalCluster
 from dask_image.ndfilters import gaussian_filter as gaussian_filter_dask
 
-from exaspim_flatfield_correction.flatfield import (
+from exaspim_flatfield_correction.basic import (
     fit_basic,
     transform_basic,
-    subtract_bkg,
 )
-from exaspim_flatfield_correction.splinefit import (
+from exaspim_flatfield_correction.fitting import (
     apply_axis_corrections,
     compute_axis_fits,
 )
-from exaspim_flatfield_correction.background import estimate_bkg
+from exaspim_flatfield_correction.background import (
+    estimate_bkg, 
+    subtract_bkg,
+)
 from exaspim_flatfield_correction.utils.mask_utils import (
     calc_gmm_prob,
     size_filter,
@@ -51,7 +53,7 @@ from exaspim_flatfield_correction.utils.utils import (
     resize,
     save_correction_curve_plot,
 )
-from exaspim_flatfield_correction.pipeline.config import (
+from exaspim_flatfield_correction.config import (
     FittingConfig,
     load_fitting_config,
 )
