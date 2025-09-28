@@ -583,6 +583,14 @@ def flatfield_fitting(
     # Re-read the computed mask back from S3 for performance
     mask_upscaled = da.from_zarr(mask_path, component="0").squeeze()
 
+    low_res = subtract_bkg(
+        low_res,
+        da.from_array(
+            resize(np.median(bkg_slices, axis=0).astype(np.float32), low_res.shape[1:]), 
+            chunks=low_res.chunksize[1:]
+        ),
+    )
+
     med_factor = (
         config.med_factor_binned
         if is_binned_channel
