@@ -450,7 +450,7 @@ def _create_mask_artifacts(
         )
         probability_volume = da.from_zarr(
             probability_path, component="0"
-        ).compute()
+        ).squeeze().compute()
 
         prob_threshold = config.mask_probability_threshold
         prob_min_size = config.mask_probability_min_size
