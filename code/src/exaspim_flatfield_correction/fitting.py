@@ -1,8 +1,10 @@
-import numpy as np
-import dask.array as da
-from scipy.ndimage import gaussian_filter1d
-from scipy.interpolate import splrep, splev
 import logging
+from collections.abc import Iterable
+
+import dask.array as da
+import numpy as np
+from scipy.interpolate import splrep, splev
+from scipy.ndimage import gaussian_filter1d
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -93,25 +95,30 @@ def compute_axis_fits(
         ("z", 0, full_shape[0], limits_z),
     )
 
+    axis_indices = [axis_idx for _, axis_idx, _, _ in axis_specs]
+    profiles, global_med = masked_axis_profile(
+        volume,
+        mask,
+        axes=axis_indices,
+        smooth_sigma=smooth_sigma,
+        percentile=percentile,
+        min_voxels=min_voxels,
+    )
+
     fits: dict[str, np.ndarray] = {}
     medians: dict[str, float] = {}
 
     for axis_label, axis_idx, width, limits in axis_specs:
-        profile, median = masked_axis_profile(
-            volume,
-            mask,
-            axis=axis_idx,
-            smooth_sigma=smooth_sigma,
-            percentile=percentile,
-            min_voxels=min_voxels,
-        )
+        profile = profiles.get(axis_idx)
+        if profile is None:
+            raise ValueError(f"Missing computed profile for axis {axis_idx}")
         fits[axis_label] = generate_axis_fit(
             profile,
             width,
             spline_smoothing,
             limits,
         )
-        medians[axis_label] = median
+        medians[axis_label] = global_med
 
     return fits, medians
 
@@ -173,14 +180,14 @@ def apply_axis_corrections(
 def masked_axis_profile(
     volume: "np.ndarray | da.Array",
     mask: "np.ndarray | da.Array",
-    axis: int,
+    axes: Iterable[int],
     *,
     smooth_sigma: "float | None" = None,
     percentile: "float | None" = None,
     min_voxels: int = 0,
-) -> tuple[np.ndarray, float]:
+) -> tuple[dict[int, np.ndarray], float]:
     """
-    Measure a normalized intensity profile along an axis using a 3D mask.
+    Measure normalized intensity profiles along specified axes using a 3D mask.
 
     Parameters
     ----------
@@ -188,8 +195,8 @@ def masked_axis_profile(
         3D volume containing the intensity values.
     mask : np.ndarray or dask.array.Array
         Binary mask with the same shape as ``volume``.
-    axis : int
-        Axis along which to evaluate the profile.
+    axes : iterable of int
+        Axes along which to evaluate the profiles.
     smooth_sigma : float, optional
         Standard deviation for optional 1D Gaussian smoothing of the profile.
     percentile : float, optional
@@ -199,46 +206,66 @@ def masked_axis_profile(
 
     Returns
     -------
-    norm_profile : np.ndarray
-        Profile normalised by the global masked median.
+    profiles : dict[int, np.ndarray]
+        Mapping from axis index to profile normalised by the global masked
+        median.
     global_med : float
         Global median intensity inside the mask.
     """
-    if isinstance(volume, da.Array):
-        volume_np = volume.astype(np.float32).compute()
-    else:
-        volume_np = np.asarray(volume, dtype=np.float32)
-
-    if isinstance(mask, da.Array):
-        mask_np = mask.astype(bool).compute()
-    else:
-        mask_np = np.asarray(mask, dtype=bool)
-
-    if volume_np.shape != mask_np.shape:
-        raise ValueError("volume and mask must have the same shape")
-
-    masked = np.where(mask_np, volume_np, np.nan)
-
-    reduce_axes = tuple(i for i in range(mask_np.ndim) if i != axis)
-    coverage = mask_np.sum(axis=reduce_axes)
-
     if percentile is None:
         percentile = 50
 
-    profile = np.nanpercentile(masked, percentile, axis=reduce_axes)
+    volume_da = da.asarray(volume, dtype=np.float32)
+    mask_da = da.asarray(mask, dtype=bool)
 
-    global_med = float(np.nanpercentile(masked, percentile))
-    if not np.isfinite(global_med) or global_med <= 0:
-        return np.ones(mask_np.shape[axis], dtype=np.float32), 0.0
+    if volume_da.shape != mask_da.shape:
+        raise ValueError("volume and mask must have the same shape")
 
-    profile = np.where(np.isnan(profile), global_med, profile)
-    if min_voxels:
-        profile = np.where(coverage >= min_voxels, profile, global_med)
+    axes = tuple(dict.fromkeys(axes))
+    if not axes:
+        return {}, float("nan")
 
-    if smooth_sigma and smooth_sigma > 0:
-        profile = gaussian_filter1d(
-            profile, sigma=smooth_sigma, mode="nearest"
+    axis_lengths = {axis: mask_da.shape[axis] for axis in axes}
+
+    masked = da.where(mask_da, volume_da, np.nan)
+    # Unfortunately, da.nanpercentile does not support axis=None.
+    global_med = np.nanpercentile(masked.compute(), percentile)
+
+    profile_tasks: list[da.Array] = []
+    for axis in axes:
+        if axis < 0 or axis >= mask_da.ndim:
+            raise ValueError(
+                f"Axis {axis} is out of bounds for array of ndim {mask_da.ndim}"
+            )
+        reduce_axes = tuple(i for i in range(mask_da.ndim) if i != axis)
+        coverage = mask_da.sum(axis=reduce_axes)
+        profile = da.nanpercentile(masked, percentile, axis=reduce_axes)
+        profile = da.where(da.isnan(profile), global_med, profile)
+        if min_voxels:
+            profile = da.where(coverage >= min_voxels, profile, global_med)
+        profile_tasks.append(profile.astype(np.float32, copy=False))
+
+    # Evaluate the global percentile and all axis profiles in one graph traversal,
+    # so the masked volume is only materialised once.
+    computed = da.compute(global_med, *profile_tasks)
+    global_med_value = float(computed[0])
+    profile_arrays = computed[1:]
+
+    results: dict[int, np.ndarray] = {}
+    if not np.isfinite(global_med_value) or global_med_value <= 0:
+        for axis, axis_len in axis_lengths.items():
+            results[axis] = np.ones(axis_len, dtype=np.float32)
+        return results, 0.0
+
+    for axis, profile_np in zip(axes, profile_arrays):
+        profile_np = np.asarray(profile_np, dtype=np.float32)
+        if smooth_sigma and smooth_sigma > 0:
+            profile_np = gaussian_filter1d(
+                profile_np, sigma=smooth_sigma, mode="nearest"
+            )
+        norm_profile = (profile_np / global_med_value).astype(
+            np.float32, copy=False
         )
+        results[axis] = norm_profile
 
-    norm_profile = (profile / global_med).astype(np.float32, copy=False)
-    return norm_profile, global_med
+    return results, global_med_value

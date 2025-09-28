@@ -613,7 +613,6 @@ def flatfield_fitting(
     low_res_clipped = (
         da.clip(low_res * mask, 0, nan_med * med_factor)
         .astype(np.uint16)
-        .compute()
     )
 
     del low_res
