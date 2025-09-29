@@ -1080,6 +1080,9 @@ def set_dask_config(results_dir: str):
             "distributed.worker.memory.pause": 0.9,
             "distributed.worker.memory.terminate": 0.95,
             "distributed.scheduler.allowed-failures": 10,
+            "logging": {
+                "distributed.shuffle._scheduler_plugin": "error",
+            },
         }
     )
 
