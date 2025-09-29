@@ -787,7 +787,16 @@ def flatfield_fitting(
             "Reusing precomputed mask artifacts for tile %s", tile_name
         )
 
+    low_res = subtract_bkg(
+        low_res,
+        da.from_array(
+            resize(np.median(bkg_slices, axis=0).astype(np.float32), low_res.shape[1:]), 
+            chunks=low_res.chunksize[1:]
+        ),
+    )
+
     mask = mask_artifacts.mask_low_res
+    mask = mask & (low_res != 0)
 
     if mask.shape == full_res.shape:
         _LOGGER.info("Mask already at full resolution, skipping upscaling.")
@@ -813,42 +822,24 @@ def flatfield_fitting(
     # Re-read the computed mask back from S3 for performance
     mask_upscaled = da.from_zarr(mask_path, component="0").squeeze()
 
-    low_res = subtract_bkg(
-        low_res,
-        da.from_array(
-            resize(np.median(bkg_slices, axis=0).astype(np.float32), low_res.shape[1:]), 
-            chunks=low_res.chunksize[1:]
-        ),
-    )
-
     med_factor = (
         config.med_factor_binned
         if is_binned_channel
         else config.med_factor_unbinned
     )
-
-    _LOGGER.info(f"Clipping low_res with median factor: {med_factor}")
-    # Dask implementation can only compute nanmedian along subsets of axes at a time,
-    # so we compute the nanmedian in two steps.
-    nan_med = da.nanmedian(
-        da.nanmedian(da.where(mask, low_res, np.nan), axis=(0, 1)), axis=0
-    ).compute()
-    # This fails with an OOM
-    # nan_med = da.nanmedian(da.where(mask, low_res, np.nan), axis=tuple(d for d in low_res.ndim)).compute()
-    _LOGGER.info(f"Computed median of tile foreground: {nan_med}")
-
-    # Clamp the intensity values to reduce the impact of very bright neurites on the profile fit
-    low_res_clipped = (
-        da.clip(low_res * mask, 0, nan_med * med_factor)
-        .astype(np.uint16)
-    )
-
-    del low_res
-
     profile_sigma = config.gaussian_sigma
     profile_percentile = config.profile_percentile
     profile_min_voxels = config.profile_min_voxels
     spline_smoothing = config.spline_smoothing
+
+    _LOGGER.info(f"Clipping low_res with median factor: {med_factor}")
+    nan_med = np.percentile(low_res[mask].compute(), profile_percentile)
+    _LOGGER.info(f"Computed median of tile foreground: {nan_med}")
+
+    # Clamp the intensity values to reduce the impact of very bright neurites on the profile fit
+    low_res_clipped = da.clip(low_res * mask, 0, nan_med * med_factor)
+    
+    del low_res
 
     _LOGGER.info(
         "Computing masked profiles (sigma=%s, percentile=%s, min_voxels=%s)",
