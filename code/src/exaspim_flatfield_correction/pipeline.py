@@ -1,4 +1,5 @@
 import os
+import re
 import glob
 import time
 import json
@@ -8,6 +9,7 @@ import subprocess
 from pathlib import Path
 from datetime import datetime
 from dataclasses import dataclass
+from typing import Any
 
 import numpy as np
 import zarr
@@ -221,10 +223,33 @@ def load_mask_from_dir(mask_dir: str, tile_name: str) -> np.ndarray:
     raise Exception(f"No mask file found for tile: {tile_name}")
 
 
-def parse_inputs(args: argparse.Namespace) -> dict:
+def extract_channel_from_tile_name(tile_name: str) -> str | None:
+    """Extract a numeric channel identifier from a tile name.
+
+    Parameters
+    ----------
+    tile_name : str
+        File or directory name describing the tile (e.g., ``tile_000017_ch_488``).
+
+    Returns
+    -------
+    str or None
+        The extracted channel digits, or ``None`` when no pattern is found.
     """
-    Parse input arguments and metadata to determine tile paths and
-    processing parameters.
+
+    match = re.search(r"_ch_(\d+)", tile_name)
+    if match:
+        return match.group(1)
+
+    match = re.search(r"_ch(\d+)", tile_name)
+    if match:
+        return match.group(1)
+
+    return None
+
+
+def parse_inputs(args: argparse.Namespace) -> dict[str, str | list[str] | None]:
+    """Collect pipeline inputs from CLI arguments and optional metadata.
 
     Parameters
     ----------
@@ -243,6 +268,16 @@ def parse_inputs(args: argparse.Namespace) -> dict:
         method = args.method
         res = str(args.res)
         binned_channel = None
+        if args.is_binned:
+            tile_name = Path(args.zarr).name
+            inferred_channel = extract_channel_from_tile_name(tile_name)
+            if inferred_channel is not None:
+                binned_channel = inferred_channel
+            else:
+                _LOGGER.warning(
+                    "Unable to infer channel number from tile %s despite --is-binned",
+                    tile_name,
+                )
     else:
         try:
             tile_file = glob.glob("../data/tile_*.json")[0]
