@@ -65,10 +65,95 @@ logging.basicConfig(
 )
 _LOGGER = logging.getLogger(__name__)
 
+DEFAULT_MEDIAN_SUMMARY_PATH = Path("/data/median_intensity_summary.json")
+
 
 @dataclass
 class MaskArtifacts:
     mask_low_res: da.Array
+
+
+def read_median_intensity_summary(path: Path) -> dict[str, float]:
+    """Load channel -> mean_of_medians mappings if present on disk."""
+    if not path.exists():
+        return {}
+
+    try:
+        data = json.loads(path.read_text())
+    except Exception:
+        _LOGGER.exception("Failed to read median intensity summary at %s", path)
+        return {}
+
+    overrides: dict[str, float] = {}
+    for channel, payload in data.items():
+        mean_value = None
+        if isinstance(payload, dict):
+            mean_value = payload.get("mean_of_medians")
+        if mean_value is None:
+            _LOGGER.warning(
+                "Skipping channel %s in %s: missing mean_of_medians",
+                channel,
+                path,
+            )
+            continue
+        try:
+            overrides[str(channel)] = float(mean_value)
+        except (TypeError, ValueError):
+            _LOGGER.warning(
+                "Skipping channel %s in %s: mean_of_medians=%r is not numeric",
+                channel,
+                path,
+                mean_value,
+            )
+    return overrides
+
+
+def apply_median_summary_override(
+    fitting_config: FittingConfig,
+    median_summary: dict[str, float],
+    tile_name: str,
+    *,
+    is_binned_channel: bool,
+    binned_channel: str | None,
+) -> None:
+    """Adjust global factors using per-channel mean medians when available."""
+    if not median_summary:
+        return
+
+    override_value: float | None = None
+    binned_key = str(binned_channel) if binned_channel else None
+
+    if is_binned_channel and binned_key:
+        override_value = median_summary.get(binned_key)
+    elif not is_binned_channel:
+        tile_lower = tile_name.lower()
+        for channel, value in median_summary.items():
+            if channel == binned_key:
+                continue
+            if channel.lower() in tile_lower:
+                override_value = value
+                break
+        if override_value is None:
+            for channel, value in median_summary.items():
+                if channel != binned_key:
+                    override_value = value
+                    break
+
+    if override_value is None:
+        return
+
+    if is_binned_channel:
+        if fitting_config.global_factor_binned != override_value:
+            _LOGGER.info(
+                "Overriding binned global factor with %.4f", override_value
+            )
+        fitting_config.global_factor_binned = override_value
+    else:
+        if fitting_config.global_factor_unbinned != override_value:
+            _LOGGER.info(
+                "Overriding unbinned global factor with %.4f", override_value
+            )
+        fitting_config.global_factor_unbinned = override_value
 
 
 def get_mem_limit() -> int | str:
@@ -942,6 +1027,15 @@ def parse_and_validate_args() -> argparse.Namespace:
         help="Use reference background image from S3 instead of estimating background.",
     )
     parser.add_argument("--is-binned", action="store_true", default=False)
+    parser.add_argument(
+        "--median-summary-path",
+        type=str,
+        default=str(DEFAULT_MEDIAN_SUMMARY_PATH),
+        help=(
+            "Path to JSON file containing per-channel mean_of_medians values "
+            "for global normalization (default: /data/median_intensity_summary.json)."
+        ),
+    )
     args = parser.parse_args()
 
     if args.method == "fitting" and args.mask_dir is None:
@@ -1008,6 +1102,8 @@ def main() -> None:
     res = params["res"]
     binned_channel = params["binned_channel"]
 
+    median_summary_path = Path(args.median_summary_path)
+
     results_dir = args.results_dir
     if not os.path.exists(results_dir):
         os.makedirs(results_dir, exist_ok=True)
@@ -1064,6 +1160,7 @@ def main() -> None:
 
     mask_artifacts: MaskArtifacts | None = None
     fitting_config: FittingConfig | None = None
+    median_summary: dict[str, float] = {}
     if method == "fitting":
         fitting_config = load_fitting_config(args.fitting_config)
         if args.fitting_config:
@@ -1072,6 +1169,12 @@ def main() -> None:
         fitting_config.to_file(
             os.path.join(results_dir, "fitting_config.json")
         )
+        median_summary = read_median_intensity_summary(median_summary_path)
+        if median_summary:
+            _LOGGER.info(
+                "Loaded median intensity overrides for channels: %s",
+                ", ".join(sorted(median_summary)),
+            )
 
     for tile_path in tile_paths:
         tile_name = Path(tile_path).name
@@ -1135,6 +1238,13 @@ def main() -> None:
                             raise ValueError(
                                 "Fitting configuration failed to initialize"
                             )
+                        apply_median_summary_override(
+                            fitting_config,
+                            median_summary,
+                            tile_name,
+                            is_binned_channel=is_binned_channel,
+                            binned_channel=binned_channel,
+                        )
                         corrected, axis_fits, mask_artifacts = (
                             flatfield_fitting(
                                 full_res,
