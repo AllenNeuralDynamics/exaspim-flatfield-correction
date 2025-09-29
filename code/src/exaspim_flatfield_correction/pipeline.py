@@ -73,7 +73,22 @@ DEFAULT_MEDIAN_SUMMARY_PATH = Path("/data/median_intensity_summary.json")
 @dataclass
 class MaskArtifacts:
     """Container for cached mask artifacts reused within the pipeline."""
+
     mask_low_res: da.Array
+
+
+def _array_chunks(arr: da.Array) -> tuple[int, ...]:
+    """Return the first chunk length from each axis of a Dask array."""
+
+    return tuple(int(axis_chunks[0]) for axis_chunks in arr.chunks)
+
+
+def _spatial_chunks(arr: da.Array) -> tuple[int, ...]:
+    """Return chunk lengths for the last two axes of a Dask array."""
+
+    if arr.ndim < 2:
+        return (int(arr.chunks[-1][0]),)
+    return tuple(int(axis_chunks[0]) for axis_chunks in arr.chunks[-2:])
 
 
 def read_median_intensity_summary(path: Path) -> dict[str, float]:
@@ -424,7 +439,8 @@ def flatfield_reference(full_res: da.Array, flatfield_path: str) -> da.Array:
     if flatfield.shape[-2:] != full_res.shape[-2:]:
         flatfield = resize(flatfield, full_res.shape[-2:])
     flatfield = flatfield / flatfield.max()
-    flatfield = da.from_array(flatfield, chunks=(256, 256))
+    spatial_chunks = _spatial_chunks(full_res)
+    flatfield = da.from_array(flatfield, chunks=spatial_chunks)
     corrected = da.clip(full_res / flatfield[np.newaxis], 0, 2**16 - 1)
     return corrected
 
@@ -488,11 +504,13 @@ def flatfield_basicpy(
         )
     mask = None
     if mask_dir is not None and results_dir is not None:
+        mask_chunks = _array_chunks(low_res)
         mask = _preprocess_mask(
             load_mask_from_dir(mask_dir, tile_name),
             low_res.shape,
             results_dir,
             tile_name,
+            chunks=mask_chunks,
         ).compute()
     fit = fit_basic(
         low_res.compute(),
@@ -513,6 +531,8 @@ def _preprocess_mask(
     low_res_shape: tuple[int, int, int],
     results_dir: str,
     tile_name: str,
+    *,
+    chunks: tuple[int, ...],
 ) -> da.Array:
     """Normalize mask shape and persist it as a reusable Zarr array.
 
@@ -526,6 +546,8 @@ def _preprocess_mask(
         Directory where the temporary Zarr mask should be written.
     tile_name : str
         Identifier used when naming the persisted mask.
+    chunks : tuple of int
+        Chunk specification matching the target low-resolution Dask array.
 
     Returns
     -------
@@ -535,18 +557,18 @@ def _preprocess_mask(
     mask_name = str(Path(results_dir) / f"{tile_name}_mask_low_res.zarr")
     if mask.shape != low_res_shape:
         mask = upscale_mask_nearest(
-            da.from_array(mask, chunks=(128, 256, 256)),
+            da.from_array(mask, chunks=chunks),
             low_res_shape,
-            chunks=(128, 256, 256),
+            chunks=chunks,
         ).compute()
     mask = mask.astype(np.uint8)
     zarr.save_array(
         str(mask_name),
         mask,
-        chunks=(128, 256, 256),
+        chunks=chunks,
         compressor=blosc.Blosc(cname="zstd", clevel=1),
     )
-    return da.from_zarr(mask_name, chunks=(128, 256, 256))
+    return da.from_zarr(mask_name)
 
 
 def _create_mask_artifacts(
@@ -597,11 +619,13 @@ def _create_mask_artifacts(
         If probability refinement is requested without ``bkg_slices``.
     """
     _LOGGER.info("Creating mask artifacts using tile %s", tile_name)
+    mask_chunks = _array_chunks(low_res)
     initial_mask = _preprocess_mask(
         size_filter(load_mask_from_dir(mask_dir, tile_name), k_largest=1, min_size=None),
         low_res.shape,
         results_dir,
         tile_name,
+        chunks=mask_chunks,
     ).astype(bool)
 
     mask_low_res = initial_mask
@@ -628,7 +652,7 @@ def _create_mask_artifacts(
             calc_gmm_prob(
                 gaussian_filter_dask(low_res.astype(np.float32), sigma=1),
                 initial_mask,
-                da.from_array(bkg_slices, chunks=(64, 64, 64)),
+                da.from_array(bkg_slices, chunks=mask_chunks),
                 n_components_fg=gmm_n_components,
                 n_components_bg=gmm_n_components,
                 max_samples_fg=gmm_max_samples,
@@ -673,8 +697,13 @@ def _create_mask_artifacts(
             k_largest=1
         )
         mask_low_res = (
-            _preprocess_mask(mask_low_res, low_res.shape, results_dir, tile_name)
-            .astype(bool)
+            _preprocess_mask(
+                mask_low_res,
+                low_res.shape,
+                results_dir,
+                tile_name,
+                chunks=mask_chunks,
+            ).astype(bool)
         )
 
     return MaskArtifacts(
@@ -768,7 +797,7 @@ def flatfield_fitting(
         mask_upscaled = upscale_mask_nearest(
             mask,
             full_res.shape,
-            chunks=(128, 256, 256),
+            chunks=_array_chunks(full_res),
         )
 
     mask_path = out_mask_path.rstrip("/") + f"/{tile_name}"
