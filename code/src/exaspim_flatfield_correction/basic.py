@@ -26,7 +26,7 @@ def fit_basic(
     autosegment: bool = False,
     sort_intensity: bool = False,
     shuffle_frames: bool = False,
-    mask: np.ndarray = None,
+    mask: np.ndarray | None = None,
     max_workers: int = 16,
     resize_mode: str = "skimage",
     working_size: int = 256,
@@ -34,42 +34,45 @@ def fit_basic(
     smoothness_darkfield: float = 0.1,
     max_slices: int = 0,
 ) -> "BaSiC":
-    """
-    Fit a BaSiC flatfield/darkfield correction model to an image stack.
+    """Fit a BaSiC flatfield/darkfield model to an image stack.
 
     Parameters
     ----------
-    im : np.ndarray
-        Image stack (frames, Y, X) or (Z, Y, X).
-    autotune : bool, optional
-        Whether to autotune BaSiC parameters. Default is False.
-    get_darkfield : bool, optional
-        Whether to estimate darkfield. Default is False.
-    autosegment : bool, optional
-        Whether to use autosegmentation. Default is False.
-    sort_intensity : bool, optional
-        Whether to sort frames by intensity before fitting. Default is False.
-    shuffle_frames : bool, optional
-        Whether to shuffle frames before fitting. Default is False.
-    mask : np.ndarray, optional
-        Optional mask for fitting weighting.
-    max_workers : int, optional
-        Number of workers for parallel processing. Default is 16.
-    resize_mode : str, optional
-        Resize mode for BaSiC. Default is 'skimage'.
-    working_size : int, optional
-        Working size for BaSiC. Default is 256.
-    smoothness_flatfield : float, optional
-        Smoothness parameter for flatfield. Default is 0.1.
-    smoothness_darkfield : float, optional
-        Smoothness parameter for darkfield. Default is 0.1.
-    max_slices : int, optional
-        If > 0, use only the top N mask slices (by area) and corresponding image slices. Default is 0 (use all).
+    im : numpy.ndarray
+        Image stack with shape ``(frames, y, x)`` or ``(z, y, x)``.
+    autotune : bool, default=False
+        Whether to run BaSiC's autotuner prior to fitting.
+    autotune_iter : int, default=50
+        Maximum iterations the autotuner should run.
+    get_darkfield : bool, default=False
+        If ``True``, estimate the darkfield component in addition to the
+        flatfield.
+    autosegment : bool, default=False
+        Enable BaSiC autosegmentation to focus the fit on bright structures.
+    sort_intensity : bool, default=False
+        Sort frames by total intensity before fitting.
+    shuffle_frames : bool, default=False
+        Shuffle frames randomly prior to fitting.
+    mask : numpy.ndarray or None, default=None
+        Optional weighting mask aligned with ``im``.
+    max_workers : int, default=16
+        Number of worker threads used by BaSiC.
+    resize_mode : str, default="skimage"
+        Resize backend used internally by BaSiC.
+    working_size : int, default=256
+        Working resolution along each spatial axis used by BaSiC.
+    smoothness_flatfield : float, default=0.1
+        Regularisation strength applied to the flatfield component.
+    smoothness_darkfield : float, default=0.1
+        Regularisation strength applied to the darkfield component.
+    max_slices : int, default=0
+        If greater than zero, limit the fit to the ``max_slices`` slices with
+        the largest mask area.
 
     Returns
     -------
     BaSiC
-        Fitted BaSiC model object.
+        Fitted BaSiC model instance.
     """
     # If max_slices > 0 and mask is provided, select top N slices by mask area
     if max_slices > 0 and mask is not None:
@@ -113,24 +116,25 @@ def fit_basic(
 
 
 def transform_basic(
-    im: da.Array, fit: "BaSiC", chunks: tuple = (256, 256)
+    im: da.Array,
+    fit: "BaSiC",
+    chunks: tuple[int, int] | str = (256, 256),
 ) -> da.Array:
-    """
-    Apply a fitted BaSiC flatfield/darkfield correction to an image.
+    """Apply a fitted BaSiC model to a Dask array lazily.
 
     Parameters
     ----------
     im : dask.array.Array
-        Image to correct (C, Y, X) or (Z, Y, X).
+        Image to correct with shape ``(c, y, x)`` or ``(z, y, x)``.
     fit : BaSiC
-        Fitted BaSiC model object.
-    chunks : tuple, optional
-        Chunk size for Dask arrays. Default is (256, 256).
+        Fitted BaSiC model instance.
+    chunks : tuple[int, int] or str, default=(256, 256)
+        Chunk specification for the generated flatfield and darkfield arrays.
 
     Returns
     -------
     dask.array.Array
-        Flatfield/darkfield corrected image.
+        Dask array representing the corrected image volume.
     """
     flatfield = da.from_array(
         resize(fit.flatfield, im.shape[-2:]), chunks=chunks

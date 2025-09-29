@@ -16,26 +16,25 @@ def rescale_spline(
     smoothing: float = 0,
     k: int = 3,
 ) -> np.ndarray:
-    """
-    Fit a spline to (x, y) and rescale it to a new width.
+    """Fit a smoothing spline and evaluate it on a new uniform grid.
 
     Parameters
     ----------
-    x : np.ndarray
-        Original x values.
-    y : np.ndarray
-        Original y values.
+    x : numpy.ndarray
+        Sample locations for the original profile.
+    y : numpy.ndarray
+        Profile values evaluated at ``x``.
     new_width : int
-        Desired output width.
-    smoothing : float, optional
-        Smoothing factor for the spline. Default is 0.
-    k : int, optional
-        Degree of the spline (default is cubic, k=3).
+        Number of samples desired in the rescaled profile.
+    smoothing : float, default=0
+        Smoothing factor passed to ``scipy.interpolate.splrep``.
+    k : int, default=3
+        Spline degree used when fitting.
 
     Returns
     -------
-    np.ndarray
-        Rescaled spline values at the new width.
+    numpy.ndarray
+        Resampled profile of length ``new_width``.
     """
     # Fit the spline using the original x and y data
     tck = splrep(x, y, s=smoothing, k=k)
@@ -62,7 +61,24 @@ def generate_axis_fit(
     smoothing: float,
     limits: "tuple[float, float] | None" = None,
 ) -> np.ndarray:
-    """Scale a 1D normalized profile to a new width with optional clipping."""
+    """Resample and optionally clip a 1D correction profile.
+
+    Parameters
+    ----------
+    profile : numpy.ndarray or dask.array.Array
+        Normalised 1D profile to be rescaled.
+    new_width : int
+        Desired number of samples after rescaling.
+    smoothing : float
+        Smoothing factor forwarded to :func:`rescale_spline`.
+    limits : tuple of float or None, default=None
+        When provided, clamp the resampled profile to ``(lower, upper)``.
+
+    Returns
+    -------
+    numpy.ndarray
+        Resampled and optionally clipped profile.
+    """
     if isinstance(profile, da.Array):
         profile_np = profile.astype(np.float32).compute()
     else:
@@ -87,7 +103,37 @@ def compute_axis_fits(
     limits_y: "tuple[float, float] | None" = None,
     limits_z: "tuple[float, float] | None" = None,
 ) -> tuple[dict[str, np.ndarray], dict[str, float]]:
-    """Compute normalized profiles and spline fits along x, y, and z axes."""
+    """Compute axis-aligned correction profiles and corresponding fits.
+
+    Parameters
+    ----------
+    volume : numpy.ndarray or dask.array.Array
+        Low-resolution image volume used to estimate the correction.
+    mask : numpy.ndarray or dask.array.Array
+        Foreground mask aligned with ``volume``.
+    full_shape : tuple of int
+        Target shape of the full-resolution dataset (z, y, x).
+    smooth_sigma : float or None, default=None
+        Optional Gaussian sigma for smoothing the masked profiles prior to
+        normalisation.
+    percentile : float or None, default=None
+        Percentile used to summarise intensities along each axis; defaults to
+        the median.
+    min_voxels : int, default=0
+        Minimum number of mask voxels required in a slice to utilise its
+        percentile measurement.
+    spline_smoothing : float, default=0
+        Smoothing factor applied when resampling the correction profiles.
+    limits_x, limits_y, limits_z : tuple of float or None, default=None
+        Optional clamp bounds applied to the resampled profiles along each
+        axis.
+
+    Returns
+    -------
+    tuple of (dict[str, numpy.ndarray], dict[str, float])
+        Mapping of axis labels to fitted correction curves and a mapping of
+        axis labels to the corresponding global medians.
+    """
 
     axis_specs = (
         ("x", 2, full_shape[2], limits_x),
@@ -132,7 +178,28 @@ def apply_axis_corrections(
     global_factor: float,
     clip_max: float = 2**16 - 1,
 ) -> da.Array:
-    """Apply per-axis correction profiles and global scaling to a volume."""
+    """Apply axis-specific correction curves and global scaling factors.
+
+    Parameters
+    ----------
+    full_res : dask.array.Array
+        Full-resolution input volume to correct.
+    mask_upscaled : dask.array.Array
+        Boolean mask at full resolution restricting where corrections apply.
+    axis_fits : dict of str to numpy.ndarray
+        Resampled correction curves for ``{"x", "y", "z"}``.
+    axis_medians : dict of str to float
+        Global medians associated with each axis profile.
+    global_factor : float
+        Target global intensity level used to scale the corrected volume.
+    clip_max : float, default=2**16 - 1
+        Upper bound used when clipping intensities after correction.
+
+    Returns
+    -------
+    dask.array.Array
+        Lazily corrected full-resolution volume.
+    """
 
     corrected = full_res
     median_xy = float(axis_medians.get("x", 0.0))

@@ -72,6 +72,7 @@ DEFAULT_MEDIAN_SUMMARY_PATH = Path("/data/median_intensity_summary.json")
 
 @dataclass
 class MaskArtifacts:
+    """Container for cached mask artifacts reused within the pipeline."""
     mask_low_res: da.Array
 
 

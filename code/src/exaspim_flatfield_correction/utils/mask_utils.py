@@ -274,9 +274,24 @@ def compute_simple_features_dask(
     sigma_log: float = 1.0,
     sigma_grad: float = 1.0,
 ) -> list[da.Array]:
-    """
-    Lazily compute 5 features as Dask arrays using dask-image:
-      [ intensity, local mean, local std, gaussian gradient magnitude, -LoG ]
+    """Compute a small bank of local features in a lazy fashion.
+
+    Parameters
+    ----------
+    x : numpy.ndarray or dask.array.Array
+        Input image volume.
+    sigma_mean : float, default=1.5
+        Gaussian sigma used when computing the local mean and variance.
+    sigma_log : float, default=1.0
+        Sigma for the Laplacian-of-Gaussian feature.
+    sigma_grad : float, default=1.0
+        Sigma for the Gaussian gradient magnitude feature.
+
+    Returns
+    -------
+    list of dask.array.Array
+        Lazy feature volumes ``[intensity, local mean, local std, gradient
+        magnitude, -LoG]``.
     """
     # Local mean & std via Gaussian filtering (E[x^2] - (E[x])^2)
     m = di.gaussian_filter(x, sigma=sigma_mean)
@@ -299,7 +314,30 @@ def _sample_rows_from_dask_stack(
     max_rows: int,
     rng: np.random.Generator,
 ) -> np.ndarray:
-    """Gather up to max_rows rows (feature vectors) from dask feature arrays."""
+    """Gather a subset of feature vectors from lazily computed arrays.
+
+    Parameters
+    ----------
+    feats : list of dask.array.Array
+        Feature volumes produced by :func:`compute_simple_features_dask`.
+    linear_idx : numpy.ndarray
+        Flat indices identifying candidate voxels.
+    max_rows : int
+        Maximum number of rows to sample from ``linear_idx``.
+    rng : numpy.random.Generator
+        Random generator used to subsample indices.
+
+    Returns
+    -------
+    numpy.ndarray
+        Array of shape ``(n_samples, n_features)`` containing finite feature
+        vectors.
+
+    Raises
+    ------
+    ValueError
+        If no finite feature vectors can be assembled.
+    """
     if linear_idx.size > max_rows:
         linear_idx = rng.choice(linear_idx, size=max_rows, replace=False)
 
@@ -332,13 +370,52 @@ def calc_gmm_prob(
     sigma_grad: float = 1.0,
     erosion_radius: int = 1,
 ) -> da.Array:
-    """
-    Memory-friendly 2-GMM classifier using dask-image filters.
-    Returns a Dask array of P(foreground) you can `.compute()` or `.persist()`.
-    The provided mask is eroded (unless `erosion_radius` is 0) before fitting
-    the foreground model to focus on high-confidence voxels. Output shape ==
-    image.shape, dtype float32. Set `max_samples_bg` to None to use the entire
-    background volume without random sampling.
+    """Estimate foreground probability with paired Gaussian mixture models.
+
+    Parameters
+    ----------
+    img_da : numpy.ndarray or dask.array.Array
+        Image volume whose foreground probability is estimated.
+    mask_da : numpy.ndarray
+        Binary mask highlighting confident foreground voxels.
+    bg_da : numpy.ndarray or dask.array.Array
+        Background reference volume used to learn background appearance.
+    n_components_fg : int, default=3
+        Number of mixture components for the foreground model.
+    n_components_bg : int, default=3
+        Number of mixture components for the background model.
+    max_samples_fg : int, default=500000
+        Maximum number of foreground voxels used for model fitting.
+    max_samples_bg : int or None, default=500000
+        Maximum number of background voxels sampled; use ``None`` to take the
+        full background volume.
+    prior_fg : float, default=0.5
+        Foreground prior probability in the Bayes classifier.
+    reg_covar : float, default=1e-6
+        Covariance regularisation for ``GaussianMixture``.
+    n_init : int, default=3
+        Number of mixture initialisations.
+    random_state : int or None, default=0
+        Seed used by the random generator.
+    sigma_mean : float, default=1.0
+        Sigma for the local mean feature.
+    sigma_log : float, default=1.0
+        Sigma for the Laplacian-of-Gaussian feature.
+    sigma_grad : float, default=1.0
+        Sigma for the gradient magnitude feature.
+    erosion_radius : int, default=1
+        Radius of the binary erosion applied to ``mask_da`` before sampling.
+
+    Returns
+    -------
+    dask.array.Array
+        Lazy array of foreground probabilities shaped like ``img_da``.
+
+    Raises
+    ------
+    ValueError
+        If ``prior_fg`` is outside ``(0, 1)`` or sampling constraints are
+        incompatible with the provided data.
     """
     if not (0.0 < prior_fg < 1.0):
         raise ValueError("prior_fg must be in (0, 1)")

@@ -1,4 +1,5 @@
 from datetime import datetime
+from typing import Any
 
 from aind_data_schema.core.processing import DataProcess
 from aind_data_schema_models.process_names import ProcessName
@@ -7,7 +8,11 @@ from exaspim_flatfield_correction.utils.utils import get_parent_s3_path
 
 
 def create_processing_metadata(
-    args, tile_path: str, output_path: str, start_date_time: datetime, res: str
+    args: Any,
+    tile_path: str,
+    output_path: str,
+    start_date_time: datetime,
+    res: str,
 ) -> DataProcess:
     """
     Create a DataProcess metadata object for flat field correction.
