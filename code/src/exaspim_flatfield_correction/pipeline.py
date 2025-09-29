@@ -76,7 +76,23 @@ class MaskArtifacts:
 
 
 def read_median_intensity_summary(path: Path) -> dict[str, float]:
-    """Load channel -> mean_of_medians mappings if present on disk."""
+    """Load per-channel normalization targets from disk.
+
+    Parameters
+    ----------
+    path : pathlib.Path
+        Filesystem path pointing to ``median_intensity_summary.json``.
+
+    Returns
+    -------
+    dict of str to float
+        Mapping from channel identifiers to their ``mean_of_medians`` value.
+
+    Notes
+    -----
+    The function logs and skips channels that are missing or have
+    non-numeric ``mean_of_medians`` entries.
+    """
     if not path.exists():
         return {}
 
@@ -118,7 +134,21 @@ def apply_median_summary_override(
     is_binned_channel: bool,
     binned_channel: str | None,
 ) -> None:
-    """Adjust global factors using per-channel mean medians when available."""
+    """Update global correction factors using the summary file when possible.
+
+    Parameters
+    ----------
+    fitting_config : FittingConfig
+        Mutable fitting configuration to update in-place.
+    median_summary : dict of str to float
+        Channel-to-``mean_of_medians`` mapping loaded from disk.
+    tile_name : str
+        Name of the tile currently being processed.
+    is_binned_channel : bool
+        Whether the tile corresponds to the binned channel.
+    binned_channel : str or None
+        Identifier of the binned channel, when known.
+    """
     if not median_summary:
         return
 
@@ -159,17 +189,17 @@ def apply_median_summary_override(
 
 
 def get_mem_limit() -> int | str:
-    """
-    Return a value suitable for Dask’s LocalCluster(memory_limit=…).
+    """Return the memory limit to pass into ``LocalCluster``.
 
-    • If the CO_MEMORY environment variable is set, treat it as **bytes** and
-      return it as an int.
-    • If CO_MEMORY is unset (or empty), return the string 'auto'.
+    Returns
+    -------
+    int or str
+        Explicit byte count if ``CO_MEMORY`` is set, otherwise ``"auto"``.
 
     Raises
     ------
     ValueError
-        If CO_MEMORY is set to a non-integer value.
+        If ``CO_MEMORY`` is defined but cannot be parsed as an integer.
     """
     raw = os.getenv("CO_MEMORY")
     if not raw:
@@ -184,25 +214,26 @@ def get_mem_limit() -> int | str:
 
 
 def load_mask_from_dir(mask_dir: str, tile_name: str) -> np.ndarray:
-    """
-    Load a mask file for a given tile from a directory.
+    """Load the binary mask that corresponds to ``tile_name``.
 
     Parameters
     ----------
     mask_dir : str
-        Directory containing mask files.
+        Directory that stores candidate mask files.
     tile_name : str
-        Name of the tile to match the mask file.
+        Tile identifier used to locate the matching mask.
 
     Returns
     -------
-    np.ndarray
-        Loaded mask image as a numpy array.
+    numpy.ndarray
+        Mask stored on disk with shape compatible with the tile.
 
     Raises
     ------
-    Exception
-        If no mask file is found for the given tile.
+    ValueError
+        If the directory or tile name is invalid.
+    FileNotFoundError
+        If no file matching the tile can be located.
     """
     if tile_name is None or tile_name == "":
         raise ValueError("Tile name must be provided to load the mask.")
@@ -220,7 +251,7 @@ def load_mask_from_dir(mask_dir: str, tile_name: str) -> np.ndarray:
                 maskp = os.path.join(root, f)
                 _LOGGER.info(f"Found mask file: {maskp}")
                 return tifffile.imread(maskp)
-    raise Exception(f"No mask file found for tile: {tile_name}")
+    raise FileNotFoundError(f"No mask file found for tile: {tile_name}")
 
 
 def extract_channel_from_tile_name(tile_name: str) -> str | None:
@@ -258,9 +289,14 @@ def parse_inputs(args: argparse.Namespace) -> dict[str, str | list[str] | None]:
 
     Returns
     -------
-    dict
-        Dictionary containing tile paths, output path, method, resolution,
-        and binned channel info.
+    dict of str to (str, list[str], or None)
+        Mapping that includes the tile paths, output destination, method,
+        resolution, and binned-channel identifier (when present).
+
+    Raises
+    ------
+    ValueError
+        If no metadata file can be located when ``--zarr`` is omitted.
     """
     if args.zarr != "":
         tile_paths = [args.zarr]
@@ -294,7 +330,7 @@ def parse_inputs(args: argparse.Namespace) -> dict[str, str | list[str] | None]:
         method = meta["method"]
         binned_channel = meta["binned_channel"]
         res = str(meta["resolution"])
-    params = {
+    params: dict[str, str | list[str] | None] = {
         "tile_paths": tile_paths,
         "out_path": out_path,
         "method": method,
@@ -311,28 +347,28 @@ def background_subtraction(
     is_binned_channel: bool = False,
     use_reference_bkg: bool = False,
 ) -> tuple[da.Array, np.ndarray, np.ndarray | None]:
-    """
-    Perform background subtraction on the full resolution image.
+    """Remove background estimates from the full-resolution volume.
 
     Parameters
     ----------
     tile_path : str
-        Path to the tile zarr.
+        Filesystem or S3 path to the tile Zarr group.
     full_res : dask.array.Array
-        Full resolution image as a dask array.
+        Full-resolution image volume to correct (modified lazily).
     z : zarr.hierarchy.Group
-        Opened zarr group for the tile.
-    is_binned_channel : bool, optional
-        Whether the tile is a binned channel, by default False.
-    use_reference_bkg : bool, optional
-        If True, loads the reference background image from S3. If False, estimate background from data. Default is False.
+        Open Zarr hierarchy for the tile.
+    is_binned_channel : bool, default=False
+        Flag indicating whether the tile represents the binned channel.
+    use_reference_bkg : bool, default=False
+        When ``True`` load a static reference background, otherwise estimate
+        it from the data.
 
     Returns
     -------
-    tuple[dask.array.Array, np.ndarray, np.ndarray | None]
-        Tuple containing the background-subtracted full resolution array, the
-        estimated 2D background image, and the stack of background-dominated
-        slices used for probability modelling (or None when unavailable).
+    tuple
+        ``(full_res_corrected, background_image, background_slices)`` where
+        ``background_slices`` may be ``None`` if no probabilistic model is
+        required.
     """
     if use_reference_bkg:
         bkg_path = get_bkg_path(tile_path)
@@ -356,27 +392,24 @@ def background_subtraction(
 
 
 def flatfield_reference(full_res: da.Array, flatfield_path: str) -> da.Array:
-    """
-    Apply reference flatfield correction to the image.
+    """Apply reference flatfield correction using a precomputed image.
 
     Parameters
     ----------
     full_res : dask.array.Array
-        Full resolution image as a dask array.
+        Full-resolution volume to be corrected.
     flatfield_path : str
-        Path to the flatfield image (local or s3).
+        Location of the reference flatfield image (local path or S3 URL).
 
     Returns
     -------
-    tuple
-        Tuple containing the corrected image, GMM probability volume,
-        binary projection masks, percentile projections, fitted
-        correction curves, and the mask artifacts for reuse.
+    dask.array.Array
+        Corrected image volume with the flatfield applied.
 
     Raises
     ------
     ValueError
-        If flatfield_path is not provided.
+        If ``flatfield_path`` is not provided.
     """
     if flatfield_path is None:
         raise ValueError(
@@ -399,50 +432,49 @@ def flatfield_basicpy(
     full_res: da.Array,
     z: zarr.hierarchy.Group,
     is_binned_channel: bool,
-    bkg: np.ndarray = None,
-    mask_dir: str = None,
-    tile_name: str = None,
+    bkg: np.ndarray | None = None,
+    mask_dir: str | None = None,
+    tile_name: str | None = None,
     max_slices: int = 100,
     working_size: int = 512,
     sort_intensity: bool = True,
     shuffle_frames: bool = False,
     autotune: bool = False,
-    results_dir: str = None,
+    results_dir: str | None = None,
 ) -> da.Array:
-    """
-    Apply basicpy-based flatfield correction to the image.
+    """Apply BasicPy flatfield correction to the supplied volume.
 
     Parameters
     ----------
     full_res : dask.array.Array
-        Full resolution image as a dask array.
+        Full-resolution image volume to correct.
     z : zarr.hierarchy.Group
-        Opened zarr group for the tile.
+        Zarr hierarchy for the tile.
     is_binned_channel : bool
-        Whether the tile is a binned channel.
-    bkg : np.ndarray, optional
-        Background image as a numpy array, by default None.
-    mask_dir : str, optional
-        Directory containing mask files, by default None.
-    tile_name : str, optional
-        Name of the tile being processed, by default None.
-    max_slices : int, optional
-        Maximum number of slices for basicpy, by default 100.
-    working_size : int, optional
-        Working size for basicpy, by default 512.
-    sort_intensity : bool, optional
-        Whether to sort by intensity, by default True.
-    shuffle_frames : bool, optional
-        Whether to shuffle frames, by default False.
-    autotune : bool, optional
-        Whether to autotune basicpy, by default False.
-    results_dir : str, optional
-        Directory to store intermediate mask zarr, by default None.
+        ``True`` when processing the binned channel.
+    bkg : numpy.ndarray or None, default=None
+        Optional background image to subtract prior to fitting.
+    mask_dir : str or None, default=None
+        Directory containing an externally supplied mask for the tile.
+    tile_name : str or None, default=None
+        Tile identifier used when saving intermediate artifacts.
+    max_slices : int, default=100
+        Maximum number of slices to pass into BasicPy.
+    working_size : int, default=512
+        Working size for BasicPy processing.
+    sort_intensity : bool, default=True
+        Whether to sort frames by intensity before fitting.
+    shuffle_frames : bool, default=False
+        Whether to shuffle the frames randomly prior to fitting.
+    autotune : bool, default=False
+        Enable BasicPy autotuning to determine optimal parameters.
+    results_dir : str or None, default=None
+        Destination directory for any intermediate mask artifacts.
 
     Returns
     -------
     dask.array.Array
-        Corrected volume after applying the BasicPy flatfield fit.
+        Lazily evaluated corrected volume.
     """
     basicpy_res = "0" if is_binned_channel else "3"
     low_res = da.from_zarr(z[basicpy_res]).squeeze().astype(np.float32)
@@ -476,10 +508,28 @@ def flatfield_basicpy(
 
 
 def _preprocess_mask(
-    mask: np.ndarray, low_res_shape: tuple, results_dir: str, tile_name: str
+    mask: np.ndarray,
+    low_res_shape: tuple[int, int, int],
+    results_dir: str,
+    tile_name: str,
 ) -> da.Array:
-    """
-    Upscale and save mask as zarr, then reload as dask array.
+    """Normalize mask shape and persist it as a reusable Zarr array.
+
+    Parameters
+    ----------
+    mask : numpy.ndarray
+        Input mask to be upscaled and stored.
+    low_res_shape : tuple of int
+        Expected shape that matches the low-resolution volume.
+    results_dir : str
+        Directory where the temporary Zarr mask should be written.
+    tile_name : str
+        Identifier used when naming the persisted mask.
+
+    Returns
+    -------
+    dask.array.Array
+        Dask array backed by the stored mask Zarr.
     """
     mask_name = str(Path(results_dir) / f"{tile_name}_mask_low_res.zarr")
     if mask.shape != low_res_shape:
@@ -510,7 +560,41 @@ def _create_mask_artifacts(
     out_probability_path: str,
     overwrite: bool,
 ) -> MaskArtifacts:
-    """Generate probability and mask artifacts for the reference tile."""
+    """Generate mask artifacts and optional probability volumes for a tile.
+
+    Parameters
+    ----------
+    low_res : dask.array.Array
+        Low-resolution stack used for mask inference.
+    z : zarr.hierarchy.Group
+        Zarr hierarchy that contains the tile data.
+    fitting_res : str
+        Resolution key within ``z`` from which the mask is derived.
+    mask_dir : str
+        Directory containing raw mask files.
+    tile_name : str
+        Identifier of the tile driving mask generation.
+    results_dir : str
+        Destination directory for persisted mask artifacts.
+    config : FittingConfig
+        Configuration controlling mask refinement and thresholds.
+    bkg_slices : numpy.ndarray or None
+        Background-dominant slices used for GMM refinement when available.
+    out_probability_path : str
+        Root path where probability volumes are stored.
+    overwrite : bool
+        Whether existing outputs may be replaced.
+
+    Returns
+    -------
+    MaskArtifacts
+        Container with the low-resolution mask suitable for reuse.
+
+    Raises
+    ------
+    ValueError
+        If probability refinement is requested without ``bkg_slices``.
+    """
     _LOGGER.info("Creating mask artifacts using tile %s", tile_name)
     initial_mask = _preprocess_mask(
         size_filter(load_mask_from_dir(mask_dir, tile_name), k_largest=1, min_size=None),
@@ -605,58 +689,52 @@ def flatfield_fitting(
     tile_name: str,
     out_mask_path: str,
     out_probability_path: str,
-    coordinate_transformations: dict,
+    coordinate_transformations: dict[str, Any],
     overwrite: bool,
     n_levels: int,
     config: FittingConfig,
-    results_dir: str = None,
+    results_dir: str | None = None,
     bkg_slices: np.ndarray | None = None,
     mask_artifacts: MaskArtifacts | None = None,
 ) -> tuple[da.Array, dict[str, np.ndarray], MaskArtifacts | None]:
-    """
-    Apply fitting-based flatfield correction to the image using a mask
-    and configurable parameters.
+    """Run the fitting-based flatfield workflow for a single tile.
 
     Parameters
     ----------
     full_res : dask.array.Array
-        Full resolution image as a dask array.
+        Full-resolution volume to correct.
     z : zarr.hierarchy.Group
-        Opened zarr group for the tile.
+        Zarr hierarchy that stores the tile data.
     is_binned_channel : bool
-        Whether the tile is a binned channel.
+        Indicates whether the tile corresponds to the binned channel.
     mask_dir : str
-        Directory containing mask files.
+        Directory containing the initial foreground mask(s).
     tile_name : str
-        Name of the tile being processed.
+        Identifier of the tile being processed.
     out_mask_path : str
-        Output path for the mask zarr.
+        Base path where upscaled masks should be written.
     out_probability_path : str
-        Output path for the probability volume OME-Zarr.
-    coordinate_transformations : dict
-        Dictionary of coordinate transformation parameters.
+        Base path where probability volumes are persisted.
+    coordinate_transformations : dict of str to Any
+        Transformation metadata copied into the OME-NGFF output.
     overwrite : bool
-        Whether to overwrite existing outputs.
+        Whether existing OME-Zarr outputs may be replaced.
     n_levels : int
-        Number of zarr pyramid levels.
+        Number of pyramid levels to generate for outputs.
     config : FittingConfig
-        Validated parameters controlling the fitting workflow.
-    results_dir : str, optional
-        Directory to store intermediate mask zarr, by default None.
-    bkg_slices : numpy.ndarray or None, optional
-        Background-dominated slices from background estimation used to fit
-        the background GMM. When None, probabilities revert to the
-        foreground-only model.
-    mask_artifacts : MaskArtifacts or None, optional
-        Precomputed mask artifacts to reuse across tiles. When None, the
-        artifacts are created using the current tile and returned for reuse.
+        Configuration controlling fitting behaviour and thresholds.
+    results_dir : str or None, default=None
+        Directory used for storing intermediate artifacts.
+    bkg_slices : numpy.ndarray or None, default=None
+        Background-dominant slices leveraged by the optional GMM refinement.
+    mask_artifacts : MaskArtifacts or None, default=None
+        Previously computed mask artifacts to reuse across tiles.
 
     Returns
     -------
     tuple
-        Tuple containing the corrected image, a dictionary of per-axis
-        correction profiles (keys 'x', 'y', 'z'), and any mask artifacts for
-        reuse.
+        ``(corrected_volume, axis_fits, mask_artifacts)`` where
+        ``axis_fits`` maps ``{"x", "y", "z"}`` to their correction curves.
     """
     fitting_res = "0" if is_binned_channel else "3"
     low_res = da.from_zarr(z[fitting_res]).squeeze().astype(np.float32)
@@ -797,25 +875,26 @@ def flatfield_fitting(
 
 
 def save_metadata(
-    data_process,
+    data_process: Any,
     out_path: str,
     tile_name: str,
     tile_path: str,
     results_dir: str,
 ) -> None:
-    """
-    Save process and metadata paths JSON for a tile.
+    """Persist processing metadata alongside the corrected tile outputs.
 
     Parameters
     ----------
     data_process : Any
-        Processing metadata object with a model_dump_json() method.
+        Structured metadata object exposing ``model_dump_json``.
     out_path : str
-        Output zarr path for the tile.
+        Target path of the corrected tile Zarr store.
     tile_name : str
-        Name of the tile being processed.
+        Identifier of the tile being processed.
     tile_path : str
-        Path to the input tile zarr.
+        Source Zarr path for the tile.
+    results_dir : str
+        Directory in which metadata JSON artifacts are saved.
     """
     process_json = data_process.model_dump_json()
     process_json_path = str(
@@ -849,28 +928,26 @@ def save_method_outputs(
     save_outputs: bool,
     bkg: np.ndarray | None = None,
     bkg_slices: np.ndarray | None = None,
-    artifacts: dict | None = None,
+    artifacts: dict[str, Any] | None = None,
 ) -> None:
-    """
-    Save method-specific QC/debug outputs.
+    """Persist optional QC artifacts for the specified correction method.
 
     Parameters
     ----------
     method : str
-        The correction method used (e.g., 'fitting', 'basicpy', 'reference').
+        Correction method identifier (e.g., ``"fitting"``).
     tile_name : str
-        Current tile name for filenames.
+        Name of the tile being processed.
     results_dir : str
-        Directory to write outputs.
+        Directory where QC artifacts should be written.
     save_outputs : bool
-        Gate to enable/disable saving.
-    bkg : np.ndarray or None
-        Background image (if computed).
-    bkg_slices : np.ndarray or None
-        Stack of background-dominated slices used for GMM fitting.
-    artifacts : dict or None
-        Method-specific artifacts; for 'fitting' expects keys such as
-        axis_fits, fit_x, fit_y, fit_z.
+        Flag that enables or skips artifact persistence.
+    bkg : numpy.ndarray or None, default=None
+        Estimated background image for the tile.
+    bkg_slices : numpy.ndarray or None, default=None
+        Background-dominated slices used to fit probabilistic models.
+    artifacts : dict of str to Any or None, default=None
+        Additional method-specific artifacts to serialize.
     """
     if not save_outputs or results_dir is None:
         return
@@ -966,8 +1043,12 @@ def get_channel_resolution(
 
 
 def set_dask_config(results_dir: str):
-    """
-    Set Dask configuration for memory management and temporary directory.
+    """Configure Dask memory thresholds and scratch directory.
+
+    Parameters
+    ----------
+    results_dir : str
+        Directory in which the Dask temporary folder will be created.
     """
     dask_tmp_dir = os.path.join(results_dir, "dask-tmp")
     dask.config.set(
@@ -1087,19 +1168,17 @@ def parse_and_validate_args() -> argparse.Namespace:
 
 
 def create_mask_path(out_zarr_path: str) -> str:
-    """
-    Create the corresponding output mask path for
-    the input zarr image.
+    """Derive the OME-Zarr mask output path from the corrected dataset path.
 
     Parameters
-    -------
-    out_zarr_path: str
-        The output path for the corrected zarr dataset
+    ----------
+    out_zarr_path : str
+        Path to the corrected OME-Zarr dataset.
 
     Returns
     -------
     str
-        The mask path for the corrected zarr dataset
+        Path pointing to the associated mask dataset.
     """
     out_zarr_folder = Path(out_zarr_path).name
     out_mask_path = out_zarr_path.replace(
@@ -1109,7 +1188,18 @@ def create_mask_path(out_zarr_path: str) -> str:
 
 
 def create_probability_path(out_zarr_path: str) -> str:
-    """Derive the output path for storing probability volumes as OME-Zarr."""
+    """Derive the probability volume output path from the corrected dataset.
+
+    Parameters
+    ----------
+    out_zarr_path : str
+        Path to the corrected OME-Zarr dataset.
+
+    Returns
+    -------
+    str
+        Path pointing to the probability-volume dataset.
+    """
 
     out_zarr_folder = Path(out_zarr_path).name
     return out_zarr_path.replace(
@@ -1118,11 +1208,7 @@ def create_probability_path(out_zarr_path: str) -> str:
 
 
 def main() -> None:
-    """
-    Main entry point for the flatfield correction pipeline.
-    Parses arguments, sets up Dask, processes each tile,
-    and saves results and metadata.
-    """
+    """Execute the flatfield correction pipeline for the requested tiles."""
     args = parse_and_validate_args()
     _LOGGER.setLevel(args.log_level)
 
