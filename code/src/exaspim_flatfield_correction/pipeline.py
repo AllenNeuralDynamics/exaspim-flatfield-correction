@@ -1322,7 +1322,7 @@ def main() -> None:
             fitting_config.median_summary_path = Path(args.median_summary_path)
         # dump to results folder
         fitting_config.to_file(
-            os.path.join(results_dir, "fitting_config.json")
+            os.path.join(results_dir, f"fitting_config_{tile_name_for_artifacts}.json")
         )
         median_summary = read_median_intensity_summary(
             fitting_config.median_summary_path
