@@ -38,7 +38,6 @@ from exaspim_flatfield_correction.utils.mask_utils import (
     calc_percentile_weight,
     size_filter,
     upscale_mask_nearest,
-    get_mask,
 )
 from exaspim_flatfield_correction.utils.zarr_utils import (
     store_ome_zarr,
