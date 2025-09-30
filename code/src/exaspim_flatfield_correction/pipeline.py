@@ -893,8 +893,160 @@ def save_method_outputs(
         )
 
 
+def process_tile(
+    tile_path: str,
+    *,
+    args: argparse.Namespace,
+    method: str,
+    res: str,
+    binned_channel: str | None,
+    binned_res: str,
+    results_dir: str,
+    out_path: str,
+    out_mask_path: str,
+    out_probability_path: str,
+    data_process: Any,
+    fitting_config: FittingConfig | None,
+    median_summary: dict[str, float],
+    mask_artifacts: MaskArtifacts | None,
+) -> MaskArtifacts | None:
+    """Execute the flatfield pipeline for a single tile and persist outputs."""
+
+    tile_name = Path(tile_path).name
+    _LOGGER.info(f"Processing tile: {tile_name}")
+    report_path = os.path.join(results_dir, f"dask-report_{tile_name}.html")
+
+    with performance_report(filename=report_path):
+        try:
+            if args.is_binned:
+                is_binned_channel = True
+                resolution = "0"
+            else:
+                is_binned_channel, resolution = get_channel_resolution(
+                    tile_name, binned_channel, binned_res, res
+                )
+            _LOGGER.info(f"{tile_name} is binned: {is_binned_channel}")
+
+            z = zarr.open(tile_path, mode="r")
+            coordinate_transformations = parse_ome_zarr_transformations(
+                z, resolution
+            )
+            _LOGGER.info(
+                f"Coordinate transformations: {coordinate_transformations}"
+            )
+
+            full_res = da.from_zarr(z[resolution]).squeeze().astype(np.float32)
+            _LOGGER.info(f"Full resolution array shape: {full_res.shape}")
+
+            bkg = None
+            bkg_slice_indices = None
+            if not args.skip_bkg_sub:
+                _LOGGER.info("Performing background subtraction")
+                full_res, bkg, bkg_slice_indices = background_subtraction(
+                    tile_path,
+                    full_res,
+                    z,
+                    is_binned_channel,
+                    args.use_reference_bkg,
+                )
+
+            axis_fits = None
+            if not args.skip_flat_field:
+                if method == "reference":
+                    corrected = flatfield_reference(full_res, args.flatfield_path)
+                elif method == "basicpy":
+                    corrected = flatfield_basicpy(
+                        full_res,
+                        z,
+                        is_binned_channel,
+                        bkg,
+                        args.mask_dir,
+                        tile_name,
+                        results_dir=results_dir,
+                    )
+                elif method == "fitting":
+                    if fitting_config is None:
+                        raise ValueError("Fitting configuration failed to initialize")
+                    if bkg is None or bkg_slice_indices is None:
+                        raise ValueError(
+                            "Fitting method requires background subtraction. "
+                            "Ensure background estimation is executed before fitting."
+                        )
+                    apply_median_summary_override(
+                        fitting_config,
+                        median_summary,
+                        tile_name,
+                        is_binned_channel=is_binned_channel,
+                        binned_channel=binned_channel,
+                    )
+                    corrected, axis_fits, mask_artifacts = flatfield_fitting(
+                        full_res,
+                        z,
+                        is_binned_channel,
+                        args.mask_dir,
+                        tile_name,
+                        out_mask_path,
+                        out_probability_path,
+                        coordinate_transformations,
+                        args.overwrite,
+                        args.n_levels,
+                        fitting_config,
+                        results_dir=results_dir,
+                        bkg=bkg,
+                        bkg_slice_indices=bkg_slice_indices,
+                        mask_artifacts=mask_artifacts,
+                    )
+                else:
+                    _LOGGER.error(f"Invalid method: {method}")
+                    raise ValueError(f"Invalid method: {method}")
+            else:
+                corrected = full_res
+
+            corrected = corrected.astype(np.uint16)
+            _LOGGER.info(f"Corrected array dtype: {corrected.dtype}")
+
+            t0 = time.time()
+            _LOGGER.info(f"Storing OME-Zarr for tile {tile_name}")
+            store_ome_zarr(
+                corrected,
+                out_path.rstrip("/") + f"/{tile_name}",
+                args.n_levels,
+                coordinate_transformations["scale"][-3:],
+                coordinate_transformations["translation"],
+                overwrite=args.overwrite,
+                write_empty_chunks=True,
+            )
+            _LOGGER.info(f"Storing OME-Zarr took {time.time() - t0:.2f}s")
+
+            artifacts = None
+            if method == "fitting":
+                artifacts = {"axis_fits": axis_fits}
+
+            save_method_outputs(
+                method,
+                tile_name,
+                results_dir,
+                args.save_outputs,
+                bkg=bkg,
+                bkg_slice_indices=bkg_slice_indices,
+                artifacts=artifacts,
+            )
+
+            data_process.end_date_time = datetime.now()
+            save_metadata(
+                data_process, out_path, tile_name, tile_path, results_dir
+            )
+        except Exception as exc:  # noqa: BLE001
+            _LOGGER.error(
+                f"Error processing tile {tile_name}: {exc}", exc_info=True
+            )
+            raise
+
+    return mask_artifacts
+
+
 def get_channel_resolution(
-    tile_name: str, binned_channel: str, binned_res: str, res: str
+    tile_name: str, binned_channel: str | None, binned_res: str, res: str
 ) -> tuple[bool, str]:
     """
     Determine if the tile is a binned channel and select the appropriate
@@ -904,8 +1056,8 @@ def get_channel_resolution(
     ----------
     tile_name : str
         Name of the tile being processed.
-    binned_channel : str
-        Name of the binned channel pattern.
+    binned_channel : str or None
+        Name of the binned channel pattern, if available.
     binned_res : str
         Resolution to use for binned channels.
     res : str
@@ -1183,145 +1335,22 @@ def main() -> None:
             )
 
     for tile_path in tile_paths:
-        tile_name = Path(tile_path).name
-        _LOGGER.info(f"Processing tile: {tile_name}")
-        with performance_report(
-            filename=os.path.join(results_dir, f"dask-report_{tile_name}.html")
-        ):
-            try:
-                if args.is_binned:
-                    is_binned_channel = True
-                    resolution = "0"
-                else:
-                    is_binned_channel, resolution = get_channel_resolution(
-                        tile_name, binned_channel, binned_res, res
-                    )
-                _LOGGER.info(f"{tile_name} is binned: {is_binned_channel}")
-                z = zarr.open(tile_path, mode="r")
-                coordinate_transformations = parse_ome_zarr_transformations(
-                    z, resolution
-                )
-                _LOGGER.info(
-                    f"Coordinate transformations: {coordinate_transformations}"
-                )
-
-                full_res = (
-                    da.from_zarr(z[resolution]).squeeze().astype(np.float32)
-                )
-                _LOGGER.info(f"Full resolution array shape: {full_res.shape}")
-
-                bkg = None
-                bkg_slice_indices = None
-                if not args.skip_bkg_sub:
-                    _LOGGER.info("Performing background subtraction")
-                    full_res, bkg, bkg_slice_indices = background_subtraction(
-                        tile_path,
-                        full_res,
-                        z,
-                        is_binned_channel,
-                        args.use_reference_bkg,
-                    )
-                    # Background QC saving is centralized at the end per method
-
-                axis_fits = None
-                if not args.skip_flat_field:
-                    if method == "reference":
-                        corrected = flatfield_reference(
-                            full_res, args.flatfield_path
-                        )
-                    elif method == "basicpy":
-                        corrected = flatfield_basicpy(
-                            full_res,
-                            z,
-                            is_binned_channel,
-                            bkg,
-                            args.mask_dir,
-                            tile_name,
-                            results_dir=results_dir,
-                        )
-                    elif method == "fitting":
-                        if fitting_config is None:
-                            raise ValueError(
-                                "Fitting configuration failed to initialize"
-                            )
-                        if bkg is None or bkg_slice_indices is None:
-                            raise ValueError(
-                                "Fitting method requires background subtraction. "
-                                "Ensure background estimation is executed before fitting."
-                            )
-                        apply_median_summary_override(
-                            fitting_config,
-                            median_summary,
-                            tile_name,
-                            is_binned_channel=is_binned_channel,
-                            binned_channel=binned_channel,
-                        )
-                        corrected, axis_fits, mask_artifacts = (
-                            flatfield_fitting(
-                                full_res,
-                                z,
-                                is_binned_channel,
-                                args.mask_dir,
-                                tile_name,
-                                out_mask_path,
-                                out_probability_path,
-                                coordinate_transformations,
-                                args.overwrite,
-                                args.n_levels,
-                                fitting_config,
-                                results_dir=results_dir,
-                                bkg=bkg,
-                                bkg_slice_indices=bkg_slice_indices,
-                                mask_artifacts=mask_artifacts,
-                            )
-                        )
-                    else:
-                        _LOGGER.error(f"Invalid method: {method}")
-                        raise ValueError(f"Invalid method: {method}")
-                else:
-                    corrected = full_res
-
-                corrected = corrected.astype(np.uint16)
-                _LOGGER.info(f"Corrected array dtype: {corrected.dtype}")
-
-                t0 = time.time()
-                _LOGGER.info(f"Storing OME-Zarr for tile {tile_name}")
-                store_ome_zarr(
-                    corrected,
-                    out_path.rstrip("/") + f"/{tile_name}",
-                    args.n_levels,
-                    coordinate_transformations["scale"][-3:],
-                    coordinate_transformations["translation"],
-                    overwrite=args.overwrite,
-                    write_empty_chunks=True,
-                )
-                _LOGGER.info(f"Storing OME-Zarr took {time.time() - t0:.2f}s")
-
-                # Centralized, method-aware saving of QC outputs
-                artifacts = None
-                if method == "fitting":
-                    artifacts = {
-                        "axis_fits": axis_fits,
-                    }
-                save_method_outputs(
-                    method,
-                    tile_name,
-                    results_dir,
-                    args.save_outputs,
-                    bkg=bkg,
-                    bkg_slice_indices=bkg_slice_indices,
-                    artifacts=artifacts,
-                )
-
-                data_process.end_date_time = datetime.now()
-                save_metadata(
-                    data_process, out_path, tile_name, tile_path, results_dir
-                )
-            except Exception as e:
-                _LOGGER.error(
-                    f"Error processing tile {tile_name}: {e}", exc_info=True
-                )
-                raise
+        mask_artifacts = process_tile(
+            tile_path,
+            args=args,
+            method=method,
+            res=res,
+            binned_channel=binned_channel,
+            binned_res=binned_res,
+            results_dir=results_dir,
+            out_path=out_path,
+            out_mask_path=out_mask_path,
+            out_probability_path=out_probability_path,
+            data_process=data_process,
+            fitting_config=fitting_config,
+            median_summary=median_summary,
+            mask_artifacts=mask_artifacts,
+        )
 
     if artifacts_destination:
         upload_artifacts(results_dir, artifacts_destination)
