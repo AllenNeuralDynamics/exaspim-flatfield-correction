@@ -282,41 +282,43 @@ def masked_axis_profile(
     if percentile is None:
         percentile = 50
 
-    volume_da = da.asarray(volume, dtype=np.float32)
-    mask_da = da.asarray(mask, dtype=bool)
+    if isinstance(volume, da.Array):
+        volume_np = volume.astype(np.float32).compute()
+    else:
+        volume_np = np.asarray(volume, dtype=np.float32)
 
-    if volume_da.shape != mask_da.shape:
+    if isinstance(mask, da.Array):
+        mask_np = mask.astype(bool).compute()
+    else:
+        mask_np = np.asarray(mask, dtype=bool)
+
+    if volume_np.shape != mask_np.shape:
         raise ValueError("volume and mask must have the same shape")
 
     axes = tuple(dict.fromkeys(axes))
     if not axes:
         return {}, float("nan")
 
-    axis_lengths = {axis: mask_da.shape[axis] for axis in axes}
-
-    masked = da.where(mask_da, volume_da, np.nan)
-    # Unfortunately, da.nanpercentile does not support axis=None.
-    global_med = np.nanpercentile(masked.compute(), percentile)
-
-    profile_tasks: list[da.Array] = []
+    axis_lengths: dict[int, int] = {}
     for axis in axes:
-        if axis < 0 or axis >= mask_da.ndim:
+        if axis < 0 or axis >= mask_np.ndim:
             raise ValueError(
-                f"Axis {axis} is out of bounds for array of ndim {mask_da.ndim}"
+                f"Axis {axis} is out of bounds for array of ndim {mask_np.ndim}"
             )
-        reduce_axes = tuple(i for i in range(mask_da.ndim) if i != axis)
-        coverage = mask_da.sum(axis=reduce_axes)
-        profile = da.nanpercentile(masked, percentile, axis=reduce_axes)
-        profile = da.where(da.isnan(profile), global_med, profile)
-        if min_voxels:
-            profile = da.where(coverage >= min_voxels, profile, global_med)
-        profile_tasks.append(profile.astype(np.float32, copy=False))
+        axis_lengths[axis] = mask_np.shape[axis]
 
-    # Evaluate the global percentile and all axis profiles in one graph traversal,
-    # so the masked volume is only materialised once.
-    computed = da.compute(global_med, *profile_tasks)
-    global_med_value = float(computed[0])
-    profile_arrays = computed[1:]
+    masked = np.where(mask_np, volume_np, np.nan)
+    global_med_value = float(np.nanpercentile(masked, percentile))
+
+    profiles: dict[int, np.ndarray] = {}
+    for axis in axes:
+        reduce_axes = tuple(i for i in range(mask_np.ndim) if i != axis)
+        coverage = mask_np.sum(axis=reduce_axes)
+        profile = np.nanpercentile(masked, percentile, axis=reduce_axes)
+        profile = np.where(np.isnan(profile), global_med_value, profile)
+        if min_voxels:
+            profile = np.where(coverage >= min_voxels, profile, global_med_value)
+        profiles[axis] = np.asarray(profile, dtype=np.float32)
 
     results: dict[int, np.ndarray] = {}
     if not np.isfinite(global_med_value) or global_med_value <= 0:
@@ -324,15 +326,13 @@ def masked_axis_profile(
             results[axis] = np.ones(axis_len, dtype=np.float32)
         return results, 0.0
 
-    for axis, profile_np in zip(axes, profile_arrays):
-        profile_np = np.asarray(profile_np, dtype=np.float32)
+    for axis, profile_np in profiles.items():
+        smoothed = profile_np
         if smooth_sigma and smooth_sigma > 0:
-            profile_np = gaussian_filter1d(
-                profile_np, sigma=smooth_sigma, mode="nearest"
+            smoothed = gaussian_filter1d(
+                smoothed, sigma=smooth_sigma, mode="nearest"
             )
-        norm_profile = (profile_np / global_med_value).astype(
-            np.float32, copy=False
-        )
+        norm_profile = (smoothed / global_med_value).astype(np.float32, copy=False)
         results[axis] = norm_profile
 
     return results, global_med_value
