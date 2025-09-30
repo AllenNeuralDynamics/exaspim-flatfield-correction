@@ -326,9 +326,8 @@ def calc_percentile_weight(
     """
 
     img = da.asarray(img_da, dtype=np.float32)
-    background = da.asarray(bg_da, dtype=np.float32)
 
-    percentiles = da.percentile(background, [low_percentile, high_percentile]).compute()
+    percentiles = np.percentile(bg_da, [low_percentile, high_percentile])
     p_low = float(percentiles[0])
     p_high = float(percentiles[1])
 

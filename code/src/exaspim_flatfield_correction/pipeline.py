@@ -514,7 +514,7 @@ def _create_mask_artifacts(
     probability_volume: da.Array | None = None
     if config.enable_gmm_refinement:
         slice_indices = np.asarray(bkg_slice_indices, dtype=np.int64)
-        bg_reference = da.take(low_res, slice_indices, axis=0)
+        bg_reference = da.take(low_res, slice_indices, axis=0).compute()
 
         _LOGGER.info(
             "Computing percentile-based probability weights (low=%.1f, high=%.1f, eps=%.3f)",
