@@ -58,6 +58,8 @@ from exaspim_flatfield_correction.utils.utils import (
 from exaspim_flatfield_correction.config import (
     FittingConfig,
     load_fitting_config,
+    read_median_intensity_summary,
+    apply_median_summary_override,
 )
 
 
@@ -66,9 +68,6 @@ logging.basicConfig(
     datefmt="%d-%b-%y %H:%M:%S",
 )
 _LOGGER = logging.getLogger(__name__)
-
-DEFAULT_MEDIAN_SUMMARY_PATH = Path("/data/median_intensity_summary.json")
-
 
 @dataclass
 class MaskArtifacts:
@@ -90,120 +89,6 @@ def _spatial_chunks(arr: da.Array) -> tuple[int, ...]:
     if arr.ndim < 2:
         return (int(arr.chunks[-1][0]),)
     return tuple(int(axis_chunks[0]) for axis_chunks in arr.chunks[-2:])
-
-
-def read_median_intensity_summary(path: Path) -> dict[str, float]:
-    """Load per-channel normalization targets from disk.
-
-    Parameters
-    ----------
-    path : pathlib.Path
-        Filesystem path pointing to ``median_intensity_summary.json``.
-
-    Returns
-    -------
-    dict of str to float
-        Mapping from channel identifiers to their ``mean_of_medians`` value.
-
-    Notes
-    -----
-    The function logs and skips channels that are missing or have
-    non-numeric ``mean_of_medians`` entries.
-    """
-    if not path.exists():
-        return {}
-
-    try:
-        data = json.loads(path.read_text())
-    except Exception:
-        _LOGGER.exception("Failed to read median intensity summary at %s", path)
-        return {}
-
-    overrides: dict[str, float] = {}
-    for channel, payload in data.items():
-        mean_value = None
-        if isinstance(payload, dict):
-            mean_value = payload.get("mean_of_medians")
-        if mean_value is None:
-            _LOGGER.warning(
-                "Skipping channel %s in %s: missing mean_of_medians",
-                channel,
-                path,
-            )
-            continue
-        try:
-            overrides[str(channel)] = float(mean_value)
-        except (TypeError, ValueError):
-            _LOGGER.warning(
-                "Skipping channel %s in %s: mean_of_medians=%r is not numeric",
-                channel,
-                path,
-                mean_value,
-            )
-    return overrides
-
-
-def apply_median_summary_override(
-    fitting_config: FittingConfig,
-    median_summary: dict[str, float],
-    tile_name: str,
-    *,
-    is_binned_channel: bool,
-    binned_channel: str | None,
-) -> None:
-    """Update global correction factors using the summary file when possible.
-
-    Parameters
-    ----------
-    fitting_config : FittingConfig
-        Mutable fitting configuration to update in-place.
-    median_summary : dict of str to float
-        Channel-to-``mean_of_medians`` mapping loaded from disk.
-    tile_name : str
-        Name of the tile currently being processed.
-    is_binned_channel : bool
-        Whether the tile corresponds to the binned channel.
-    binned_channel : str or None
-        Identifier of the binned channel, when known.
-    """
-    if not median_summary:
-        return
-
-    override_value: float | None = None
-    binned_key = str(binned_channel) if binned_channel else None
-
-    if is_binned_channel and binned_key:
-        override_value = median_summary.get(binned_key)
-    elif not is_binned_channel:
-        tile_lower = tile_name.lower()
-        for channel, value in median_summary.items():
-            if channel == binned_key:
-                continue
-            if channel.lower() in tile_lower:
-                override_value = value
-                break
-        if override_value is None:
-            for channel, value in median_summary.items():
-                if channel != binned_key:
-                    override_value = value
-                    break
-
-    if override_value is None:
-        return
-
-    if is_binned_channel:
-        if fitting_config.global_factor_binned != override_value:
-            _LOGGER.info(
-                "Overriding binned global factor with %.4f", override_value
-            )
-        fitting_config.global_factor_binned = override_value
-    else:
-        if fitting_config.global_factor_unbinned != override_value:
-            _LOGGER.info(
-                "Overriding unbinned global factor with %.4f", override_value
-            )
-        fitting_config.global_factor_unbinned = override_value
-
 
 def get_mem_limit() -> int | str:
     """Return the memory limit to pass into ``LocalCluster``.
@@ -1143,10 +1028,11 @@ def parse_and_validate_args() -> argparse.Namespace:
     parser.add_argument(
         "--median-summary-path",
         type=str,
-        default=str(DEFAULT_MEDIAN_SUMMARY_PATH),
+        default=None,
         help=(
-            "Path to JSON file containing per-channel mean_of_medians values "
-            "for global normalization (default: /data/median_intensity_summary.json)."
+            "Path to a JSON file containing per-channel mean_of_medians values "
+            "for global normalization. Overrides the value stored in the fitting "
+            "configuration when provided."
         ),
     )
     args = parser.parse_args()
@@ -1220,8 +1106,6 @@ def main() -> None:
     res = params["res"]
     binned_channel = params["binned_channel"]
 
-    median_summary_path = Path(args.median_summary_path)
-
     results_dir = args.results_dir
     if not os.path.exists(results_dir):
         os.makedirs(results_dir, exist_ok=True)
@@ -1283,11 +1167,15 @@ def main() -> None:
         fitting_config = load_fitting_config(args.fitting_config)
         if args.fitting_config:
             _LOGGER.info("Loaded fitting config from %s", args.fitting_config)
+        if args.median_summary_path:
+            fitting_config.median_summary_path = Path(args.median_summary_path)
         # dump to results folder
         fitting_config.to_file(
             os.path.join(results_dir, "fitting_config.json")
         )
-        median_summary = read_median_intensity_summary(median_summary_path)
+        median_summary = read_median_intensity_summary(
+            fitting_config.median_summary_path
+        )
         if median_summary:
             _LOGGER.info(
                 "Loaded median intensity overrides for channels: %s",

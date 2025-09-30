@@ -6,7 +6,11 @@ import json
 from pathlib import Path
 from typing import Any
 
+import logging
+
 from pydantic import BaseModel, ConfigDict, Field
+
+_LOGGER = logging.getLogger(__name__)
 
 
 class FittingConfig(BaseModel):
@@ -154,6 +158,13 @@ class FittingConfig(BaseModel):
             "weight volume."
         ),
     )
+    median_summary_path: Path | None = Field(
+        default=None,
+        description=(
+            "Optional path to a JSON file with per-channel mean_of_medians "
+            "values for overriding global normalization factors."
+        ),
+    )
     enable_gmm_refinement: bool = Field(
         default=False,
         description=(
@@ -209,7 +220,7 @@ class FittingConfig(BaseModel):
     def to_file(self, path: str | Path, *, indent: int = 2) -> None:
         """Serialize the configuration to JSON on disk."""
 
-        payload = json.dumps(self.model_dump(), indent=indent)
+        payload = json.dumps(self.model_dump(mode="json"), indent=indent)
         Path(path).write_text(payload)
 
 
@@ -219,3 +230,114 @@ def load_fitting_config(path: str | Path | None = None) -> FittingConfig:
     if path is None:
         return FittingConfig()
     return FittingConfig.from_file(path)
+
+
+def read_median_intensity_summary(
+    path: str | Path | None,
+) -> dict[str, float]:
+    """Load per-channel normalization targets from disk.
+
+    Parameters
+    ----------
+    path : str or pathlib.Path or None
+        Filesystem path pointing to ``median_intensity_summary.json``. When
+        ``None``, the function returns an empty mapping.
+
+    Returns
+    -------
+    dict of str to float
+        Mapping from channel identifiers to their ``mean_of_medians`` value.
+
+    Notes
+    -----
+    The function logs and skips channels that are missing or have
+    non-numeric ``mean_of_medians`` entries.
+    """
+
+    if path is None:
+        return {}
+
+    summary_path = Path(path)
+    if not summary_path.exists():
+        _LOGGER.debug("Median intensity summary not found at %s", summary_path)
+        return {}
+
+    try:
+        data = json.loads(summary_path.read_text())
+    except Exception:  # noqa: BLE001 - want to log previously unseen errors
+        _LOGGER.exception(
+            "Failed to read median intensity summary at %s", summary_path
+        )
+        return {}
+
+    overrides: dict[str, float] = {}
+    for channel, payload in data.items():
+        mean_value = None
+        if isinstance(payload, dict):
+            mean_value = payload.get("mean_of_medians")
+        if mean_value is None:
+            _LOGGER.warning(
+                "Skipping channel %s in %s: missing mean_of_medians",
+                channel,
+                summary_path,
+            )
+            continue
+        try:
+            overrides[str(channel)] = float(mean_value)
+        except (TypeError, ValueError):
+            _LOGGER.warning(
+                "Skipping channel %s in %s: mean_of_medians=%r is not numeric",
+                channel,
+                summary_path,
+                mean_value,
+            )
+    return overrides
+
+
+def apply_median_summary_override(
+    fitting_config: FittingConfig,
+    median_summary: dict[str, float],
+    tile_name: str,
+    *,
+    is_binned_channel: bool,
+    binned_channel: str | None,
+) -> None:
+    """Update global correction factors using the summary file when possible."""
+
+    if not median_summary:
+        return
+
+    override_value: float | None = None
+    binned_key = str(binned_channel) if binned_channel else None
+
+    if is_binned_channel and binned_key:
+        override_value = median_summary.get(binned_key)
+    elif not is_binned_channel:
+        tile_lower = tile_name.lower()
+        for channel, value in median_summary.items():
+            if channel == binned_key:
+                continue
+            if channel.lower() in tile_lower:
+                override_value = value
+                break
+        if override_value is None:
+            for channel, value in median_summary.items():
+                if channel != binned_key:
+                    override_value = value
+                    break
+
+    if override_value is None:
+        return
+
+    if is_binned_channel:
+        if fitting_config.global_factor_binned != override_value:
+            _LOGGER.info(
+                "Overriding binned global factor with %.4f", override_value
+            )
+        fitting_config.global_factor_binned = override_value
+    else:
+        if fitting_config.global_factor_unbinned != override_value:
+            _LOGGER.info(
+                "Overriding unbinned global factor with %.4f", override_value
+            )
+        fitting_config.global_factor_unbinned = override_value
