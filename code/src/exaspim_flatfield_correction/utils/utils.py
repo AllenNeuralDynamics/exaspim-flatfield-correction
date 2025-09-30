@@ -1,5 +1,7 @@
 import io
+import logging
 import re
+import subprocess
 from pathlib import Path
 
 import boto3
@@ -12,6 +14,8 @@ import matplotlib
 
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
+
+_LOGGER = logging.getLogger(__name__)
 
 
 def compose_image(
@@ -181,6 +185,42 @@ def read_bkg_image(s3_url: str) -> np.ndarray:
     tiff_file_content = response["Body"].read()
     numpy_array = tifffile.imread(io.BytesIO(tiff_file_content))
     return numpy_array
+
+
+def upload_artifacts(results_dir: str, destination: str) -> None:
+    """Upload local artifacts to an S3 destination using the AWS CLI.
+
+    Parameters
+    ----------
+    results_dir : str
+        Local directory containing the artifacts to upload.
+    destination : str
+        Target S3 URI where the artifacts should be copied.
+
+    Raises
+    ------
+    subprocess.CalledProcessError
+        If the AWS CLI copy command fails.
+    """
+
+    _LOGGER.info("Uploading artifacts from %s to %s", results_dir, destination)
+    try:
+        subprocess.run(
+            [
+                "aws",
+                "s3",
+                "cp",
+                "--recursive",
+                results_dir,
+                destination,
+            ],
+            check=True,
+        )
+    except subprocess.CalledProcessError:
+        _LOGGER.error(
+            "Failed to upload artifacts to %s", destination, exc_info=True
+        )
+        raise
 
 
 def get_bkg_path(raw_tile_path: str) -> str:

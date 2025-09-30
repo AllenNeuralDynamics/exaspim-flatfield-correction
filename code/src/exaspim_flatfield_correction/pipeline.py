@@ -5,7 +5,6 @@ import time
 import json
 import argparse
 import logging
-import subprocess
 from pathlib import Path
 from datetime import datetime
 from dataclasses import dataclass
@@ -54,6 +53,7 @@ from exaspim_flatfield_correction.utils.utils import (
     get_bkg_path,
     resize,
     save_correction_curve_plot,
+    upload_artifacts,
 )
 from exaspim_flatfield_correction.config import (
     FittingConfig,
@@ -1324,30 +1324,7 @@ def main() -> None:
                 raise
 
     if artifacts_destination:
-        try:
-            _LOGGER.info(
-                "Uploading artifacts from %s to %s",
-                results_dir,
-                artifacts_destination,
-            )
-            subprocess.run(
-                [
-                    "aws",
-                    "s3",
-                    "cp",
-                    "--recursive",
-                    results_dir,
-                    artifacts_destination,
-                ],
-                check=True,
-            )
-        except subprocess.CalledProcessError as exc:
-            _LOGGER.error(
-                "Failed to upload artifacts to %s",
-                artifacts_destination,
-                exc_info=True,
-            )
-            raise
+        upload_artifacts(results_dir, artifacts_destination)
 
 
 if __name__ == "__main__":
