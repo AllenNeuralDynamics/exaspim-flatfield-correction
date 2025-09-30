@@ -33,8 +33,8 @@ def estimate_bkg(
     -------
     tuple[np.ndarray, np.ndarray]
         Tuple where the first element is the estimated 2D background (median
-        across z) and the second element is the filtered stack of background
-        slices used for subsequent modelling.
+        across z) and the second element is the indices of slices retained for
+        background modeling.
     """
 
     # -- Sanity checks --
@@ -47,8 +47,10 @@ def estimate_bkg(
     std_z = np.std(im, axis=(1, 2))
     slice_mask = std_z <= np.percentile(std_z, 5)
 
+    retained_indices = np.flatnonzero(slice_mask)
     im = im[slice_mask, :, :]  # shape now could be (z', y, x)
     initial = im.copy()
+    initial_indices = retained_indices.copy()
 
     # Iterative outlier-slice removal
     for _ in range(n_iter):
@@ -68,6 +70,7 @@ def estimate_bkg(
         inds_remove = frac_high > prob_thresh
 
         keep_mask = ~inds_remove
+        retained_indices = retained_indices[keep_mask]
         im = im[keep_mask, :, :]
 
         if np.mean(inds_remove) < 0.0001:
@@ -79,10 +82,11 @@ def estimate_bkg(
             "Could not estimate background from tile, using initial guess."
         )
         im = initial
+        retained_indices = initial_indices
 
     mu_final = np.median(im, axis=0).astype(np.float32)  # (y, x)
 
-    return mu_final, im
+    return mu_final, retained_indices.astype(np.int64, copy=False)
 
 
 def subtract_bkg(im: da.Array, bkg_da: da.Array) -> da.Array:

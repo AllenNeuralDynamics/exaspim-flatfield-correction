@@ -32,11 +32,11 @@ from exaspim_flatfield_correction.fitting import (
     compute_axis_fits,
 )
 from exaspim_flatfield_correction.background import (
-    estimate_bkg, 
+    estimate_bkg,
     subtract_bkg,
 )
 from exaspim_flatfield_correction.utils.mask_utils import (
-    calc_gmm_prob,
+    calc_percentile_weight,
     size_filter,
     upscale_mask_nearest,
     get_mask,
@@ -75,6 +75,7 @@ class MaskArtifacts:
     """Container for cached mask artifacts reused within the pipeline."""
 
     mask_low_res: da.Array
+    probability_volume: da.Array | None = None
 
 
 def _array_chunks(arr: da.Array) -> tuple[int, ...]:
@@ -382,19 +383,19 @@ def background_subtraction(
     Returns
     -------
     tuple
-        ``(full_res_corrected, background_image, background_slices)`` where
-        ``background_slices`` may be ``None`` if no probabilistic model is
-        required.
+        ``(full_res_corrected, background_image, background_slice_indices)``
+        where ``background_slice_indices`` may be ``None`` if no probabilistic
+        model is required.
     """
     if use_reference_bkg:
         bkg_path = get_bkg_path(tile_path)
         bkg = read_bkg_image(bkg_path).astype(np.float32)
-        bkg_slices = None
+        bkg_slice_indices = None
     else:
         bkg_res = "0" if is_binned_channel else "3"
         _LOGGER.info(f"Using resolution {bkg_res} for background estimation")
         low_res = da.from_zarr(z[bkg_res]).squeeze().astype(np.float32)
-        bkg, bkg_slices = estimate_bkg(
+        bkg, bkg_slice_indices = estimate_bkg(
             gaussian_filter_dask(low_res, sigma=1).compute()
         )
 
@@ -404,7 +405,7 @@ def background_subtraction(
             resize(bkg, full_res.shape[1:]), chunks=full_res.chunksize[1:]
         ),
     )
-    return full_res, bkg, bkg_slices
+    return full_res, bkg, bkg_slice_indices
 
 
 def flatfield_reference(full_res: da.Array, flatfield_path: str) -> da.Array:
@@ -579,7 +580,7 @@ def _create_mask_artifacts(
     tile_name: str,
     results_dir: str,
     config: FittingConfig,
-    bkg_slices: np.ndarray | None,
+    bkg_slice_indices: np.ndarray,
     out_probability_path: str,
     overwrite: bool,
 ) -> MaskArtifacts:
@@ -601,8 +602,9 @@ def _create_mask_artifacts(
         Destination directory for persisted mask artifacts.
     config : FittingConfig
         Configuration controlling mask refinement and thresholds.
-    bkg_slices : numpy.ndarray or None
-        Background-dominant slices used for GMM refinement when available.
+    bkg_slice_indices : numpy.ndarray
+        Indices of background-dominant slices used when estimating background
+        statistics for the probability volume.
     out_probability_path : str
         Root path where probability volumes are stored.
     overwrite : bool
@@ -613,10 +615,6 @@ def _create_mask_artifacts(
     MaskArtifacts
         Container with the low-resolution mask suitable for reuse.
 
-    Raises
-    ------
-    ValueError
-        If probability refinement is requested without ``bkg_slices``.
     """
     _LOGGER.info("Creating mask artifacts using tile %s", tile_name)
     mask_chunks = _array_chunks(low_res)
@@ -627,41 +625,28 @@ def _create_mask_artifacts(
         tile_name,
         chunks=mask_chunks,
     ).astype(bool)
+    initial_mask = initial_mask & (low_res != 0)
 
-    mask_low_res = initial_mask
-
+    probability_volume: da.Array | None = None
     if config.enable_gmm_refinement:
-        if bkg_slices is None:
-            raise ValueError(
-                "Background slices are required to fit the mask GMM on the reference tile"
-            )
-
-        gmm_n_components = config.gmm_n_components
-        gmm_max_samples = config.gmm_max_samples
-        gmm_batch_size = config.gmm_batch_size
-        gmm_random_state = config.gmm_random_state
+        slice_indices = np.asarray(bkg_slice_indices, dtype=np.int64)
+        bg_reference = da.take(low_res, slice_indices, axis=0)
 
         _LOGGER.info(
-            "Fitting GMM probabilities with n_components=%d, max_samples=%d, batch_size=%d",
-            gmm_n_components,
-            gmm_max_samples,
-            gmm_batch_size,
+            "Computing percentile-based probability weights (low=%.1f, high=%.1f, eps=%.3f)",
+            config.probability_bg_low_percentile,
+            config.probability_bg_high_percentile,
+            config.probability_ramp_eps,
         )
 
-        probability_volume = (
-            calc_gmm_prob(
-                gaussian_filter_dask(low_res.astype(np.float32), sigma=1),
-                initial_mask,
-                da.from_array(bkg_slices, chunks=mask_chunks),
-                n_components_fg=gmm_n_components,
-                n_components_bg=gmm_n_components,
-                max_samples_fg=gmm_max_samples,
-                max_samples_bg=gmm_max_samples,
-                random_state=gmm_random_state,
-                erosion_radius=config.erosion_radius,
-            )
-            .astype(np.float32)
-        )
+        probability_volume = calc_percentile_weight(
+            low_res,
+            bg_reference,
+            low_percentile=config.probability_bg_low_percentile,
+            high_percentile=config.probability_bg_high_percentile,
+            eps=config.probability_ramp_eps,
+            smooth_sigma=config.probability_smooth_sigma,
+        ).astype(np.float32)
 
         probability_path = out_probability_path.rstrip("/") + f"/{tile_name}"
         probability_transformations = parse_ome_zarr_transformations(
@@ -670,10 +655,13 @@ def _create_mask_artifacts(
         probability_scale = probability_transformations["scale"]
         probability_translation = probability_transformations["translation"]
 
+        _LOGGER.info(
+            "Storing probability volume at %s", probability_path
+        )
         store_ome_zarr(
             probability_volume,
             probability_path,
-            4,
+            5,
             tuple(probability_scale[-3:]),
             tuple(probability_translation),
             overwrite=overwrite,
@@ -683,31 +671,9 @@ def _create_mask_artifacts(
             probability_path, component="0"
         ).squeeze().compute()
 
-        prob_threshold = config.mask_probability_threshold
-        prob_min_size = config.mask_probability_min_size
-        _LOGGER.info(
-            "Thresholding probability volume with threshold %.3f and min_size %s",
-            prob_threshold,
-            prob_min_size,
-        )
-        mask_low_res = get_mask(
-            probability_volume,
-            threshold=prob_threshold,
-            min_size=prob_min_size,
-            k_largest=1
-        )
-        mask_low_res = (
-            _preprocess_mask(
-                mask_low_res,
-                low_res.shape,
-                results_dir,
-                tile_name,
-                chunks=mask_chunks,
-            ).astype(bool)
-        )
-
     return MaskArtifacts(
-        mask_low_res=mask_low_res,
+        mask_low_res=initial_mask,
+        probability_volume=probability_volume,
     )
 
 
@@ -723,8 +689,9 @@ def flatfield_fitting(
     overwrite: bool,
     n_levels: int,
     config: FittingConfig,
+    bkg: np.ndarray,
+    bkg_slice_indices: np.ndarray,
     results_dir: str | None = None,
-    bkg_slices: np.ndarray | None = None,
     mask_artifacts: MaskArtifacts | None = None,
 ) -> tuple[da.Array, dict[str, np.ndarray], MaskArtifacts | None]:
     """Run the fitting-based flatfield workflow for a single tile.
@@ -753,10 +720,13 @@ def flatfield_fitting(
         Number of pyramid levels to generate for outputs.
     config : FittingConfig
         Configuration controlling fitting behaviour and thresholds.
+    bkg : numpy.ndarray
+        Estimated 2D background image used for subtraction of ``low_res``.
+    bkg_slice_indices : numpy.ndarray
+        Indices of background-dominant slices leveraged by the optional
+        probability refinement.
     results_dir : str or None, default=None
         Directory used for storing intermediate artifacts.
-    bkg_slices : numpy.ndarray or None, default=None
-        Background-dominant slices leveraged by the optional GMM refinement.
     mask_artifacts : MaskArtifacts or None, default=None
         Previously computed mask artifacts to reuse across tiles.
 
@@ -769,6 +739,16 @@ def flatfield_fitting(
     fitting_res = "0" if is_binned_channel else "3"
     low_res = da.from_zarr(z[fitting_res]).squeeze().astype(np.float32)
 
+    low_res = subtract_bkg(
+        low_res,
+        da.from_array(
+            resize(
+                bkg.astype(np.float32, copy=False), low_res.shape[1:]
+            ),
+            chunks=low_res.chunksize[1:],
+        ),
+    )
+
     if mask_artifacts is None:
         mask_artifacts = _create_mask_artifacts(
             low_res=low_res,
@@ -778,7 +758,7 @@ def flatfield_fitting(
             tile_name=tile_name,
             results_dir=results_dir,
             config=config,
-            bkg_slices=bkg_slices,
+            bkg_slice_indices=bkg_slice_indices,
             out_probability_path=out_probability_path,
             overwrite=overwrite,
         )
@@ -787,16 +767,8 @@ def flatfield_fitting(
             "Reusing precomputed mask artifacts for tile %s", tile_name
         )
 
-    low_res = subtract_bkg(
-        low_res,
-        da.from_array(
-            resize(np.median(bkg_slices, axis=0).astype(np.float32), low_res.shape[1:]), 
-            chunks=low_res.chunksize[1:]
-        ),
-    )
-
     mask = mask_artifacts.mask_low_res
-    mask = mask & (low_res != 0)
+    weights = mask_artifacts.probability_volume
 
     if mask.shape == full_res.shape:
         _LOGGER.info("Mask already at full resolution, skipping upscaling.")
@@ -832,12 +804,20 @@ def flatfield_fitting(
     profile_min_voxels = config.profile_min_voxels
     spline_smoothing = config.spline_smoothing
 
-    _LOGGER.info(f"Clipping low_res with median factor: {med_factor}")
-    nan_med = np.percentile(low_res[mask].compute(), profile_percentile)
-    _LOGGER.info(f"Computed median of tile foreground: {nan_med}")
+    low_res = low_res.compute()
+    mask = mask.compute()
+
+    global_val = np.percentile(
+        low_res[mask], 
+        profile_percentile, 
+        weights=weights[mask] if weights is not None else None, 
+        method="inverted_cdf" if weights is not None else "linear"
+    )
+    _LOGGER.info(f"Computed {profile_percentile} percentile of tile foreground: {global_val}")
 
     # Clamp the intensity values to reduce the impact of very bright neurites on the profile fit
-    low_res_clipped = da.clip(low_res * mask, 0, nan_med * med_factor)
+    _LOGGER.info(f"Clipping low_res with median factor: {med_factor}")
+    low_res_clipped = np.clip(low_res, 0, global_val * med_factor)
     
     del low_res
 
@@ -847,7 +827,7 @@ def flatfield_fitting(
         profile_percentile,
         profile_min_voxels,
     )
-    axis_fits, axis_medians = compute_axis_fits(
+    axis_fits = compute_axis_fits(
         low_res_clipped,
         mask,
         full_res.shape,
@@ -858,19 +838,8 @@ def flatfield_fitting(
         limits_x=config.limits_x,
         limits_y=config.limits_y,
         limits_z=config.limits_z,
-    )
-
-    median_xy = axis_medians["x"]
-    median_xz = axis_medians["y"]
-    median_yz = axis_medians["z"]
-    _LOGGER.info(
-        "Global median from 3D masked profile (axis=X): %s", median_xy
-    )
-    _LOGGER.info(
-        "Global median from 3D masked profile (axis=Y): %s", median_xz
-    )
-    _LOGGER.info(
-        "Global median from 3D masked profile (axis=Z): %s", median_yz
+        weights=weights,
+        global_med=global_val,
     )
 
     global_factor = (
@@ -883,7 +852,7 @@ def flatfield_fitting(
         full_res,
         mask_upscaled,
         axis_fits,
-        axis_medians,
+        global_med=global_val,
         global_factor=global_factor,
     )
 
@@ -948,7 +917,7 @@ def save_method_outputs(
     results_dir: str,
     save_outputs: bool,
     bkg: np.ndarray | None = None,
-    bkg_slices: np.ndarray | None = None,
+    bkg_slice_indices: np.ndarray | None = None,
     artifacts: dict[str, Any] | None = None,
 ) -> None:
     """Persist optional QC artifacts for the specified correction method.
@@ -965,8 +934,9 @@ def save_method_outputs(
         Flag that enables or skips artifact persistence.
     bkg : numpy.ndarray or None, default=None
         Estimated background image for the tile.
-    bkg_slices : numpy.ndarray or None, default=None
-        Background-dominated slices used to fit probabilistic models.
+    bkg_slice_indices : numpy.ndarray or None, default=None
+        Indices of background-dominated slices used to fit probabilistic
+        models.
     artifacts : dict of str to Any or None, default=None
         Additional method-specific artifacts to serialize.
     """
@@ -975,12 +945,15 @@ def save_method_outputs(
 
     # Always try to save background-derived outputs if provided
     try:
-        if bkg_slices is not None:
-            tifffile.imwrite(
-                os.path.join(results_dir, f"{tile_name}_bkg_slices.tif"),
-                np.asarray(bkg_slices, dtype=np.float32),
-                imagej=True,
+        if bkg_slice_indices is not None:
+            indices_out = os.path.join(
+                results_dir, f"{tile_name}_bkg_slice_indices.json"
             )
+            with open(indices_out, "w", encoding="utf-8") as handle:
+                json.dump(
+                    np.asarray(bkg_slice_indices, dtype=np.int64).tolist(),
+                    handle,
+                )
         elif bkg is not None:
             tifffile.imwrite(
                 os.path.join(results_dir, f"{tile_name}_bkg.tif"),
@@ -1350,10 +1323,10 @@ def main() -> None:
                 _LOGGER.info(f"Full resolution array shape: {full_res.shape}")
 
                 bkg = None
-                bkg_slices = None
+                bkg_slice_indices = None
                 if not args.skip_bkg_sub:
                     _LOGGER.info("Performing background subtraction")
-                    full_res, bkg, bkg_slices = background_subtraction(
+                    full_res, bkg, bkg_slice_indices = background_subtraction(
                         tile_path,
                         full_res,
                         z,
@@ -1383,6 +1356,11 @@ def main() -> None:
                             raise ValueError(
                                 "Fitting configuration failed to initialize"
                             )
+                        if bkg is None or bkg_slice_indices is None:
+                            raise ValueError(
+                                "Fitting method requires background subtraction. "
+                                "Ensure background estimation is executed before fitting."
+                            )
                         apply_median_summary_override(
                             fitting_config,
                             median_summary,
@@ -1404,7 +1382,8 @@ def main() -> None:
                                 args.n_levels,
                                 fitting_config,
                                 results_dir=results_dir,
-                                bkg_slices=bkg_slices,
+                                bkg=bkg,
+                                bkg_slice_indices=bkg_slice_indices,
                                 mask_artifacts=mask_artifacts,
                             )
                         )
@@ -1442,7 +1421,7 @@ def main() -> None:
                     results_dir,
                     args.save_outputs,
                     bkg=bkg,
-                    bkg_slices=bkg_slices,
+                    bkg_slice_indices=bkg_slice_indices,
                     artifacts=artifacts,
                 )
 

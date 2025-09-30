@@ -308,6 +308,59 @@ def compute_simple_features_dask(
     return [x, m, std, grad_mag, neg_log]
 
 
+def calc_percentile_weight(
+    img_da: np.ndarray | da.Array,
+    bg_da: np.ndarray | da.Array,
+    *,
+    low_percentile: float = 50.0,
+    high_percentile: float = 99.0,
+    eps: float = 0.01,
+    smooth_sigma: float = 1.0,
+) -> da.Array:
+    """Compute soft foreground weights from background percentiles.
+
+    The returned volume assigns weights near zero to intensities typical of
+    the background slices and transitions smoothly to one once values exceed
+    the high-percentile threshold. A light Gaussian blur is applied at the end
+    to suppress speckle while keeping the ramp monotonic.
+    """
+
+    img = da.asarray(img_da, dtype=np.float32)
+    background = da.asarray(bg_da, dtype=np.float32)
+
+    percentiles = da.percentile(background, [low_percentile, high_percentile]).compute()
+    p_low = float(percentiles[0])
+    p_high = float(percentiles[1])
+
+    if not np.isfinite(p_low) or not np.isfinite(p_high):
+        raise ValueError("Background percentiles must be finite values")
+
+    if p_high < p_low:
+        p_low, p_high = p_high, p_low
+
+    eps = float(np.clip(eps, 1e-6, 0.49))
+
+    delta = p_high - p_low
+    if delta <= 0:
+        weights = da.where(img > p_low, 1.0, 0.0).astype(np.float32)
+    else:
+        mid = 0.5 * (p_low + p_high)
+        scale = delta / (2.0 * np.log((1.0 / eps) - 1.0))
+        scale = float(max(scale, 1e-6))
+
+        def _logistic(block: np.ndarray) -> np.ndarray:
+            z = np.clip((block - mid) / scale, -40.0, 40.0)
+            return (1.0 / (1.0 + np.exp(-z))).astype(np.float32)
+
+        weights = da.map_blocks(_logistic, img, dtype=np.float32)
+
+    if smooth_sigma and smooth_sigma > 0:
+        weights = di.gaussian_filter(weights, sigma=smooth_sigma)
+
+    weights = da.clip(weights, 0.0, 1.0).astype(np.float32)
+    return weights
+
+
 def _sample_rows_from_dask_stack(
     feats: list[da.Array],
     linear_idx: np.ndarray,
@@ -433,8 +486,6 @@ def calc_gmm_prob(
         sigma_log=sigma_log,
         sigma_grad=sigma_grad,
     )
-    n_feats = len(feats_img)  # 5
-
     # ---- Subsample training rows from Dask (materialize small NumPy arrays) ----
     rng = np.random.default_rng(random_state)
 

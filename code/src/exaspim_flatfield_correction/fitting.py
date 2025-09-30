@@ -102,6 +102,8 @@ def compute_axis_fits(
     limits_x: "tuple[float, float] | None" = None,
     limits_y: "tuple[float, float] | None" = None,
     limits_z: "tuple[float, float] | None" = None,
+    weights: "np.ndarray | None" = None,
+    global_med: float = None,
 ) -> tuple[dict[str, np.ndarray], dict[str, float]]:
     """Compute axis-aligned correction profiles and corresponding fits.
 
@@ -127,12 +129,13 @@ def compute_axis_fits(
     limits_x, limits_y, limits_z : tuple of float or None, default=None
         Optional clamp bounds applied to the resampled profiles along each
         axis.
+    weights : numpy.ndarray or None, optional
+        Optional weighting array used for percentile calculations.
 
     Returns
     -------
-    tuple of (dict[str, numpy.ndarray], dict[str, float])
-        Mapping of axis labels to fitted correction curves and a mapping of
-        axis labels to the corresponding global medians.
+    dict[str, numpy.ndarray]
+        Mapping of axis labels to fitted correction curves
     """
 
     axis_specs = (
@@ -142,18 +145,18 @@ def compute_axis_fits(
     )
 
     axis_indices = [axis_idx for _, axis_idx, _, _ in axis_specs]
-    profiles, global_med = masked_axis_profile(
+    profiles = masked_axis_profile(
         volume,
         mask,
         axes=axis_indices,
         smooth_sigma=smooth_sigma,
         percentile=percentile,
         min_voxels=min_voxels,
+        weights=weights,
+        global_med_value=global_med,
     )
 
     fits: dict[str, np.ndarray] = {}
-    medians: dict[str, float] = {}
-
     for axis_label, axis_idx, width, limits in axis_specs:
         profile = profiles.get(axis_idx)
         if profile is None:
@@ -164,18 +167,17 @@ def compute_axis_fits(
             spline_smoothing,
             limits,
         )
-        medians[axis_label] = global_med
 
-    return fits, medians
+    return fits
 
 
 def apply_axis_corrections(
     full_res: da.Array,
     mask_upscaled: da.Array,
     axis_fits: dict[str, np.ndarray],
-    axis_medians: dict[str, float],
     *,
     global_factor: float,
+    global_med: float,
     clip_max: float = 2**16 - 1,
 ) -> da.Array:
     """Apply axis-specific correction curves and global scaling factors.
@@ -188,8 +190,6 @@ def apply_axis_corrections(
         Boolean mask at full resolution restricting where corrections apply.
     axis_fits : dict of str to numpy.ndarray
         Resampled correction curves for ``{"x", "y", "z"}``.
-    axis_medians : dict of str to float
-        Global medians associated with each axis profile.
     global_factor : float
         Target global intensity level used to scale the corrected volume.
     clip_max : float, default=2**16 - 1
@@ -200,11 +200,8 @@ def apply_axis_corrections(
     dask.array.Array
         Lazily corrected full-resolution volume.
     """
-
     corrected = full_res
-    median_xy = float(axis_medians.get("x", 0.0))
-
-    if median_xy != 0 and np.isfinite(median_xy):
+    if global_med != 0 and np.isfinite(global_med):
         fit_x = axis_fits.get("x")
         if fit_x is not None:
             correction_x = fit_x.reshape(1, 1, -1)
@@ -226,11 +223,11 @@ def apply_axis_corrections(
                 mask_upscaled, corrected / correction_z, corrected
             )
 
-        ratio = global_factor / median_xy
+        ratio = global_factor / global_med
         _LOGGER.info(
             "Doing global correction with factor: %s and median_xy: %s, ratio = %s",
             global_factor,
-            median_xy,
+            global_med,
             ratio,
         )
         corrected = da.where(mask_upscaled, corrected * ratio, corrected)
@@ -238,10 +235,54 @@ def apply_axis_corrections(
     else:
         _LOGGER.warning(
             "Skipping correction: median_xy is zero or non-finite (%s)",
-            median_xy,
+            global_med,
         )
 
     return corrected
+
+
+def _nanpercentile_flattened(
+    data: np.ndarray,
+    axis: int,
+    percentile: float,
+    *,
+    weights: "np.ndarray | None" = None,
+    method: str = "linear",
+) -> np.ndarray:
+    """Compute percentiles along ``axis`` by flattening the remaining dims.
+
+    This helper avoids NumPy's current limitation with weighted reductions
+    over multiple axes by iterating over each slice explicitly.
+    """
+    if axis < 0:
+        axis += data.ndim
+    if axis < 0 or axis >= data.ndim:
+        raise ValueError(
+            f"Axis {axis} is out of bounds for array of ndim {data.ndim}"
+        )
+
+    moved = np.moveaxis(data, axis, 0)
+    moved_weights: "np.ndarray | None" = None
+    if weights is not None:
+        moved_weights = np.moveaxis(weights, axis, 0)
+
+    result = np.empty(moved.shape[0], dtype=np.float32)
+
+    for idx in range(moved.shape[0]):
+        slice_values = moved[idx].reshape(-1)
+        if moved_weights is None:
+            value = np.nanpercentile(slice_values, percentile, method=method)
+        else:
+            slice_weights = moved_weights[idx].reshape(-1)
+            value = np.nanpercentile(
+                slice_values,
+                percentile,
+                weights=slice_weights,
+                method=method,
+            )
+        result[idx] = value
+
+    return result
 
 
 def masked_axis_profile(
@@ -252,6 +293,8 @@ def masked_axis_profile(
     smooth_sigma: "float | None" = None,
     percentile: "float | None" = None,
     min_voxels: int = 0,
+    weights: "np.ndarray | None" = None,
+    global_med_value: float = None,
 ) -> tuple[dict[int, np.ndarray], float]:
     """
     Measure normalized intensity profiles along specified axes using a 3D mask.
@@ -270,6 +313,9 @@ def masked_axis_profile(
         Percentile to use instead of the median when summarising each plane.
     min_voxels : int, optional
         Minimum number of mask voxels required for a plane to be trusted.
+    weights : np.ndarray or None, optional
+        Optional weighting array matching ``volume`` used for the percentile
+        computation.
 
     Returns
     -------
@@ -307,14 +353,34 @@ def masked_axis_profile(
             )
         axis_lengths[axis] = mask_np.shape[axis]
 
+    method = "linear"
+    if weights is not None:
+        method = "inverted_cdf"
+
     masked = np.where(mask_np, volume_np, np.nan)
-    global_med_value = float(np.nanpercentile(masked, percentile))
+    if global_med_value is None:
+        global_med_value = float(np.nanpercentile(masked, percentile, weights=weights, method=method))
+    print(global_med_value)
 
     profiles: dict[int, np.ndarray] = {}
     for axis in axes:
         reduce_axes = tuple(i for i in range(mask_np.ndim) if i != axis)
         coverage = mask_np.sum(axis=reduce_axes)
-        profile = np.nanpercentile(masked, percentile, axis=reduce_axes)
+        if weights is not None:
+            profile = _nanpercentile_flattened(
+                masked,
+                axis,
+                percentile,
+                weights=weights,
+                method=method,
+            )
+        else:
+            profile = np.nanpercentile(
+                masked,
+                percentile,
+                axis=reduce_axes,
+                method=method,
+            )
         profile = np.where(np.isnan(profile), global_med_value, profile)
         if min_voxels:
             profile = np.where(coverage >= min_voxels, profile, global_med_value)
@@ -335,4 +401,4 @@ def masked_axis_profile(
         norm_profile = (smoothed / global_med_value).astype(np.float32, copy=False)
         results[axis] = norm_profile
 
-    return results, global_med_value
+    return results

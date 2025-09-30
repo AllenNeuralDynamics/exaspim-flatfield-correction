@@ -119,6 +119,41 @@ class FittingConfig(BaseModel):
             "mask projection."
         ),
     )
+    probability_bg_low_percentile: float = Field(
+        default=50.0,
+        ge=0,
+        le=100,
+        description=(
+            "Lower percentile of background intensities anchoring the low end "
+            "of the logistic weighting ramp."
+        ),
+    )
+    probability_bg_high_percentile: float = Field(
+        default=99.9,
+        ge=0,
+        le=100,
+        description=(
+            "Upper percentile of background intensities targeting weights near "
+            "one in the logistic ramp."
+        ),
+    )
+    probability_ramp_eps: float = Field(
+        default=0.01,
+        gt=0,
+        lt=0.5,
+        description=(
+            "Logistic ramp value assigned at the low anchor percentile; also "
+            "controls the sharpness of the transition."
+        ),
+    )
+    probability_smooth_sigma: float = Field(
+        default=1.0,
+        ge=0,
+        description=(
+            "Gaussian sigma applied to softly smooth the percentile-based "
+            "weight volume."
+        ),
+    )
     enable_gmm_refinement: bool = Field(
         default=False,
         description=(
