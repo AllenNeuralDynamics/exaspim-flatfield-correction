@@ -688,22 +688,24 @@ def flatfield_fitting(
     profile_min_voxels = config.profile_min_voxels
     spline_smoothing = config.spline_smoothing
 
-    low_res = low_res.compute()
-    mask = mask.compute()
+    if weights is not None:
+        low_res_masked, weights_masked = da.compute(low_res[mask], weights[mask])
+    else:
+        low_res_masked = low_res[mask].compute()
+        weights_masked = None
 
     global_val = np.percentile(
-        low_res[mask], 
+        low_res_masked, 
         profile_percentile, 
-        weights=weights[mask] if weights is not None else None, 
-        method="inverted_cdf" if weights is not None else "linear"
+        weights=weights_masked if weights_masked is not None else None, 
+        method="inverted_cdf" if weights_masked is not None else "linear"
     )
     _LOGGER.info(f"Computed {profile_percentile} percentile of tile foreground: {global_val}")
+    del low_res_masked, weights_masked
 
     # Clamp the intensity values to reduce the impact of very bright neurites on the profile fit
     _LOGGER.info(f"Clipping low_res with median factor: {med_factor}")
-    low_res_clipped = np.clip(low_res, 0, global_val * med_factor)
-    
-    del low_res
+    low_res = np.clip(low_res.compute(), 0, global_val * med_factor)
 
     _LOGGER.info(
         "Computing masked profiles (sigma=%s, percentile=%s, min_voxels=%s)",
@@ -712,7 +714,7 @@ def flatfield_fitting(
         profile_min_voxels,
     )
     axis_fits = compute_axis_fits(
-        low_res_clipped,
+        low_res,
         mask,
         full_res.shape,
         smooth_sigma=profile_sigma,
