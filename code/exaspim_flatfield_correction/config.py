@@ -106,23 +106,6 @@ class FittingConfig(BaseModel):
             "used to derive the global scaling ratio."
         ),
     )
-    mask_probability_threshold: float = Field(
-        default=0.9,
-        ge=0,
-        le=1,
-        description=(
-            "Probability cutoff applied to the GMM-derived soft tissue map "
-            "to derive a binary mask."
-        ),
-    )
-    mask_probability_min_size: int = Field(
-        default=10000,
-        ge=0,
-        description=(
-            "Minimum connected-component size retained from the probability "
-            "mask projection."
-        ),
-    )
     probability_bg_low_percentile: float = Field(
         default=50.0,
         ge=0,
@@ -142,12 +125,30 @@ class FittingConfig(BaseModel):
         ),
     )
     probability_ramp_eps: float = Field(
-        default=0.01,
+        default=0.0001,
         gt=0,
         lt=0.5,
         description=(
-            "Logistic ramp value assigned at the low anchor percentile; also "
-            "controls the sharpness of the transition."
+            "Logistic ramp value assigned at the low anchor percentile"
+        ),
+    )
+    probability_ramp_start_frac: float = Field(
+        default=0.2,
+        ge=0,
+        le=1,
+        description=(
+            "Fraction along the percentile span where the logistic ramp "
+            "begins; e.g. 0.2 means the ramp starts 20% of the way from the low to "
+            "the high percentile."
+        ),
+    )
+    probability_ramp_nu: float = Field(
+        default=1.0,
+        ge=1.0,
+        description=(
+            "Controls the skew of the logistic ramp; nu=1 matches a standard "
+            "logistic, while larger values skew the ramp toward the high "
+            "percentile."
         ),
     )
     probability_smooth_sigma: float = Field(

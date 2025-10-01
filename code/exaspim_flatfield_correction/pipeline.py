@@ -531,6 +531,8 @@ def _create_mask_artifacts(
             high_percentile=config.probability_bg_high_percentile,
             eps=config.probability_ramp_eps,
             smooth_sigma=config.probability_smooth_sigma,
+            start_frac=config.probability_ramp_start_frac,
+            nu=config.probability_ramp_nu,
         ).astype(np.float32)
 
         probability_path = out_probability_path.rstrip("/") + f"/{tile_name}"

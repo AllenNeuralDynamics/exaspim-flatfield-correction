@@ -316,17 +316,44 @@ def calc_percentile_weight(
     high_percentile: float = 99.0,
     eps: float = 0.01,
     smooth_sigma: float = 1.0,
+    start_frac: float = 0,
+    nu: float = 1.0,
 ) -> da.Array:
-    """Compute soft foreground weights from background percentiles.
+    """
+    Compute foreground weights using a generalised logistic (Richards) curve.
 
-    The returned volume assigns weights near zero to intensities typical of
-    the background slices and transitions smoothly to one once values exceed
-    the high-percentile threshold. A light Gaussian blur is applied at the end
-    to suppress speckle while keeping the ramp monotonic.
+    This version gives you more asymmetric control: `start_frac` picks where
+    the ramp begins (relative to low→high), and `nu` adjusts skew/inflection bias.
+    The top “knee” is anchored near (p_high, 1−eps).
+
+    Parameters
+    ----------
+    img_da : np.ndarray or dask.array.Array
+        Background-subtracted image volume.
+    bg_da : np.ndarray or dask.array.Array
+        Voxels representative of the background distribution.
+    low_percentile : float
+        Lower percentile (maps to weight ≈ 0 region).
+    high_percentile : float
+        Upper percentile (maps close to weight = 1).
+    eps : float
+        A small positive parameter so the extremes don’t hit exactly 0 or 1.
+    smooth_sigma : float
+        Gaussian smoothing sigma on the resulting weight map.
+    start_frac : float (in [0,1))
+        Fraction along (low→high) where the ramp should **begin** in earnest.
+    nu : float (> 0)
+        Skew / asymmetry parameter of the generalised logistic (nu = 1 → standard logistic).
+
+    Returns
+    -------
+    dask.array.Array
+        Weights in [0,1], softly ramping from “background-like” to foreground.
     """
 
     img = da.asarray(img_da, dtype=np.float32)
 
+    # Compute background percentiles
     percentiles = np.percentile(bg_da, [low_percentile, high_percentile])
     p_low = float(percentiles[0])
     p_high = float(percentiles[1])
@@ -335,27 +362,56 @@ def calc_percentile_weight(
         raise ValueError("Background percentiles must be finite values")
 
     if p_high < p_low:
+        # swap to ensure p_low < p_high
         p_low, p_high = p_high, p_low
 
     eps = float(np.clip(eps, 1e-6, 0.49))
+    start_frac = float(np.clip(start_frac, 0.0, 0.999))
+    nu = float(np.clip(nu, 1e-6, None))
 
     delta = p_high - p_low
     if delta <= 0:
+        # degenerate: everything is basically the same
         weights = da.where(img > p_low, 1.0, 0.0).astype(np.float32)
     else:
-        mid = 0.5 * (p_low + p_high)
-        scale = delta / (2.0 * np.log((1.0 / eps) - 1.0))
-        scale = float(max(scale, 1e-6))
+        # Normalize intensity to t in [0,1]
+        def _norm(block: np.ndarray) -> np.ndarray:
+            return np.clip((block - p_low) / delta, 0.0, 1.0)
 
-        def _logistic(block: np.ndarray) -> np.ndarray:
-            z = np.clip((block - mid) / scale, -40.0, 40.0)
-            return (1.0 / (1.0 + np.exp(-z))).astype(np.float32)
+        t = da.map_blocks(_norm, img, dtype=np.float32)
 
-        weights = da.map_blocks(_logistic, img, dtype=np.float32)
+        # Anchors:
+        #   At t = start_frac, weight = eps
+        #   At t = 1.0, weight = 1 - eps
+        y1 = eps
+        y2 = 1.0 - eps
 
+        # According to Richards/generalised logistic with A=0, K=1, C=1:
+        #   f(t) = [1 + Q * exp(-B t)]^(-1/nu)
+        # Solve for B and Q:
+        #   (1 + Q exp(-B t1)) = y1^{-ν}
+        #   (1 + Q exp(-B * 1))  = y2^{-ν}
+        A_s = y1**(-nu) - 1.0
+        A_h = y2**(-nu) - 1.0
+        # Avoid divide by zero
+        B = np.log(A_s / A_h) / (1.0 - start_frac)
+        Q = float(A_h * np.exp(B))
+
+        # Logistic / Richards block
+        def _richards(block: np.ndarray) -> np.ndarray:
+            # block is normalized t
+            # compute exponent part
+            z = -B * np.clip(block, 0.0, 1.0)
+            # compute (1 + Q exp(z))^(−1/nu); z is <= 0 so exp(z) is stable
+            return (1.0 / (1.0 + Q * np.exp(z))) ** (1.0 / nu)
+
+        weights = da.map_blocks(_richards, t, dtype=np.float32)
+
+    # Optional smoothing
     if smooth_sigma and smooth_sigma > 0:
         weights = di.gaussian_filter(weights, sigma=smooth_sigma)
 
+    # Clip to [0,1]
     weights = da.clip(weights, 0.0, 1.0).astype(np.float32)
     return weights
 
