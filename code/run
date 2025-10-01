@@ -24,7 +24,7 @@ echo "Processing tile: $TILE_NUM"
 ARTIFACTS_PATH="$(dirname "$2")/artifacts/$TILE_NUM"
 echo "Creating artifacts directory at: $ARTIFACTS_PATH"
 
-PYTHONPATH=. python -u exaspim_flatfield_correction/pipeline.py \
+python -m exaspim_flatfield_correction.pipeline \
 --zarr "$1" \
 --output "$2" \
 --res "$3" \
