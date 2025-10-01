@@ -3,7 +3,6 @@ set -ex
 
 source $(conda info --base)/etc/profile.d/conda.sh
 conda activate correction
-pip install /root/capsule
 
 export AWS_REQUEST_CHECKSUM_CALCULATION=when_required
 export AWS_RESPONSE_CHECKSUM_VALIDATION=when_required
