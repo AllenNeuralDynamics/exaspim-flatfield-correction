@@ -23,6 +23,71 @@ from xarray_multiscale.reducers import windowed_rank, windowed_mean
 _LOGGER = logging.getLogger(__name__)
 
 
+def initialize_zarr_group(
+    path: str,
+    *,
+    mode: str = "a",
+    aws_region: str = "us-west-2",
+    s3_use_ssl: bool = False,
+    s3_batch_size: int = 64,
+    s3_multipart_threshold: int = 256 * 1024 * 1024,
+    s3_total_max_attempts: int = 10,
+    s3_retry_mode: str = "adaptive",
+) -> zarr.hierarchy.Group:
+    """Open (and create if needed) a Zarr group.
+
+    Parameters
+    ----------
+    path : str
+        Local filesystem path or S3 URI where the group should reside.
+    mode : str, optional
+        Zarr open mode to use (e.g. ``"a"``, ``"w"``, ``"w-"``). Defaults to
+        ``"a"`` which creates the group when missing and reuses it otherwise.
+    aws_region : str, optional
+        AWS region to use when ``path`` points to S3. Default "us-west-2".
+    s3_use_ssl : bool, optional
+        Whether to use SSL when communicating with S3. Default ``False``.
+    s3_batch_size : int, optional
+        Batch size for S3 multipart uploads. Default ``64``.
+    s3_multipart_threshold : int, optional
+        Threshold (in bytes) before S3 multipart uploads are used.
+        Default ``256 * 1024 * 1024`` (256 MB).
+    s3_total_max_attempts : int, optional
+        Maximum number of retry attempts for S3 operations. Default ``10``.
+    s3_retry_mode : str, optional
+        Retry mode passed to the S3 client. Default ``"adaptive"``.
+    Returns
+    -------
+    zarr.hierarchy.Group
+        The opened Zarr group handle.
+    """
+
+    target_path = path.rstrip("/")
+    if target_path.startswith("s3://"):
+        s3 = s3fs.S3FileSystem(
+            anon=False,
+            client_kwargs={
+                "region_name": aws_region,
+            },
+            config_kwargs={
+                "s3": {
+                    "multipart_threshold": s3_multipart_threshold,
+                },
+                "retries": {
+                    "total_max_attempts": s3_total_max_attempts,
+                    "mode": s3_retry_mode,
+                },
+            },
+            use_ssl=s3_use_ssl,
+            s3_additional_kwargs={"batch_size": s3_batch_size},
+        )
+        store = s3fs.S3Map(root=target_path, s3=s3, check=False)
+    else:
+        Path(target_path).mkdir(parents=True, exist_ok=True)
+        store = zarr.DirectoryStore(target_path)
+    return zarr.open_group(store=store, mode=mode)
+
+
 def store_ome_zarr(
     corrected: da.Array,
     output_zarr: str,
@@ -98,33 +163,18 @@ def store_ome_zarr(
         If the provided scale_factors has fewer than three elements or the
         block_shape does not describe all five TCZYX axes.
     """
-    if output_zarr.startswith("s3://"):
-        s3 = s3fs.S3FileSystem(
-            anon=False,
-            client_kwargs={
-                "region_name": aws_region,
-            },
-            config_kwargs={
-                "s3": {
-                    "multipart_threshold": s3_multipart_threshold,
-                    # Avoid multipart upload for small chunks
-                },
-                "retries": {
-                    "total_max_attempts": s3_total_max_attempts,
-                    "mode": s3_retry_mode,
-                },
-            },
-            use_ssl=s3_use_ssl,
-            s3_additional_kwargs={"batch_size": s3_batch_size},
-        )
-        # Create a Zarr group on S3
-        store = s3fs.S3Map(root=output_zarr, s3=s3, check=False)
-    else:
-        store = zarr.DirectoryStore(output_zarr)
-
     mode = "w" if overwrite else "w-"
     try:
-        root_group = zarr.open_group(store=store, mode=mode)
+        root_group = initialize_zarr_group(
+            output_zarr,
+            mode=mode,
+            aws_region=aws_region,
+            s3_use_ssl=s3_use_ssl,
+            s3_batch_size=s3_batch_size,
+            s3_multipart_threshold=s3_multipart_threshold,
+            s3_total_max_attempts=s3_total_max_attempts,
+            s3_retry_mode=s3_retry_mode,
+        )
     except ContainsGroupError:
         _LOGGER.info(f"Not overwriting tile {output_zarr}")
         return

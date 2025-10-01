@@ -40,6 +40,7 @@ from exaspim_flatfield_correction.utils.mask_utils import (
     upscale_mask_nearest,
 )
 from exaspim_flatfield_correction.utils.zarr_utils import (
+    initialize_zarr_group,
     store_ome_zarr,
     parse_ome_zarr_transformations,
 )
@@ -1293,6 +1294,8 @@ def main() -> None:
 
     out_mask_path = create_mask_path(out_path)
     out_probability_path = create_probability_path(out_path)
+    initialize_zarr_group(out_mask_path)
+    initialize_zarr_group(out_probability_path)
 
     artifacts_destination = None
     tile_name_for_artifacts = Path(tile_paths[0]).name if tile_paths else None
