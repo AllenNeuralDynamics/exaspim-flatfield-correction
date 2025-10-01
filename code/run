@@ -1,9 +1,9 @@
 #!/usr/bin/env bash
 set -ex
 
-source $(conda info --base)/etc/profile.d/conda.sh
-conda activate correction
-pip install .
+# source $(conda info --base)/etc/profile.d/conda.sh
+# conda activate correction
+# pip install .
 
 export AWS_REQUEST_CHECKSUM_CALCULATION=when_required
 export AWS_RESPONSE_CHECKSUM_VALIDATION=when_required
@@ -25,7 +25,7 @@ echo "Processing tile: $TILE_NUM"
 ARTIFACTS_PATH="$(dirname "$2")/artifacts/$TILE_NUM"
 echo "Creating artifacts directory at: $ARTIFACTS_PATH"
 
-PYTHONPATH=./src python -u ./src/exaspim_flatfield_correction/pipeline.py \
+PYTHONPATH=. python -u exaspim_flatfield_correction/pipeline.py \
 --zarr "$1" \
 --output "$2" \
 --res "$3" \
