@@ -368,7 +368,7 @@ def masked_axis_profile(
                 masked, percentile, weights=weights, method=method
             )
         )
-    print(global_med_value)
+    _LOGGER.debug('Global median value: %s', global_med_value)
 
     profiles: dict[int, np.ndarray] = {}
     for axis in axes:
