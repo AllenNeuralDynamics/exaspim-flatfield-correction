@@ -1,11 +1,10 @@
-from datetime import datetime
 import json
+from datetime import datetime
 from pathlib import Path
 from typing import Any
 
 from aind_data_schema.core.processing import DataProcess
 from aind_data_schema_models.process_names import ProcessName
-
 from exaspim_flatfield_correction.utils.utils import get_parent_s3_path
 
 
@@ -104,4 +103,3 @@ def save_metadata(
                 }
             )
         )
-        

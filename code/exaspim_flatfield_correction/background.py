@@ -1,7 +1,7 @@
-import numpy as np
 import logging
 
 import dask.array as da
+import numpy as np
 
 _LOGGER = logging.getLogger(__name__)
 

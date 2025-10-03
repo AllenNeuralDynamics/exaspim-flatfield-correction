@@ -1,12 +1,12 @@
-import os
-import glob
-import time
-import json
 import argparse
+import glob
+import json
 import logging
-from pathlib import Path
-from datetime import datetime
+import os
+import time
 from dataclasses import dataclass
+from datetime import datetime
+from pathlib import Path
 from typing import Any
 
 import numpy as np
@@ -14,59 +14,51 @@ import zarr
 from numcodecs import blosc
 
 blosc.use_threads = False
-import tifffile
 import dask.array as da
+import tifffile
 from dask.distributed import performance_report
-from distributed import Client, LocalCluster
 from dask_image.ndfilters import gaussian_filter as gaussian_filter_dask
-
-from exaspim_flatfield_correction.basic import (
-    fit_basic,
-    transform_basic,
+from distributed import Client, LocalCluster
+from exaspim_flatfield_correction.background import estimate_bkg, subtract_bkg
+from exaspim_flatfield_correction.basic import fit_basic, transform_basic
+from exaspim_flatfield_correction.config import (
+    FittingConfig,
+    apply_median_summary_override,
+    load_fitting_config,
+    read_median_intensity_summary,
 )
 from exaspim_flatfield_correction.fitting import (
     apply_axis_corrections,
     compute_axis_fits,
-)
-from exaspim_flatfield_correction.background import (
-    estimate_bkg,
-    subtract_bkg,
 )
 from exaspim_flatfield_correction.utils.mask_utils import (
     calc_percentile_weight,
     size_filter,
     upscale_mask_nearest,
 )
-from exaspim_flatfield_correction.utils.zarr_utils import (
-    initialize_zarr_group,
-    store_ome_zarr,
-    parse_ome_zarr_transformations,
-)
 from exaspim_flatfield_correction.utils.metadata_utils import (
     create_processing_metadata,
-    save_metadata
+    save_metadata,
 )
 from exaspim_flatfield_correction.utils.utils import (
-    get_parent_s3_path,
-    read_bkg_image,
-    get_bkg_path,
-    resize,
-    save_correction_curve_plot,
-    upload_artifacts,
     array_chunks,
     chunks_2d,
-    get_mem_limit,
     extract_channel_from_tile_name,
+    get_bkg_path,
+    get_mem_limit,
+    get_parent_s3_path,
     load_mask_from_dir,
-    set_dask_config
+    read_bkg_image,
+    resize,
+    save_correction_curve_plot,
+    set_dask_config,
+    upload_artifacts,
 )
-from exaspim_flatfield_correction.config import (
-    FittingConfig,
-    load_fitting_config,
-    read_median_intensity_summary,
-    apply_median_summary_override,
+from exaspim_flatfield_correction.utils.zarr_utils import (
+    initialize_zarr_group,
+    parse_ome_zarr_transformations,
+    store_ome_zarr,
 )
-
 
 logging.basicConfig(
     format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
@@ -83,7 +75,9 @@ class MaskArtifacts:
     probability_volume: da.Array | None = None
 
 
-def resolve_args(args: argparse.Namespace) -> dict[str, str | list[str] | None]:
+def resolve_args(
+    args: argparse.Namespace,
+) -> dict[str, str | list[str] | None]:
     """Collect pipeline inputs from CLI arguments and optional metadata.
 
     Parameters
@@ -406,7 +400,9 @@ def _create_mask_artifacts(
     _LOGGER.info("Creating mask artifacts using tile %s", tile_name)
     mask_chunks = array_chunks(low_res)
     initial_mask = _preprocess_mask(
-        size_filter(load_mask_from_dir(mask_dir, tile_name), k_largest=1, min_size=None),
+        size_filter(
+            load_mask_from_dir(mask_dir, tile_name), k_largest=1, min_size=None
+        ),
         low_res.shape,
         results_dir,
         tile_name,
@@ -444,9 +440,7 @@ def _create_mask_artifacts(
         probability_scale = probability_transformations["scale"]
         probability_translation = probability_transformations["translation"]
 
-        _LOGGER.info(
-            "Storing probability volume at %s", probability_path
-        )
+        _LOGGER.info("Storing probability volume at %s", probability_path)
         store_ome_zarr(
             probability_volume,
             probability_path,
@@ -532,9 +526,7 @@ def flatfield_fitting(
     low_res = subtract_bkg(
         low_res,
         da.from_array(
-            resize(
-                bkg.astype(np.float32, copy=False), low_res.shape[1:]
-            ),
+            resize(bkg.astype(np.float32, copy=False), low_res.shape[1:]),
             chunks=low_res.chunksize[1:],
         ),
     )
@@ -558,7 +550,6 @@ def flatfield_fitting(
         )
 
     mask = mask_artifacts.mask_low_res
-
 
     if mask.shape == full_res.shape:
         _LOGGER.info("Mask already at full resolution, skipping upscaling.")
@@ -597,18 +588,22 @@ def flatfield_fitting(
     weights = mask_artifacts.probability_volume
 
     if weights is not None:
-        low_res_masked, weights_masked = da.compute(low_res[mask], weights[mask])
+        low_res_masked, weights_masked = da.compute(
+            low_res[mask], weights[mask]
+        )
     else:
         low_res_masked = low_res[mask].compute()
         weights_masked = None
 
     global_val = np.percentile(
-        low_res_masked, 
-        profile_percentile, 
-        weights=weights_masked if weights_masked is not None else None, 
-        method="inverted_cdf" if weights_masked is not None else "linear"
+        low_res_masked,
+        profile_percentile,
+        weights=weights_masked if weights_masked is not None else None,
+        method="inverted_cdf" if weights_masked is not None else "linear",
     )
-    _LOGGER.info(f"Computed {profile_percentile} percentile of tile foreground: {global_val}")
+    _LOGGER.info(
+        f"Computed {profile_percentile} percentile of tile foreground: {global_val}"
+    )
     del low_res_masked, weights_masked
 
     # Clamp the intensity values to reduce the impact of very bright neurites on the profile fit
@@ -632,7 +627,7 @@ def flatfield_fitting(
         limits_x=config.limits_x,
         limits_y=config.limits_y,
         limits_z=config.limits_z,
-        weights=weights.compute(), # bring into memory for fitting only
+        weights=weights.compute(),  # bring into memory for fitting only
         global_med=global_val,
     )
     del low_res, mask, weights
@@ -816,7 +811,9 @@ def process_tile(
             axis_fits = None
             if not args.skip_flat_field:
                 if method == "reference":
-                    corrected = flatfield_reference(full_res, args.flatfield_path)
+                    corrected = flatfield_reference(
+                        full_res, args.flatfield_path
+                    )
                 elif method == "basicpy":
                     corrected = flatfield_basicpy(
                         full_res,
@@ -829,7 +826,9 @@ def process_tile(
                     )
                 elif method == "fitting":
                     if fitting_config is None:
-                        raise ValueError("Fitting configuration failed to initialize")
+                        raise ValueError(
+                            "Fitting configuration failed to initialize"
+                        )
                     if bkg is None or bkg_slice_indices is None:
                         raise ValueError(
                             "Fitting method requires background subtraction. "
@@ -1085,15 +1084,15 @@ def main() -> None:
     binned_res = "0"
 
     dask_config = {
-            "temporary-directory": os.path.join(results_dir, "dask-temp"),
-            "distributed.worker.memory.target": 0.7,
-            "distributed.worker.memory.spill": 0.8,
-            "distributed.worker.memory.pause": 0.9,
-            "distributed.worker.memory.terminate": 0.95,
-            "distributed.scheduler.allowed-failures": 10,
-            "logging": {
-                "distributed.shuffle._scheduler_plugin": "error",
-            },
+        "temporary-directory": os.path.join(results_dir, "dask-temp"),
+        "distributed.worker.memory.target": 0.7,
+        "distributed.worker.memory.spill": 0.8,
+        "distributed.worker.memory.pause": 0.9,
+        "distributed.worker.memory.terminate": 0.95,
+        "distributed.scheduler.allowed-failures": 10,
+        "logging": {
+            "distributed.shuffle._scheduler_plugin": "error",
+        },
     }
     set_dask_config(dask_config)
 
@@ -1156,7 +1155,9 @@ def main() -> None:
             fitting_config.median_summary_path = Path(args.median_summary_path)
         # dump to results folder
         fitting_config.to_file(
-            os.path.join(results_dir, f"fitting_config_{tile_name_for_artifacts}.json")
+            os.path.join(
+                results_dir, f"fitting_config_{tile_name_for_artifacts}.json"
+            )
         )
         median_summary = read_median_intensity_summary(
             fitting_config.median_summary_path

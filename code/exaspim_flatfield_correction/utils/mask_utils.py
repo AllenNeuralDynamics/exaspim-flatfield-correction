@@ -2,19 +2,18 @@ import logging
 from typing import Union
 
 import dask.array as da
+import dask_image.ndfilters as di
+import dask_image.ndmorph as ndm
 import numpy as np
+from exaspim_flatfield_correction.utils.utils import resize_dask
 from scipy.ndimage import (
     binary_closing,
     binary_fill_holes,
     distance_transform_edt,
     label,
 )
-import dask_image.ndfilters as di
-import dask_image.ndmorph as ndm
 from skimage.morphology import ball, disk
 from sklearn.mixture import GaussianMixture
-
-from exaspim_flatfield_correction.utils.utils import resize_dask
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -391,8 +390,8 @@ def calc_percentile_weight(
         # Solve for B and Q:
         #   (1 + Q exp(-B t1)) = y1^{-ν}
         #   (1 + Q exp(-B * 1))  = y2^{-ν}
-        A_s = y1**(-nu) - 1.0
-        A_h = y2**(-nu) - 1.0
+        A_s = y1 ** (-nu) - 1.0
+        A_h = y2 ** (-nu) - 1.0
         # Avoid divide by zero
         B = np.log(A_s / A_h) / (1.0 - start_frac)
         Q = float(A_h * np.exp(B))
@@ -551,7 +550,9 @@ def calc_gmm_prob(
             structure = disk(erosion_radius)
         else:
             raise ValueError("Mask must be 2D or 3D for erosion")
-        _LOGGER.debug("Applying binary erosion to mask with radius %s", erosion_radius)
+        _LOGGER.debug(
+            "Applying binary erosion to mask with radius %s", erosion_radius
+        )
         mask_eroded = ndm.binary_erosion(mask_da, structure=structure)
     else:
         mask_eroded = mask_da

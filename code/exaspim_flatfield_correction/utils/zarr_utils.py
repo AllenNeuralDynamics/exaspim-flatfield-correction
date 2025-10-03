@@ -1,14 +1,12 @@
-from pathlib import Path
-from functools import partial
 import logging
+from functools import partial
+from pathlib import Path
 from typing import Callable
 
-import zarr
-from zarr.errors import ContainsGroupError
-import numpy as np
 import dask.array as da
+import numpy as np
 import s3fs
-
+import zarr
 from aind_data_transfer.transformations.ome_zarr import (
     downsample_and_store,
     store_array,
@@ -16,9 +14,10 @@ from aind_data_transfer.transformations.ome_zarr import (
 )
 from numcodecs import blosc
 from numcodecs.abc import Codec
+from zarr.errors import ContainsGroupError
 
 blosc.use_threads = False
-from xarray_multiscale.reducers import windowed_rank, windowed_mean
+from xarray_multiscale.reducers import windowed_mean, windowed_rank
 
 _LOGGER = logging.getLogger(__name__)
 

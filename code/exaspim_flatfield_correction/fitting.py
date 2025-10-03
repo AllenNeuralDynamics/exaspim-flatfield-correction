@@ -3,7 +3,7 @@ from collections.abc import Iterable
 
 import dask.array as da
 import numpy as np
-from scipy.interpolate import splrep, splev
+from scipy.interpolate import splev, splrep
 from scipy.ndimage import gaussian_filter1d
 
 _LOGGER = logging.getLogger(__name__)
@@ -359,7 +359,11 @@ def masked_axis_profile(
 
     masked = np.where(mask_np, volume_np, np.nan)
     if global_med_value is None:
-        global_med_value = float(np.nanpercentile(masked, percentile, weights=weights, method=method))
+        global_med_value = float(
+            np.nanpercentile(
+                masked, percentile, weights=weights, method=method
+            )
+        )
     print(global_med_value)
 
     profiles: dict[int, np.ndarray] = {}
@@ -383,7 +387,9 @@ def masked_axis_profile(
             )
         profile = np.where(np.isnan(profile), global_med_value, profile)
         if min_voxels:
-            profile = np.where(coverage >= min_voxels, profile, global_med_value)
+            profile = np.where(
+                coverage >= min_voxels, profile, global_med_value
+            )
         profiles[axis] = np.asarray(profile, dtype=np.float32)
 
     results: dict[int, np.ndarray] = {}
@@ -398,7 +404,9 @@ def masked_axis_profile(
             smoothed = gaussian_filter1d(
                 smoothed, sigma=smooth_sigma, mode="nearest"
             )
-        norm_profile = (smoothed / global_med_value).astype(np.float32, copy=False)
+        norm_profile = (smoothed / global_med_value).astype(
+            np.float32, copy=False
+        )
         results[axis] = norm_profile
 
     return results

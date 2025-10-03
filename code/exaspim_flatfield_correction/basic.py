@@ -1,11 +1,8 @@
 import logging
 
-import numpy as np
 import dask.array as da
-
-from exaspim_flatfield_correction.utils.utils import (
-    resize
-)
+import numpy as np
+from exaspim_flatfield_correction.utils.utils import resize
 
 _LOGGER = logging.getLogger(__name__)
 

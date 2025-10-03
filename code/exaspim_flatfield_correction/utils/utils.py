@@ -1,18 +1,18 @@
-import os
 import io
 import logging
+import os
 import re
 import subprocess
 from pathlib import Path
 
 import boto3
 import dask
-import tifffile
-import numpy as np
 import dask.array as da
-from skimage.transform import resize as _resize
-from botocore.exceptions import ClientError
 import matplotlib
+import numpy as np
+import tifffile
+from botocore.exceptions import ClientError
+from skimage.transform import resize as _resize
 
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
@@ -465,7 +465,7 @@ def get_mem_limit() -> int | str:
         raise ValueError(
             f"CO_MEMORY must be an integer number of bytes; got {raw!r}"
         ) from exc
-    
+
 
 def load_mask_from_dir(mask_dir: str, tile_name: str) -> np.ndarray:
     """Load the binary mask that corresponds to ``tile_name``.
