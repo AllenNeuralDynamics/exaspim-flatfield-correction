@@ -1,15 +1,17 @@
-import numpy as np
 import logging
+
+import dask.array as da
+import numpy as np
 
 _LOGGER = logging.getLogger(__name__)
 
 
 def estimate_bkg(
     im: np.ndarray,
-    sigmaFactor: float = 3.0,
-    probThresh: float = 0.01,
-    nIter: int = 100,
-) -> np.ndarray:
+    sigma_factor: float = 3.0,
+    prob_thresh: float = 0.01,
+    n_iter: int = 100,
+) -> tuple[np.ndarray, np.ndarray]:
     """
     Flat-field background estimation for scattered light with
     variable background, processing a 3D array.
@@ -19,19 +21,20 @@ def estimate_bkg(
     im : np.ndarray, shape (z, y, x)
         3D array where each slice is im[z, :, :].
         Typically loaded from Zarr or elsewhere.
-    sigmaFactor : float
+    sigma_factor : float
         Multiplier for pixel-level std to identify high pixels.
-    probThresh : float
+    prob_thresh : float
         Probability threshold: fraction of pixels in a slice that
-        exceed (mu + sigmaFactor*sigma).
-    nIter : int
+        exceed (mu + sigma_factor*sigma).
+    n_iter : int
         Number of iterations for outlier slice removal.
 
     Returns
     -------
-    np.ndarray, shape (y, x)
-        2D array representing the estimated background (median across z).
-        This is the final background estimate after removing outlier slices.
+    tuple[np.ndarray, np.ndarray]
+        Tuple where the first element is the estimated 2D background (median
+        across z) and the second element is the indices of slices retained for
+        background modeling.
     """
 
     # -- Sanity checks --
@@ -44,27 +47,30 @@ def estimate_bkg(
     std_z = np.std(im, axis=(1, 2))
     slice_mask = std_z <= np.percentile(std_z, 5)
 
+    retained_indices = np.flatnonzero(slice_mask)
     im = im[slice_mask, :, :]  # shape now could be (z', y, x)
     initial = im.copy()
+    initial_indices = retained_indices.copy()
 
     # Iterative outlier-slice removal
-    for _ in range(nIter):
+    for _ in range(n_iter):
         # Compute mean & std across slices (axis=0) => shape (y, x)
         # Remember, after removing slices, we have new z' dimension
         mu = np.median(im)
         sigma = np.std(im)
 
         # fraction of "high" pixels in each slice => shape (z',)
-        threshold_2d = mu + sigmaFactor * sigma  # shape (y, x)
+        threshold_2d = mu + sigma_factor * sigma  # shape (y, x)
         # Broadcast threshold over each slice
         high_count = im > threshold_2d  # shape (z', y, x)
         frac_high = np.mean(high_count, axis=(1, 2))
 
         # We remove slices if:
-        #   fraction of high pixels > probThresh
-        inds_remove = frac_high > probThresh
+        #   fraction of high pixels > prob_thresh
+        inds_remove = frac_high > prob_thresh
 
         keep_mask = ~inds_remove
+        retained_indices = retained_indices[keep_mask]
         im = im[keep_mask, :, :]
 
         if np.mean(inds_remove) < 0.0001:
@@ -76,7 +82,27 @@ def estimate_bkg(
             "Could not estimate background from tile, using initial guess."
         )
         im = initial
+        retained_indices = initial_indices
 
     mu_final = np.median(im, axis=0).astype(np.float32)  # (y, x)
 
-    return mu_final
+    return mu_final, retained_indices.astype(np.int64, copy=False)
+
+
+def subtract_bkg(im: da.Array, bkg_da: da.Array) -> da.Array:
+    """
+    Subtract a background image from an image and clip to valid range.
+
+    Parameters
+    ----------
+    im : dask.array.Array
+        Input image.
+    bkg_da : dask.array.Array
+        Background image to subtract.
+
+    Returns
+    -------
+    dask.array.Array
+        Background-subtracted and clipped image.
+    """
+    return da.clip(im - bkg_da, 0, None)

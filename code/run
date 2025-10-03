@@ -1,14 +1,30 @@
 #!/usr/bin/env bash
 set -ex
 
+source $(conda info --base)/etc/profile.d/conda.sh
+conda activate correction
+
 export AWS_REQUEST_CHECKSUM_CALCULATION=when_required
 export AWS_RESPONSE_CHECKSUM_VALIDATION=when_required
 
-export MALLOC_TRIM_THRESHOLD_=0
+export MALLOC_TRIM_THRESHOLD_=65536
 
 # This is the master script for the capsule. When you click "Reproducible Run", the code in this file will execute.
 
-python -u -m exaspim_flatfield_correction.pipeline.run_pipeline \
+# Check if eighth argument is 1
+BINNED_FLAG=""
+if [ "$8" == "1" ]; then
+  BINNED_FLAG="--is-binned"
+fi
+
+TILE_NUM=$(basename "$1")
+echo "Processing tile: $TILE_NUM"
+
+# create a artifacts directory with the parent directory of the output S3 path
+ARTIFACTS_PATH="$(dirname "$2")/artifacts/$TILE_NUM"
+echo "Creating artifacts directory at: $ARTIFACTS_PATH"
+
+python -m exaspim_flatfield_correction.pipeline \
 --zarr "$1" \
 --output "$2" \
 --res "$3" \
@@ -17,6 +33,10 @@ python -u -m exaspim_flatfield_correction.pipeline.run_pipeline \
 --num-workers "$6" \
 --mask-dir "$7" \
 --n-levels 7 \
---overwrite
+--results-dir "/results" \
+--save-outputs \
+--fitting-config "$9" \
+--overwrite \
+$BINNED_FLAG
 
 echo "Done!"

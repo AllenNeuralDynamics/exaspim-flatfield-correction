@@ -44,6 +44,20 @@
 			"name": "mask-dir",
 			"type": "text",
 			"value_type": "string"
+		},
+		{
+			"id": "t0iuucNbj8PQTSQQ",
+			"name": "is-binned",
+			"type": "text",
+			"value_type": "integer",
+			"default_value": "0",
+			"maximum": 1
+		},
+		{
+			"id": "gEfv91spv5kiB7uM",
+			"name": "fitting-config",
+			"type": "text",
+			"value_type": "string"
 		}
 	]
 }

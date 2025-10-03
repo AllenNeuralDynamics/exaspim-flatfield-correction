@@ -1,16 +1,334 @@
 #!/usr/bin/env bash
-set -ex
+set -uo pipefail
+
+# ---- Config (override via env) ------------------------------------------------
+# Default extensions dir to match your Docker snippet:
+EXT_DIR="${EXT_DIR:-/.vscode/extensions}"
+CURL_RETRIES="${CURL_RETRIES:-3}"
+MAX_VERSION_TRIES="${MAX_VERSION_TRIES:-5}"  # how many prior versions to try for backoff installs
+
+# ---- Install locations --------------------
+# We install the extracted code-server dir under /.code-server and symlink the binary into /usr/bin
+# You can still override these via env: BIN_DIR=/custom/bin LIB_DIR=/custom/lib EXT_DIR=/custom/ext
+BIN_DIR="${BIN_DIR:-/usr/bin}"
+LIB_DIR="${LIB_DIR:-/.code-server}"
+mkdir -p "$BIN_DIR" "$LIB_DIR"
+
+# ---- Helpers ------------------------------------------------------------------
+need_cmd() { command -v "$1" >/dev/null 2>&1 || { echo "Missing required command: $1" >&2; exit 1; }; }
+log() { printf "\n\033[1;34m==>\033[0m %s\n" "$*"; }
+
+need_cmd curl
+need_cmd tar
+need_cmd awk
+need_cmd sed
+need_cmd grep
+
+# centralized temp cleanup (robust even on `exit`)
+declare -a __CLEANUP=()
+cleanup_add() { __CLEANUP+=("$1"); }
+cleanup_run() { local p; for p in "${__CLEANUP[@]}"; do [[ -n "${p:-}" ]] && rm -rf "$p"; done; }
+trap cleanup_run EXIT
+
+arch_map() {
+  local m; m="$(uname -m)"
+  case "$m" in
+    x86_64|amd64)  echo "amd64" ;;
+    aarch64|arm64) echo "arm64" ;;
+    *) echo "Unsupported arch: $m" >&2; exit 1 ;;
+  esac
+}
+
+require_linux() {
+  local s; s="$(uname -s)"
+  if [[ "$s" != "Linux" ]]; then
+    echo "This script currently targets Linux. Detected: $s" >&2
+    exit 1
+  fi
+}
+
+# ---- Install latest code-server ----------------------
+install_latest_code_server() {
+  require_linux
+  local arch; arch="$(arch_map)"
+  local api="https://api.github.com/repos/coder/code-server/releases/latest"
+  local tmp; tmp="$(mktemp -d)"; cleanup_add "$tmp"
+
+  log "Resolving latest code-server release from GitHub…"
+  local curl_args=(-fsSL --retry "$CURL_RETRIES" --retry-connrefused --retry-delay 1 \
+                   -H 'Accept: application/vnd.github+json' \
+                   -H 'User-Agent: code-server-install')
+  [[ -n "${GH_TOKEN:-}" ]] && curl_args+=(-H "Authorization: Bearer $GH_TOKEN")
+
+  local json url remote_ver
+  json="$(curl "${curl_args[@]}" "$api")"
+
+  if printf '%s' "$json" | grep -q '"API rate limit exceeded"'; then
+    echo "GitHub API rate limit exceeded. Set GH_TOKEN to an access token and retry." >&2
+    exit 1
+  fi
+
+  if command -v jq >/dev/null 2>&1; then
+    url="$(jq -r --arg arch "$arch" '.assets[] | select(.name|test("linux-" + $arch + "\\.tar\\.gz$")) | .browser_download_url' <<<"$json" | head -n1)"
+    remote_ver="$(jq -r '.tag_name' <<<"$json" | sed 's/^v//')"
+  else
+    url="$(printf '%s' "$json" \
+      | grep -oE '"browser_download_url":[[:space:]]*"[^"]+linux-'"$arch"'\.tar\.gz"' \
+      | sed -E 's/.*"browser_download_url":[[:space:]]*"([^"]+)".*/\1/' \
+      | head -n1)"
+    remote_ver="$(printf '%s' "$json" | grep -o '"tag_name":"v[^"]*' | head -n1 | sed -E 's/.*"tag_name":"v([^"]*)/\1/')"
+  fi
+
+  [[ -z "${url:-}" || "$url" == "null" ]] && { echo "Could not determine code-server tarball url for arch=$arch" >&2; exit 1; }
+  [[ -z "${remote_ver:-}" || "$remote_ver" == "null" ]] && remote_ver="(unknown)"
+
+  local current_ver=""
+  if [[ -x "$BIN_DIR/code-server" ]]; then
+    current_ver="$("$BIN_DIR/code-server" --version 2>/dev/null | head -n1 | awk '{print $1}')"
+  elif command -v code-server >/dev/null 2>&1; then
+    current_ver="$(code-server --version 2>/dev/null | head -n1 | awk '{print $1}')"
+  fi
+
+  # Skip install if current version is >= remote (version-aware)
+  if [[ -n "$current_ver" && "$remote_ver" =~ ^[0-9] ]]; then
+    local newest
+    newest="$(printf '%s\n%s\n' "$current_ver" "$remote_ver" | sort -V | tail -n1)"
+    if [[ "$newest" == "$current_ver" ]]; then
+      log "code-server $current_ver is up-to-date (>= $remote_ver). Skipping install."
+      return 0
+    fi
+  fi
+
+  log "Downloading code-server $remote_ver ($arch)…"
+  local tgz="$tmp/code-server.tgz"
+  curl -fL --retry "$CURL_RETRIES" --retry-connrefused --retry-delay 1 -o "$tgz" "$url"
+
+  log "Installing to $LIB_DIR (symlink at $BIN_DIR)…"
+  set +o pipefail
+  local extract_dir
+  extract_dir="$(tar -tzf "$tgz" 2>/dev/null | awk -F/ 'NR==1{print $1; exit}')"
+  set -o pipefail
+  tar -xzf "$tgz" -C "$tmp"
+
+  rm -rf "$LIB_DIR/$extract_dir"
+  mv "$tmp/$extract_dir" "$LIB_DIR/$extract_dir"
+  ln -sfn "$LIB_DIR/$extract_dir/bin/code-server" "$BIN_DIR/code-server"
+
+  case ":$PATH:" in
+    *":$BIN_DIR:"*) ;;
+    *) log "Add to PATH for this session: export PATH=\"$BIN_DIR:\$PATH\"";;
+  esac
+
+  # Log embedded VS Code version (3rd line of --version) without leaving files in /tmp
+  if "$BIN_DIR/code-server" --version >/dev/null 2>&1; then
+    "$BIN_DIR/code-server" --version | awk 'NR==3{print "\n\033[1;34m==>\033[0m Detected VS Code " $0}' || true
+  fi
+
+  log "Installed $("$BIN_DIR/code-server" --version | head -n1)"
+}
+
+# ---- VS Code Marketplace helpers ---------------------------------------------
+market_api="https://marketplace.visualstudio.com/_apis/public/gallery"
+
+get_extension_json() {
+  local publisher="$1" name="$2" extid="${publisher}.${name}"
+  # include versions + files + props + asset uri + stats, but NOT latest-only
+  local body='{"filters":[{"criteria":[{"filterType":7,"value":"'"${extid}"'"}]}],"flags":403}'
+  curl -fsSL \
+    -H 'Accept: application/json;api-version=7.1-preview.1' \
+    -H 'Content-Type: application/json' \
+    --retry "$CURL_RETRIES" --retry-connrefused --retry-delay 1 \
+    --data "$body" \
+    "${market_api}/extensionquery"
+}
+
+# Returns the latest STABLE version unless ALLOW_PRERELEASE=1
+get_latest_vsix_version() {
+  local publisher="$1" name="$2"
+  local json; json="$(get_extension_json "$publisher" "$name")"
+
+  if command -v jq >/dev/null 2>&1; then
+    # versions are newest-first; keep the first that is NOT marked prerelease
+    jq -r --arg allow "${ALLOW_PRERELEASE:-0}" '
+      .results[0].extensions[0].versions
+      | ( if $allow == "1" then . else
+            map(select( ((.properties // [])
+               | any(.key=="Microsoft.VisualStudio.Code.PreRelease" and (.value|tostring)=="true")) | not ))
+        end)
+      | .[0].version
+    ' <<<"$json"
+  else
+    # Fallback (no jq): may include prereleases.
+    sed -n 's/.*"version":"\([^"]*\)".*/\1/p' <<<"$json" | head -n1
+  fi
+}
+
+# Returns a newline-separated list of versions (newest first), STABLE unless ALLOW_PRERELEASE=1
+get_version_list() {
+  local publisher="$1" name="$2"
+  local json; json="$(get_extension_json "$publisher" "$name")"
+
+  if command -v jq >/dev/null 2>&1; then
+    jq -r --arg allow "${ALLOW_PRERELEASE:-0}" '
+      .results[0].extensions[0].versions
+      | ( if $allow == "1" then . else
+            map(select( ((.properties // [])
+               | any(.key=="Microsoft.VisualStudio.Code.PreRelease" and (.value|tostring)=="true")) | not ))
+        end)
+      | .[].version
+    ' <<<"$json"
+  else
+    # Fallback (no jq): unfiltered list, may include prereleases.
+    printf '%s' "$json" \
+      | grep -oE '"version":"[^"]+"' \
+      | sed -E 's/.*"version":"([^"]+)".*/\1/' \
+      | awk '!seen[$0]++'
+  fi
+}
+
+get_vsix_download_url() {
+  local publisher="$1" name="$2" version="$3"
+  local json; json="$(get_extension_json "$publisher" "$name")"
+  local url=""
+  if command -v jq >/dev/null 2>&1; then
+    url="$(jq -r --arg ver "$version" '
+      .results[0].extensions[0].versions[]
+      | select(.version==$ver)
+      | (.files[]? | select(.assetType=="Microsoft.VisualStudio.Services.VSIXPackage") | .source) // empty
+    ' <<<"$json" | head -n1)"
+    if [[ -z "$url" || "$url" == "null" ]]; then
+      url="$(jq -r --arg ver "$version" '
+        .results[0].extensions[0].versions[]
+        | select(.version==$ver)
+        | .assetUri + "/Microsoft.VisualStudio.Services.VSIXPackage"
+      ' <<<"$json" | head -n1)"
+    fi
+  else
+    url="$(printf '%s' "$json" \
+      | grep -oE '"source":[[:space:]]*"https:[^"]+Microsoft\.VisualStudio\.Services\.VSIXPackage"' \
+      | head -n1 | sed -E 's/.*"source":[[:space:]]*"([^"]+)".*/\1/')"
+    if [[ -z "$url" ]]; then
+      local asset_uri
+      asset_uri="$(printf '%s' "$json" | grep -oE '"assetUri":[[:space:]]*"https:[^"]+"' | head -n1 | sed -E 's/.*"assetUri":[[:space:]]*"([^"]+)".*/\1/')"
+      [[ -n "$asset_uri" ]] && url="${asset_uri}/Microsoft.VisualStudio.Services.VSIXPackage"
+    fi
+  fi
+  printf '%s' "$url"
+}
+
+download_vsix() {
+  local url="$1" out="$2"
+  curl -fL --retry "$CURL_RETRIES" --retry-connrefused --retry-delay 1 \
+       -H 'Accept: application/octet-stream' \
+       -o "$out" "$url"
+  # PK zip signature check
+  head -c 2 "$out" | grep -q '^PK' || {
+    echo "Downloaded file is not a VSIX (ZIP). First 200 bytes:" >&2
+    head -c 200 "$out" | sed 's/[^[:print:]\t]/./g' >&2 || true
+    return 1
+  }
+}
+
+download_and_install_extension() {
+  local publisher="$1" name="$2"
+  mkdir -p "$EXT_DIR"
+
+  log "Resolving latest version for ${publisher}.${name}…"
+  local version; version="$(get_latest_vsix_version "$publisher" "$name")"
+  [[ -z "${version:-}" || "$version" == "null" ]] && { echo "Failed to resolve version for ${publisher}.${name}" >&2; exit 1; }
+  log "Latest ${publisher}.${name} = ${version}"
+
+  local tmp; tmp="$(mktemp -d)"; cleanup_add "$tmp"
+  local vsix="$tmp/${publisher}.${name}.${version}.vsix"
+  local url; url="$(get_vsix_download_url "$publisher" "$name" "$version")"
+  [[ -z "${url:-}" ]] && { echo "Could not resolve VSIX download URL for ${publisher}.${name} ${version}" >&2; exit 1; }
+
+  log "Downloading VSIX for ${publisher}.${name}…"
+  download_vsix "$url" "$vsix"
+
+  log "Installing ${publisher}.${name} ${version} → ${EXT_DIR}…"
+  "$BIN_DIR/code-server" --extensions-dir="$EXT_DIR" --install-extension "$vsix"
+}
+
+# Try newest→older up to MAX_VERSION_TRIES, stop at first success
+download_and_install_extension_best_effort() {
+  local publisher="$1" name="$2" max_tries="${3:-$MAX_VERSION_TRIES}"
+  mkdir -p "$EXT_DIR"
+
+  log "Fetching version list for ${publisher}.${name}…"
+  local versions
+  IFS=$'\n' read -r -d '' -a versions < <(get_version_list "$publisher" "$name" && printf '\0')
+
+  if [[ ${#versions[@]} -eq 0 ]]; then
+    echo "No versions found for ${publisher}.${name}" >&2
+    exit 1
+  fi
+
+  local tmp; tmp="$(mktemp -d)"; cleanup_add "$tmp"
+
+  local tried=0 v url vsix out rc
+  for v in "${versions[@]}"; do
+    (( tried >= max_tries )) && { echo "No compatible ${publisher}.${name} found after $max_tries attempts." >&2; exit 1; }
+
+    log "Attempt $((tried+1))/$max_tries: trying ${publisher}.${name} ${v}…"
+    url="$(get_vsix_download_url "$publisher" "$name" "$v")"
+    if [[ -z "${url:-}" ]]; then
+      log "Could not resolve download URL for ${v}; trying next…"
+      ((tried++)); continue
+    fi
+
+    vsix="$tmp/${publisher}.${name}.${v}.vsix"
+    if ! download_vsix "$url" "$vsix"; then
+      log "Download looked wrong for ${v}; trying next…"
+      ((tried++)); continue
+    fi
+
+    out="$("$BIN_DIR/code-server" --extensions-dir="$EXT_DIR" --install-extension "$vsix" 2>&1)"; rc=$?
+
+    if [[ $rc -eq 0 ]]; then
+      log "Installed ${publisher}.${name} ${v}"
+      return 0
+    fi
+
+    if printf '%s' "$out" | grep -qi 'not compatible with VS Code'; then
+      log "Version ${v} not compatible with this code-server (VS Code)."
+      ((tried++))
+      continue
+    else
+      echo "Failed to install ${publisher}.${name} ${v} for a non-compatibility reason:" >&2
+      printf '%s\n' "$out" >&2
+      exit 1
+    fi
+  done
+
+  echo "Exhausted available versions for ${publisher}.${name} without success." >&2
+  exit 1
+}
+
+# ---- Run ----------------------------------------------------------------------
+install_latest_code_server
+
+# Copilot usually fine on latest:
+download_and_install_extension GitHub copilot
+
+# Copilot Chat: try older versions automatically (override tries via MAX_VERSION_TRIES=N)
+download_and_install_extension_best_effort GitHub copilot-chat
+
+download_and_install_extension_best_effort OpenAI chatgpt
+
+log "All done!"
+
+conda update conda -y
+conda update mamba -y
+mamba create -n correction -c conda-forge python=3.11 -y
+source $(conda info --base)/etc/profile.d/conda.sh
+conda activate correction
 
 git clone https://github.com/AllenNeuralDynamics/exaspim-flatfield-correction.git
-cd exaspim-flatfield-correction/
-cd code/
-pip install .[basicpy]
-cd ../..
+cd exaspim-flatfield-correction
+git checkout dev
+pip install .
 
-VERSION=4.100.3
-mkdir /.code-server
-cd /.code-server
-curl -fL "https://github.com/coder/code-server/releases/download/v$VERSION/code-server-$VERSION-linux-amd64.tar.gz" \
-  | tar -xz
-ln -s /.code-server/code-server-$VERSION-linux-amd64/bin/code-server  /usr/bin/code-server
-cd -
+curl "https://awscli.amazonaws.com/awscli-exe-linux-x86_64.zip" -o "awscliv2.zip"
+unzip awscliv2.zip
+./aws/install

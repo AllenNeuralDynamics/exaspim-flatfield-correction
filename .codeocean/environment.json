@@ -1,0 +1,37 @@
+{
+	"version": 1,
+	"base_image": "codeocean/mambaforge3:23.1.0-4-python3.10.12-ubuntu22.04",
+	"post_install": true,
+	"options": {
+		"registry_host_arg": true,
+		"git_ask_pass": true,
+		"mount_secrets": true
+	},
+	"installers": {
+		"apt": {
+			"packages": [
+				{
+					"name": "build-essential",
+					"version": "12.9ubuntu3"
+				},
+				{
+					"name": "jq",
+					"version": "1.6-2.1ubuntu3.1"
+				},
+				{
+					"name": "ninja-build",
+					"version": "1.10.1-1"
+				},
+				{
+					"name": "wget",
+					"version": "1.21.2-2ubuntu1.1"
+				},
+				{
+					"name": "zip",
+					"version": "3.0-12build2"
+				}
+			],
+			"install_software_properties_common": true
+		}
+	}
+}

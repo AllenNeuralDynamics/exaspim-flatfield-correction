@@ -1,8 +1,5 @@
-/data/
-notebooks/
-.vscode
-code/__pycache__/flatfield_correction.cpython-310.pyc
-code/__pycache__/utils.cpython-310.pyc
-code/__pycache__/zarr_io.cpython-310.pyc
-code/__pycache__/utils.cpython-310.pyc
-code/__pycache__/utils.cpython-310.pyc
+data/
+*.vscode/
+**/__pycache__/
+*.egg-info
+aws/
