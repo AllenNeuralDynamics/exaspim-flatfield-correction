@@ -1,67 +1,57 @@
 # ExASPIM Flatfield Correction
 
-ExASPIM Flatfield Correction is a Python library for robust flatfield and background correction of large-scale fluorescence microscopy datasets in Zarr format. It is designed to support high-throughput, automated correction workflows for multi-tile, multi-resolution volumetric imaging data, with a focus on reproducibility and scalability.
+ExASPIM Flatfield Correction provides background subtraction and flatfield correction for large (TBs) 3D images. The library targets automated, high-throughput processing and ships a command-line pipeline plus supporting utilities and notebooks.
 
-## Features
-- Support for large (many Terabytes) 3D Zarr datasets (local or S3)
-- Automated background estimation and illumination correction
-- Dask-powered, chunked processing
-- OME-NGFF metadata and multiscale pyramid output
-
-## Supported Methods
-
-The main pipeline supports the following correction methods:
-
-- **reference**: Use provided reference flatfield and darkfield images (local or S3) to correct each tile.
-- **basicpy**: Use the [BaSiC](https://github.com/CSBDeep/basicpy) algorithm to estimate flatfield and darkfield from the data itself.
-- **fitting**: Axis-specific intesnity gradient correction via robust spline fitting followed by global inter-tile normalization
-
-All methods support optional background subtraction and mask-based correction. The pipeline is highly configurable and can be run on local or cloud data.
+## Key Capabilities
+- Background estimation with slice rejection tailored for fluorescence microscopy.
+- Reference-, BaSiC-, and spline-fitting-based illumination correction.
+- Optional probabilistic foreground refinement to improve intensity profile estimation.
+- Dask-powered chunked execution with configurable worker counts and memory limits.
 
 ## Installation
+- Python >= 3.11 is required.
+- Install the package and core dependencies with `pip install .` from the repository root.
+- To enable the BaSiC workflow, install the optional extra: `pip install .[basicpy]`.
+
+## Command Line Interface
+The main entry point is exposed as `exaspim-flatfield-run`. You can also invoke the module directly via `python -m exaspim_flatfield_correction.pipeline`.
 
 ```sh
-pip install .
+exaspim-flatfield-run \
+  --zarr s3://bucket/tile_00001.ome.zarr \
+  --output s3://bucket/corrected/tile_00001.ome.zarr \
+  --method fitting \
+  --mask-dir /path/to/masks \
+  --num-workers 8 \
+  --n-levels 4
 ```
 
-## Usage
+Essential arguments:
+- `--zarr`: input tile in OME-Zarr format (local path or S3 URI). When omitted, the pipeline searches for `../data/tile_*.json` metadata.
+- `--output`: destination OME-Zarr path for the corrected volume.
+- `--method`: `reference`, `basicpy`, or `fitting`. The fitting workflow requires `--mask-dir`; the reference workflow expects `--flatfield-path`.
+- `--res`: resolution key to process (default `0`).
 
-### Command Line
+Frequently used options:
+- `--num-workers`: number of Dask workers to launch (one thread per worker).
+- `--results-dir`: directory for logs, diagnostics, and exported artifacts (defaults to `./results`).
+- `--save-outputs`: persist intermediate TIFFs and plots inside `results/`.
+- `--n-levels`: number of multiscale pyramid levels to generate for outputs.
+- `--use-reference-bkg`: reuse precomputed background instead of estimating from the data.
+- `--fitting-config`: JSON file with overrides for mask refinement, percentile weights, spline smoothing, and global normalization.
+- `--median-summary-path`: per-channel normalization overrides produced by upstream statistics.
+- `--is-binned`: flag tiles that correspond to a binned channel so the pipeline adjusts resolution handling.
 
-After installation, run the main pipeline with:
+The pipeline honours the `CO_MEMORY` environment variable (bytes) when sizing the Dask cluster and expects AWS credentials in the environment when reading or writing S3 paths.
 
-```sh
-python -m exaspim_flatfield_correction.pipeline.run_pipeline --zarr <input_zarr> --output <output_zarr> --method <reference|basicpy|fitting> [options]
-```
+## Outputs
+Each tile run writes corrected data to the requested `--output` location and emits auxiliary OME-Zarr artifacts alongside it:
+- `mask/<tile>/0/…`: upsampled foreground mask used for fitting.
+- `probability/<tile>/0/…`: percentile-based probability weights when GMM refinement is enabled in the fitting configuration.
+- `results/`: pipeline metadata, diagnostics, and optional cached intermediates.
 
-Key arguments:
-- `--zarr`: Path to input Zarr (local or S3)
-- `--output`: Output Zarr path
-- `--method`: Correction method (`reference`, `basicpy`, or `fitting`)
-- `--flatfield-path`: Path to reference flatfield (for `reference` method)
-- `--mask-dir`: Directory with masks (for `fitting` method)
-- `--skip-flat-field`: Skip flatfield correction
-- `--skip-bkg-sub`: Skip background subtraction
-- `--n-levels`: Number of Zarr pyramid levels (default: 7)
-
-See `python -m exaspim_flatfield_correction.pipeline.run_pipeline --help` for all options.
-
-You can also import and use individual correction functions for custom workflows.
-
-## Example
-
-```sh
-python -m exaspim_flatfield_correction.pipeline.run_pipeline \
-    --zarr s3://my-bucket/mydata.zarr \
-    --output s3://my-bucket/corrected.zarr \
-    --method fitting \
-    --mask-dir ./masks \
-    --n-levels 5
-```
+## Notebooks
+Interactive examples live under `notebooks/`. `notebooks/probability_weight_demo.ipynb` demonstrates loading a tile, estimating probability weights, and visualising raw slices next to their weighting volume.
 
 ## Development
-To install in editable mode:
-
-```sh
-pip install -e .
-```
+Install in editable mode with `pip install -e .[basicpy]`, set up your preferred environment, and run tests or linting as needed. Console scripts resolve relative to the `code/` package directory, and the `run` shell helper used in the Code Ocean capsule delegates to the same pipeline entry point.
