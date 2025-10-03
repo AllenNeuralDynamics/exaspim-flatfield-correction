@@ -1,3 +1,4 @@
+import os
 import io
 import logging
 import re
@@ -5,6 +6,7 @@ import subprocess
 from pathlib import Path
 
 import boto3
+import dask
 import tifffile
 import numpy as np
 import dask.array as da
@@ -424,3 +426,126 @@ def save_correction_curve_plot(
     fig.tight_layout()
     fig.savefig(out_png, dpi=dpi)
     plt.close(fig)
+
+
+def array_chunks(arr: da.Array) -> tuple[int, ...]:
+    """Return the first chunk length from each axis of a Dask array."""
+
+    return tuple(int(axis_chunks[0]) for axis_chunks in arr.chunks)
+
+
+def chunks_2d(arr: da.Array) -> tuple[int, ...]:
+    """Return chunk lengths for the last two axes of a Dask array."""
+
+    if arr.ndim < 2:
+        return (int(arr.chunks[-1][0]),)
+    return tuple(int(axis_chunks[0]) for axis_chunks in arr.chunks[-2:])
+
+
+def get_mem_limit() -> int | str:
+    """Return the memory limit to pass into ``LocalCluster``.
+
+    Returns
+    -------
+    int or str
+        Explicit byte count if ``CO_MEMORY`` is set, otherwise ``"auto"``.
+
+    Raises
+    ------
+    ValueError
+        If ``CO_MEMORY`` is defined but cannot be parsed as an integer.
+    """
+    raw = os.getenv("CO_MEMORY")
+    if not raw:
+        return "auto"
+
+    try:
+        return int(raw)
+    except ValueError as exc:
+        raise ValueError(
+            f"CO_MEMORY must be an integer number of bytes; got {raw!r}"
+        ) from exc
+    
+
+def load_mask_from_dir(mask_dir: str, tile_name: str) -> np.ndarray:
+    """Load the binary mask that corresponds to ``tile_name``.
+
+    Parameters
+    ----------
+    mask_dir : str
+        Directory that stores candidate mask files.
+    tile_name : str
+        Tile identifier used to locate the matching mask.
+
+    Returns
+    -------
+    numpy.ndarray
+        Mask stored on disk with shape compatible with the tile.
+
+    Raises
+    ------
+    ValueError
+        If the directory or tile name is invalid.
+    FileNotFoundError
+        If no file matching the tile can be located.
+    """
+    if tile_name is None or tile_name == "":
+        raise ValueError("Tile name must be provided to load the mask.")
+    if mask_dir is None or not os.path.isdir(mask_dir):
+        raise ValueError(
+            f"Mask directory {mask_dir} does not exist or is not a directory."
+        )
+    _LOGGER.info(
+        f"Loading mask from directory: {mask_dir} for tile: {tile_name}"
+    )
+    tile_prefix = "_".join(tile_name.split("_")[:2])
+    for root, _, files in os.walk(mask_dir, followlinks=True):
+        for f in files:
+            if tile_prefix in f:
+                maskp = os.path.join(root, f)
+                _LOGGER.info(f"Found mask file: {maskp}")
+                return tifffile.imread(maskp)
+    raise FileNotFoundError(f"No mask file found for tile: {tile_name}")
+
+
+def extract_channel_from_tile_name(tile_name: str) -> str | None:
+    """Extract a numeric channel identifier from a tile name.
+
+    Parameters
+    ----------
+    tile_name : str
+        File or directory name describing the tile (e.g., ``tile_000017_ch_488``).
+
+    Returns
+    -------
+    str or None
+        The extracted channel digits, or ``None`` when no pattern is found.
+    """
+
+    match = re.search(r"_ch_(\d+)", tile_name)
+    if match:
+        return match.group(1)
+
+    match = re.search(r"_ch(\d+)", tile_name)
+    if match:
+        return match.group(1)
+
+    return None
+
+
+def set_dask_config(config_dict: dict | None = None) -> None:
+    """
+    Configure Dask
+    """
+    if config_dict is None:
+        config_dict = {
+            "distributed.worker.memory.target": 0.7,
+            "distributed.worker.memory.spill": 0.8,
+            "distributed.worker.memory.pause": 0.9,
+            "distributed.worker.memory.terminate": 0.95,
+            "distributed.scheduler.allowed-failures": 10,
+            "logging": {
+                "distributed.shuffle._scheduler_plugin": "error",
+            },
+        }
+    dask.config.set(config_dict)

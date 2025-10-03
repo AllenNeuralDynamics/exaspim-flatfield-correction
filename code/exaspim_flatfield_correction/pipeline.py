@@ -1,5 +1,4 @@
 import os
-import re
 import glob
 import time
 import json
@@ -16,7 +15,6 @@ from numcodecs import blosc
 
 blosc.use_threads = False
 import tifffile
-import dask
 import dask.array as da
 from dask.distributed import performance_report
 from distributed import Client, LocalCluster
@@ -46,6 +44,7 @@ from exaspim_flatfield_correction.utils.zarr_utils import (
 )
 from exaspim_flatfield_correction.utils.metadata_utils import (
     create_processing_metadata,
+    save_metadata
 )
 from exaspim_flatfield_correction.utils.utils import (
     get_parent_s3_path,
@@ -54,6 +53,12 @@ from exaspim_flatfield_correction.utils.utils import (
     resize,
     save_correction_curve_plot,
     upload_artifacts,
+    array_chunks,
+    chunks_2d,
+    get_mem_limit,
+    extract_channel_from_tile_name,
+    load_mask_from_dir,
+    set_dask_config
 )
 from exaspim_flatfield_correction.config import (
     FittingConfig,
@@ -69,6 +74,7 @@ logging.basicConfig(
 )
 _LOGGER = logging.getLogger(__name__)
 
+
 @dataclass
 class MaskArtifacts:
     """Container for cached mask artifacts reused within the pipeline."""
@@ -77,111 +83,7 @@ class MaskArtifacts:
     probability_volume: da.Array | None = None
 
 
-def _array_chunks(arr: da.Array) -> tuple[int, ...]:
-    """Return the first chunk length from each axis of a Dask array."""
-
-    return tuple(int(axis_chunks[0]) for axis_chunks in arr.chunks)
-
-
-def _spatial_chunks(arr: da.Array) -> tuple[int, ...]:
-    """Return chunk lengths for the last two axes of a Dask array."""
-
-    if arr.ndim < 2:
-        return (int(arr.chunks[-1][0]),)
-    return tuple(int(axis_chunks[0]) for axis_chunks in arr.chunks[-2:])
-
-def get_mem_limit() -> int | str:
-    """Return the memory limit to pass into ``LocalCluster``.
-
-    Returns
-    -------
-    int or str
-        Explicit byte count if ``CO_MEMORY`` is set, otherwise ``"auto"``.
-
-    Raises
-    ------
-    ValueError
-        If ``CO_MEMORY`` is defined but cannot be parsed as an integer.
-    """
-    raw = os.getenv("CO_MEMORY")
-    if not raw:
-        return "auto"
-
-    try:
-        return int(raw)
-    except ValueError as exc:
-        raise ValueError(
-            f"CO_MEMORY must be an integer number of bytes; got {raw!r}"
-        ) from exc
-
-
-def load_mask_from_dir(mask_dir: str, tile_name: str) -> np.ndarray:
-    """Load the binary mask that corresponds to ``tile_name``.
-
-    Parameters
-    ----------
-    mask_dir : str
-        Directory that stores candidate mask files.
-    tile_name : str
-        Tile identifier used to locate the matching mask.
-
-    Returns
-    -------
-    numpy.ndarray
-        Mask stored on disk with shape compatible with the tile.
-
-    Raises
-    ------
-    ValueError
-        If the directory or tile name is invalid.
-    FileNotFoundError
-        If no file matching the tile can be located.
-    """
-    if tile_name is None or tile_name == "":
-        raise ValueError("Tile name must be provided to load the mask.")
-    if mask_dir is None or not os.path.isdir(mask_dir):
-        raise ValueError(
-            f"Mask directory {mask_dir} does not exist or is not a directory."
-        )
-    _LOGGER.info(
-        f"Loading mask from directory: {mask_dir} for tile: {tile_name}"
-    )
-    tile_prefix = "_".join(tile_name.split("_")[:2])
-    for root, _, files in os.walk(mask_dir, followlinks=True):
-        for f in files:
-            if tile_prefix in f:
-                maskp = os.path.join(root, f)
-                _LOGGER.info(f"Found mask file: {maskp}")
-                return tifffile.imread(maskp)
-    raise FileNotFoundError(f"No mask file found for tile: {tile_name}")
-
-
-def extract_channel_from_tile_name(tile_name: str) -> str | None:
-    """Extract a numeric channel identifier from a tile name.
-
-    Parameters
-    ----------
-    tile_name : str
-        File or directory name describing the tile (e.g., ``tile_000017_ch_488``).
-
-    Returns
-    -------
-    str or None
-        The extracted channel digits, or ``None`` when no pattern is found.
-    """
-
-    match = re.search(r"_ch_(\d+)", tile_name)
-    if match:
-        return match.group(1)
-
-    match = re.search(r"_ch(\d+)", tile_name)
-    if match:
-        return match.group(1)
-
-    return None
-
-
-def parse_inputs(args: argparse.Namespace) -> dict[str, str | list[str] | None]:
+def resolve_args(args: argparse.Namespace) -> dict[str, str | list[str] | None]:
     """Collect pipeline inputs from CLI arguments and optional metadata.
 
     Parameters
@@ -325,7 +227,7 @@ def flatfield_reference(full_res: da.Array, flatfield_path: str) -> da.Array:
     if flatfield.shape[-2:] != full_res.shape[-2:]:
         flatfield = resize(flatfield, full_res.shape[-2:])
     flatfield = flatfield / flatfield.max()
-    spatial_chunks = _spatial_chunks(full_res)
+    spatial_chunks = chunks_2d(full_res)
     flatfield = da.from_array(flatfield, chunks=spatial_chunks)
     corrected = da.clip(full_res / flatfield[np.newaxis], 0, 2**16 - 1)
     return corrected
@@ -390,7 +292,7 @@ def flatfield_basicpy(
         )
     mask = None
     if mask_dir is not None and results_dir is not None:
-        mask_chunks = _array_chunks(low_res)
+        mask_chunks = array_chunks(low_res)
         mask = _preprocess_mask(
             load_mask_from_dir(mask_dir, tile_name),
             low_res.shape,
@@ -502,7 +404,7 @@ def _create_mask_artifacts(
 
     """
     _LOGGER.info("Creating mask artifacts using tile %s", tile_name)
-    mask_chunks = _array_chunks(low_res)
+    mask_chunks = array_chunks(low_res)
     initial_mask = _preprocess_mask(
         size_filter(load_mask_from_dir(mask_dir, tile_name), k_largest=1, min_size=None),
         low_res.shape,
@@ -666,7 +568,7 @@ def flatfield_fitting(
         mask_upscaled = upscale_mask_nearest(
             mask,
             full_res.shape,
-            chunks=_array_chunks(full_res),
+            chunks=array_chunks(full_res),
         )
 
     mask_path = out_mask_path.rstrip("/") + f"/{tile_name}"
@@ -755,53 +657,6 @@ def flatfield_fitting(
         axis_fits,
         mask_artifacts,
     )
-
-
-def save_metadata(
-    data_process: Any,
-    out_path: str,
-    tile_name: str,
-    tile_path: str,
-    results_dir: str,
-) -> None:
-    """Persist processing metadata alongside the corrected tile outputs.
-
-    Parameters
-    ----------
-    data_process : Any
-        Structured metadata object exposing ``model_dump_json``.
-    out_path : str
-        Target path of the corrected tile Zarr store.
-    tile_name : str
-        Identifier of the tile being processed.
-    tile_path : str
-        Source Zarr path for the tile.
-    results_dir : str
-        Directory in which metadata JSON artifacts are saved.
-    """
-    process_json = data_process.model_dump_json()
-    process_json_path = str(
-        Path(results_dir)
-        / f"process_{Path(out_path).parent.name}_{tile_name}.json"
-    )
-    with open(process_json_path, "w") as f:
-        f.write(process_json)
-
-    input_metadata_path = get_parent_s3_path(get_parent_s3_path(tile_path))
-    output_metadata_path = get_parent_s3_path(out_path)
-    metadata_json_path = str(
-        Path(results_dir)
-        / f"metadata_paths_{Path(out_path).parent.name}_{tile_name}.json"
-    )
-    with open(metadata_json_path, "w") as f:
-        f.write(
-            json.dumps(
-                {
-                    "input_metadata": input_metadata_path,
-                    "output_metadata": output_metadata_path,
-                }
-            )
-        )
 
 
 def save_method_outputs(
@@ -1081,30 +936,6 @@ def get_channel_resolution(
     return is_binned, binned_res if is_binned else res
 
 
-def set_dask_config(results_dir: str):
-    """Configure Dask memory thresholds and scratch directory.
-
-    Parameters
-    ----------
-    results_dir : str
-        Directory in which the Dask temporary folder will be created.
-    """
-    dask_tmp_dir = os.path.join(results_dir, "dask-tmp")
-    dask.config.set(
-        {
-            "temporary-directory": dask_tmp_dir,
-            "distributed.worker.memory.target": 0.7,
-            "distributed.worker.memory.spill": 0.8,
-            "distributed.worker.memory.pause": 0.9,
-            "distributed.worker.memory.terminate": 0.95,
-            "distributed.scheduler.allowed-failures": 10,
-            "logging": {
-                "distributed.shuffle._scheduler_plugin": "error",
-            },
-        }
-    )
-
-
 def parse_and_validate_args() -> argparse.Namespace:
     """
     Parse and validate command-line arguments for the flatfield
@@ -1210,8 +1041,8 @@ def parse_and_validate_args() -> argparse.Namespace:
     return args
 
 
-def create_mask_path(out_zarr_path: str) -> str:
-    """Derive the OME-Zarr mask output path from the corrected dataset path.
+def create_zarr_artifact_path(out_zarr_path: str, dirname: str) -> str:
+    """Derive the OME-Zarr artifact output path from the corrected dataset path.
 
     Parameters
     ----------
@@ -1221,33 +1052,13 @@ def create_mask_path(out_zarr_path: str) -> str:
     Returns
     -------
     str
-        Path pointing to the associated mask dataset.
+        Path pointing to the associated artifact dataset.
     """
     out_zarr_folder = Path(out_zarr_path).name
-    out_mask_path = out_zarr_path.replace(
-        out_zarr_folder, f"mask/{out_zarr_folder}"
+    out_path = out_zarr_path.replace(
+        out_zarr_folder, f"{dirname}/{out_zarr_folder}"
     )
-    return out_mask_path
-
-
-def create_probability_path(out_zarr_path: str) -> str:
-    """Derive the probability volume output path from the corrected dataset.
-
-    Parameters
-    ----------
-    out_zarr_path : str
-        Path to the corrected OME-Zarr dataset.
-
-    Returns
-    -------
-    str
-        Path pointing to the probability-volume dataset.
-    """
-
-    out_zarr_folder = Path(out_zarr_path).name
-    return out_zarr_path.replace(
-        out_zarr_folder, f"probability/{out_zarr_folder}"
-    )
+    return out_path
 
 
 def main() -> None:
@@ -1257,7 +1068,7 @@ def main() -> None:
 
     _LOGGER.info(f"args: {args}")
 
-    params = parse_inputs(args)
+    params = resolve_args(args)
     _LOGGER.info(f"Parsed parameters: {params}")
 
     tile_paths = params["tile_paths"]
@@ -1273,7 +1084,19 @@ def main() -> None:
     # TODO: make a parameter
     binned_res = "0"
 
-    set_dask_config(results_dir)
+    dask_config = {
+            "temporary-directory": os.path.join(results_dir, "dask-temp"),
+            "distributed.worker.memory.target": 0.7,
+            "distributed.worker.memory.spill": 0.8,
+            "distributed.worker.memory.pause": 0.9,
+            "distributed.worker.memory.terminate": 0.95,
+            "distributed.scheduler.allowed-failures": 10,
+            "logging": {
+                "distributed.shuffle._scheduler_plugin": "error",
+            },
+    }
+    set_dask_config(dask_config)
+
     co_memory = get_mem_limit()
     _LOGGER.info(f"CO_MEMORY: {co_memory}")
 
@@ -1298,8 +1121,8 @@ def main() -> None:
     )
     _LOGGER.info(f"Dask client: {client}")
 
-    out_mask_path = create_mask_path(out_path)
-    out_probability_path = create_probability_path(out_path)
+    out_mask_path = create_zarr_artifact_path(out_path, "mask")
+    out_probability_path = create_zarr_artifact_path(out_path, "probability")
     initialize_zarr_group(out_mask_path)
     initialize_zarr_group(out_probability_path)
 

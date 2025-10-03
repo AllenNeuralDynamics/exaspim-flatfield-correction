@@ -1,4 +1,6 @@
 from datetime import datetime
+import json
+from pathlib import Path
 from typing import Any
 
 from aind_data_schema.core.processing import DataProcess
@@ -55,3 +57,51 @@ def create_processing_metadata(
     }
     process = DataProcess(**processing_info)
     return process
+
+
+def save_metadata(
+    data_process: Any,
+    out_path: str,
+    tile_name: str,
+    tile_path: str,
+    results_dir: str,
+) -> None:
+    """Persist processing metadata alongside the corrected tile outputs.
+
+    Parameters
+    ----------
+    data_process : Any
+        Structured metadata object exposing ``model_dump_json``.
+    out_path : str
+        Target path of the corrected tile Zarr store.
+    tile_name : str
+        Identifier of the tile being processed.
+    tile_path : str
+        Source Zarr path for the tile.
+    results_dir : str
+        Directory in which metadata JSON artifacts are saved.
+    """
+    process_json = data_process.model_dump_json()
+    process_json_path = str(
+        Path(results_dir)
+        / f"process_{Path(out_path).parent.name}_{tile_name}.json"
+    )
+    with open(process_json_path, "w") as f:
+        f.write(process_json)
+
+    input_metadata_path = get_parent_s3_path(get_parent_s3_path(tile_path))
+    output_metadata_path = get_parent_s3_path(out_path)
+    metadata_json_path = str(
+        Path(results_dir)
+        / f"metadata_paths_{Path(out_path).parent.name}_{tile_name}.json"
+    )
+    with open(metadata_json_path, "w") as f:
+        f.write(
+            json.dumps(
+                {
+                    "input_metadata": input_metadata_path,
+                    "output_metadata": output_metadata_path,
+                }
+            )
+        )
+        
