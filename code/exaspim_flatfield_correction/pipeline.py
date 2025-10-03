@@ -554,9 +554,10 @@ def _create_mask_artifacts(
             overwrite=overwrite,
             write_empty_chunks=False,
         )
+        # Do not materialize into memory until needed
         probability_volume = da.from_zarr(
             probability_path, component="0"
-        ).squeeze().compute()
+        ).squeeze()
 
     return MaskArtifacts(
         mask_low_res=initial_mask,
@@ -655,7 +656,7 @@ def flatfield_fitting(
         )
 
     mask = mask_artifacts.mask_low_res
-    weights = mask_artifacts.probability_volume
+
 
     if mask.shape == full_res.shape:
         _LOGGER.info("Mask already at full resolution, skipping upscaling.")
@@ -690,6 +691,8 @@ def flatfield_fitting(
     profile_percentile = config.profile_percentile
     profile_min_voxels = config.profile_min_voxels
     spline_smoothing = config.spline_smoothing
+
+    weights = mask_artifacts.probability_volume
 
     if weights is not None:
         low_res_masked, weights_masked = da.compute(low_res[mask], weights[mask])
@@ -727,9 +730,10 @@ def flatfield_fitting(
         limits_x=config.limits_x,
         limits_y=config.limits_y,
         limits_z=config.limits_z,
-        weights=weights,
+        weights=weights.compute(), # bring into memory for fitting only
         global_med=global_val,
     )
+    del low_res, mask, weights
 
     global_factor = (
         config.global_factor_binned
