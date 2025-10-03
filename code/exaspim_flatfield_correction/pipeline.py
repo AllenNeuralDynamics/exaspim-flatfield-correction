@@ -30,9 +30,9 @@ from exaspim_flatfield_correction.config import (
 from exaspim_flatfield_correction.fitting import (
     apply_axis_corrections,
     compute_axis_fits,
+    calc_percentile_weight,
 )
 from exaspim_flatfield_correction.utils.mask_utils import (
-    calc_percentile_weight,
     size_filter,
     upscale_mask_nearest,
 )
