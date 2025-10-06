@@ -627,7 +627,7 @@ def flatfield_fitting(
         limits_x=config.limits_x,
         limits_y=config.limits_y,
         limits_z=config.limits_z,
-        weights=weights.compute(),  # bring into memory for fitting only
+        weights=weights.compute() if weights is not None else None,
         global_med=global_val,
     )
     del low_res, mask, weights
