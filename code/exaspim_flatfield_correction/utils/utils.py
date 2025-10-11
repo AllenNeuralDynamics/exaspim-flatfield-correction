@@ -6,7 +6,6 @@ import subprocess
 from pathlib import Path
 
 import boto3
-import dask
 import dask.array as da
 import matplotlib
 import numpy as np
@@ -442,31 +441,6 @@ def chunks_2d(arr: da.Array) -> tuple[int, ...]:
     return tuple(int(axis_chunks[0]) for axis_chunks in arr.chunks[-2:])
 
 
-def get_mem_limit() -> int | str:
-    """Return the memory limit to pass into ``LocalCluster``.
-
-    Returns
-    -------
-    int or str
-        Explicit byte count if ``CO_MEMORY`` is set, otherwise ``"auto"``.
-
-    Raises
-    ------
-    ValueError
-        If ``CO_MEMORY`` is defined but cannot be parsed as an integer.
-    """
-    raw = os.getenv("CO_MEMORY")
-    if not raw:
-        return "auto"
-
-    try:
-        return int(raw)
-    except ValueError as exc:
-        raise ValueError(
-            f"CO_MEMORY must be an integer number of bytes; got {raw!r}"
-        ) from exc
-
-
 def load_mask_from_dir(mask_dir: str, tile_name: str) -> np.ndarray:
     """Load the binary mask that corresponds to ``tile_name``.
 
@@ -532,20 +506,3 @@ def extract_channel_from_tile_name(tile_name: str) -> str | None:
 
     return None
 
-
-def set_dask_config(config_dict: dict | None = None) -> None:
-    """
-    Configure Dask
-    """
-    if config_dict is None:
-        config_dict = {
-            "distributed.worker.memory.target": 0.7,
-            "distributed.worker.memory.spill": 0.8,
-            "distributed.worker.memory.pause": 0.9,
-            "distributed.worker.memory.terminate": 0.95,
-            "distributed.scheduler.allowed-failures": 10,
-            "logging": {
-                "distributed.shuffle._scheduler_plugin": "error",
-            },
-        }
-    dask.config.set(config_dict)
