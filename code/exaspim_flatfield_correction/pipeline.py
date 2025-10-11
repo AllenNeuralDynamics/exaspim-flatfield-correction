@@ -643,6 +643,7 @@ def flatfield_fitting(
         axis_fits,
         global_med=global_val,
         global_factor=global_factor,
+        ratio_limits=config.global_ratio_limits,
     )
 
     # Return corrected image and QC/debug artifacts for saving in main
