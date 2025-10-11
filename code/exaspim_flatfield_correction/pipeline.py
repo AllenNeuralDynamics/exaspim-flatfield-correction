@@ -18,7 +18,6 @@ import dask.array as da
 import tifffile
 from dask.distributed import performance_report
 from dask_image.ndfilters import gaussian_filter as gaussian_filter_dask
-from distributed import Client, LocalCluster
 from exaspim_flatfield_correction.background import estimate_bkg, subtract_bkg
 from exaspim_flatfield_correction.basic import fit_basic, transform_basic
 from exaspim_flatfield_correction.config import (
@@ -45,13 +44,11 @@ from exaspim_flatfield_correction.utils.utils import (
     chunks_2d,
     extract_channel_from_tile_name,
     get_bkg_path,
-    get_mem_limit,
     get_parent_s3_path,
     load_mask_from_dir,
     read_bkg_image,
     resize,
     save_correction_curve_plot,
-    set_dask_config,
     upload_artifacts,
 )
 from exaspim_flatfield_correction.utils.zarr_utils import (
@@ -59,6 +56,8 @@ from exaspim_flatfield_correction.utils.zarr_utils import (
     parse_ome_zarr_transformations,
     store_ome_zarr,
 )
+from exaspim_flatfield_correction.utils.dask_utils import create_dask_client
+
 
 logging.basicConfig(
     format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
@@ -1001,6 +1000,13 @@ def parse_and_validate_args() -> argparse.Namespace:
         help="Path to a JSON file with fitting configuration overrides.",
     )
     parser.add_argument("--num-workers", type=int, default=1)
+    parser.add_argument(
+        "--worker-mode",
+        type=str,
+        choices=["processes", "threads"],
+        default="processes",
+        help="Execution mode for Dask workers (default: processes).",
+    )
     parser.add_argument("--log-level", type=str, default=logging.INFO)
     parser.add_argument(
         "--n-levels",
@@ -1083,40 +1089,10 @@ def main() -> None:
     # TODO: make a parameter
     binned_res = "0"
 
-    dask_config = {
-        "temporary-directory": os.path.join(results_dir, "dask-temp"),
-        "distributed.worker.memory.target": 0.7,
-        "distributed.worker.memory.spill": 0.8,
-        "distributed.worker.memory.pause": 0.9,
-        "distributed.worker.memory.terminate": 0.95,
-        "distributed.scheduler.allowed-failures": 10,
-        "logging": {
-            "distributed.shuffle._scheduler_plugin": "error",
-        },
-    }
-    set_dask_config(dask_config)
-
-    co_memory = get_mem_limit()
-    _LOGGER.info(f"CO_MEMORY: {co_memory}")
-
-    # Support CO_MEMORY='auto' or explicit integer bytes
-    if isinstance(co_memory, int):
-        if co_memory <= 0:
-            raise ValueError(
-                "CO_MEMORY must be set to a positive integer value "
-                "to allocate memory for Dask workers."
-            )
-        memory_limit = int(co_memory / max(1, args.num_workers))
-    else:
-        memory_limit = "auto"
-
-    client = Client(
-        LocalCluster(
-            processes=True,
-            n_workers=args.num_workers,
-            threads_per_worker=1,
-            memory_limit=memory_limit,
-        )
+    client = create_dask_client(
+        results_dir=results_dir,
+        num_workers=args.num_workers,
+        worker_mode=args.worker_mode,
     )
     _LOGGER.info(f"Dask client: {client}")
 

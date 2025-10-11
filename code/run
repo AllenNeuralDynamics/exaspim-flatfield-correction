@@ -36,6 +36,7 @@ python -m exaspim_flatfield_correction.pipeline \
 --results-dir "/results" \
 --save-outputs \
 --fitting-config "$9" \
+--worker-mode "${10}" \
 --overwrite \
 $BINNED_FLAG
 
