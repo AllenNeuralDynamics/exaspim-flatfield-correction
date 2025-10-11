@@ -58,6 +58,13 @@
 			"name": "fitting-config",
 			"type": "text",
 			"value_type": "string"
+		},
+		{
+			"id": "urqiMws3Q95ThLCf",
+			"name": "worker-mode",
+			"type": "text",
+			"value_type": "string",
+			"default_value": "processes"
 		}
 	]
 }
