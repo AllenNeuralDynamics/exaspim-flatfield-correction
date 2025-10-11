@@ -101,7 +101,9 @@ def set_dask_config(config_dict: Mapping[str, Any] | None = None) -> None:
     Parameters
     ----------
     config_dict : Mapping[str, Any] or None, optional
-        Overrides layered on top of the pipeline defaults.
+        Overrides layered on top of the pipeline defaults. 
+        Note that only top-level keys are overriden, meaning 
+        nested dicts are replaced, not merged.
     """
     defaults = {
         "distributed.worker.memory.target": 0.7,
