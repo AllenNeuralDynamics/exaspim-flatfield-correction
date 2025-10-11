@@ -231,15 +231,15 @@ class FittingConfig(BaseModel):
         Path(path).write_text(payload)
 
     @model_validator(mode="after")
-    def _validate_global_ratio_limits(cls, values: "FittingConfig") -> "FittingConfig":
-        limits = values.global_ratio_limits
+    def _validate_global_ratio_limits(self) -> "FittingConfig":
+        limits = self.global_ratio_limits
         if limits is not None:
             lower, upper = limits
             if lower >= upper:
                 raise ValueError(
                     "global_ratio_limits must be ordered as (min, max) with min < max"
                 )
-        return values
+        return self
 
 
 def load_fitting_config(path: str | Path | None = None) -> FittingConfig:
