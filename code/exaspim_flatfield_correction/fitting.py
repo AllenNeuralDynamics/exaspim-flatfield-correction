@@ -182,6 +182,7 @@ def apply_axis_corrections(
     *,
     global_factor: float,
     global_med: float,
+    ratio_limits: "tuple[float, float] | None" = None,
     clip_max: float = 2**16 - 1,
 ) -> da.Array:
     """Apply axis-specific correction curves and global scaling factors.
@@ -196,6 +197,8 @@ def apply_axis_corrections(
         Resampled correction curves for ``{"x", "y", "z"}``.
     global_factor : float
         Target global intensity level used to scale the corrected volume.
+    ratio_limits : tuple of float or None, default=None
+        Optional clamp bounds applied to the global scaling ratio.
     clip_max : float, default=2**16 - 1
         Upper bound used when clipping intensities after correction.
 
@@ -228,6 +231,18 @@ def apply_axis_corrections(
             )
 
         ratio = global_factor / global_med
+        if ratio_limits is not None:
+            clamped_ratio = float(
+                np.clip(ratio, ratio_limits[0], ratio_limits[1])
+            )
+            if clamped_ratio != ratio:
+                _LOGGER.info(
+                    "Clamped global correction ratio from %s to %s using limits %s",
+                    ratio,
+                    clamped_ratio,
+                    ratio_limits,
+                )
+            ratio = clamped_ratio
         _LOGGER.info(
             "Doing global correction with factor: %s and median_xy: %s, ratio = %s",
             global_factor,

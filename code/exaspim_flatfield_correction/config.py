@@ -7,7 +7,7 @@ import logging
 from pathlib import Path
 from typing import Any
 
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -103,6 +103,13 @@ class FittingConfig(BaseModel):
         description=(
             "Target median intensity for unbinned channels after correction, "
             "used to derive the global scaling ratio."
+        ),
+    )
+    global_ratio_limits: tuple[float, float] | None = Field(
+        default=None,
+        description=(
+            "Optional lower/upper clamp applied to the global correction "
+            "ratio (global_factor / global_med); set to null to disable."
         ),
     )
     probability_bg_low_percentile: float = Field(
@@ -222,6 +229,17 @@ class FittingConfig(BaseModel):
 
         payload = json.dumps(self.model_dump(mode="json"), indent=indent)
         Path(path).write_text(payload)
+
+    @model_validator(mode="after")
+    def _validate_global_ratio_limits(cls, values: "FittingConfig") -> "FittingConfig":
+        limits = values.global_ratio_limits
+        if limits is not None:
+            lower, upper = limits
+            if lower >= upper:
+                raise ValueError(
+                    "global_ratio_limits must be ordered as (min, max) with min < max"
+                )
+        return values
 
 
 def load_fitting_config(path: str | Path | None = None) -> FittingConfig:
