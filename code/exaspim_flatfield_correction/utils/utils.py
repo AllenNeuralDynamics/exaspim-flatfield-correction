@@ -2,6 +2,7 @@ import io
 import logging
 import os
 import re
+import math
 import subprocess
 from pathlib import Path
 
@@ -506,3 +507,91 @@ def extract_channel_from_tile_name(tile_name: str) -> str | None:
 
     return None
 
+
+def weighted_percentile(
+    data: da.Array,
+    mask: da.Array,
+    percentile: float,
+    weights: da.Array | None = None,
+) -> float:
+    """
+    Compute a weighted percentile from a masked volume using a histogram.
+
+    Parameters
+    ----------
+    data : dask.array.Array
+        Input volume whose values are assumed to be within the 16-bit range.
+    mask : dask.array.Array
+        Boolean or integer mask identifying voxels to include in the percentile
+        computation. Non-zero entries are treated as foreground.
+    percentile : float
+        Desired percentile in ``[0, 100]``.
+    weights : dask.array.Array or None, optional
+        Per-voxel weights aligned with ``data``. When provided, non-zero mask
+        elements are weighted by these values using the inverted CDF rule.
+
+    Returns
+    -------
+    float
+        The weighted percentile value.
+
+    Raises
+    ------
+    ValueError
+        If ``percentile`` lies outside ``[0, 100]``, the histogram encounter
+        non-finite values, or no voxels are selected by the mask.
+    """
+
+    if not 0.0 <= percentile <= 100.0:
+        raise ValueError(f"Percentile must be between 0 and 100, received {percentile}")
+
+    use_inverted = weights is not None
+
+    if weights is not None:
+        hist_weights = (weights * mask).astype(np.float32)
+    else:
+        hist_weights = mask.astype(np.float32)
+
+    data_min = int(data.min().compute())
+    data_max = int(data.max().compute())
+    if not np.isfinite(data_min) or not np.isfinite(data_max):
+        raise ValueError("Encountered non-finite values while computing percentile range.")
+    if data_min == data_max:
+        return float(data_min)
+
+    bins = int(math.ceil(data_max) - math.floor(data_min)) + 1
+    hist_range = (float(data_min), float(data_max + 1))
+
+    hist_weights = hist_weights.rechunk(data.chunks)
+
+    counts, edges = da.histogram(
+        data,
+        bins=bins,
+        range=hist_range,
+        weights=hist_weights,
+    )
+    counts_np = counts.compute()
+    total_weight = counts_np.sum()
+    if total_weight == 0:
+        raise ValueError("No voxels selected by mask; cannot compute percentile.")
+
+    edges_np = np.asarray(edges)
+    target_weight = (percentile / 100.0) * total_weight
+    cdf = np.cumsum(counts_np)
+    bin_idx = int(np.searchsorted(cdf, target_weight, side="left"))
+    bin_idx = min(bin_idx, len(counts_np) - 1)
+
+    lower_edge = edges_np[bin_idx]
+    upper_edge = edges_np[bin_idx + 1]
+    prev_cumulative = cdf[bin_idx - 1] if bin_idx > 0 else 0.0
+    bin_weight = counts_np[bin_idx]
+    in_bin_target = np.clip(target_weight - prev_cumulative, 0.0, bin_weight)
+
+    if bin_weight == 0 or lower_edge == upper_edge:
+        return float(lower_edge)
+
+    if use_inverted:
+        return float(lower_edge)
+
+    fraction = in_bin_target / bin_weight
+    return float(lower_edge + fraction * (upper_edge - lower_edge))
