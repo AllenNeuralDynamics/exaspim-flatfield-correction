@@ -50,6 +50,7 @@ from exaspim_flatfield_correction.utils.utils import (
     resize,
     save_correction_curve_plot,
     upload_artifacts,
+    weighted_percentile
 )
 from exaspim_flatfield_correction.utils.zarr_utils import (
     initialize_zarr_group,
@@ -586,24 +587,16 @@ def flatfield_fitting(
 
     weights = mask_artifacts.probability_volume
 
-    if weights is not None:
-        low_res_masked, weights_masked = da.compute(
-            low_res[mask], weights[mask]
-        )
-    else:
-        low_res_masked = low_res[mask].compute()
-        weights_masked = None
-
-    global_val = np.percentile(
-        low_res_masked,
+    global_val = weighted_percentile(
+        low_res.astype(np.uint16),
+        mask,
         profile_percentile,
-        weights=weights_masked if weights_masked is not None else None,
-        method="inverted_cdf" if weights_masked is not None else "linear",
+        weights=weights,
     )
+    
     _LOGGER.info(
         f"Computed {profile_percentile} percentile of tile foreground: {global_val}"
     )
-    del low_res_masked, weights_masked
 
     # Clamp the intensity values to reduce the impact of very bright neurites on the profile fit
     _LOGGER.info(f"Clipping low_res with median factor: {med_factor}")
