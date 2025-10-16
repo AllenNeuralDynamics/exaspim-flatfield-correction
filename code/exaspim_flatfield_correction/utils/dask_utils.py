@@ -184,7 +184,7 @@ def _resolve_threads_per_worker(
         If ``worker_mode`` holds an unsupported value.
     """
     if worker_mode == WorkerMode.PROCESSES:
-        cpu_total = os.cpu_count() or 1
+        cpu_total = int(os.getenv("CO_CPUS", os.cpu_count() or 1))
         return num_workers, max(1, cpu_total // max(1, num_workers))
     if worker_mode == WorkerMode.THREADS:
         return 1, num_workers
