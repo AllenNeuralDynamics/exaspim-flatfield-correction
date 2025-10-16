@@ -3,3 +3,4 @@ data/
 **/__pycache__/
 *.egg-info
 aws/
+.vscode
