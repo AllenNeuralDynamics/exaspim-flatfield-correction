@@ -89,7 +89,7 @@ def save_metadata(
         f.write(process_json)
 
     input_metadata_path = get_parent_s3_path(get_parent_s3_path(tile_path))
-    output_metadata_path = get_parent_s3_path(out_path)
+    output_metadata_path = get_parent_s3_path(get_parent_s3_path(out_path))
     metadata_json_path = str(
         Path(results_dir)
         / f"metadata_paths_{Path(out_path).parent.name}_{tile_name}.json"
