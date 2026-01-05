@@ -598,6 +598,12 @@ def flatfield_fitting(
         f"Computed {profile_percentile} percentile of tile foreground: {global_val}"
     )
 
+    if global_val == 0:
+        _LOGGER.warning(
+            f"Skipping flatfield correction for zero-mean tile {tile_name}"
+        )   
+        return full_res, None, mask_artifacts
+
     # Clamp the intensity values to reduce the impact of very bright neurites on the profile fit
     _LOGGER.info(f"Clipping low_res with median factor: {med_factor}")
     low_res = np.clip(low_res.compute(), 0, global_val * med_factor)
