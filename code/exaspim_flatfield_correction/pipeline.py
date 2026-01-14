@@ -406,7 +406,7 @@ def _create_mask_artifacts(
         return None
     initial_mask = _preprocess_mask(
         size_filter(
-            initial_mask, k_largest=1, min_size=None
+            initial_mask, k_largest=2, min_size=None
         ),
         low_res.shape,
         results_dir,
