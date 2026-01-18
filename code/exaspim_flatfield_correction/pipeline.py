@@ -626,10 +626,9 @@ def flatfield_fitting(
         profile_min_voxels,
     )
     axis_fits = compute_axis_fits(
-        low_res,
+        gaussian_filter_dask(low_res, sigma=profile_sigma).compute(),
         mask,
         full_res.shape,
-        smooth_sigma=profile_sigma,
         percentile=profile_percentile,
         min_voxels=profile_min_voxels,
         spline_smoothing=spline_smoothing,

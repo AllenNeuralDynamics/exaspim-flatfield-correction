@@ -98,8 +98,6 @@ def compute_axis_fits(
     volume: "np.ndarray | da.Array",
     mask: "np.ndarray | da.Array",
     full_shape: tuple[int, int, int],
-    *,
-    smooth_sigma: "float | None" = None,
     percentile: "float | None" = None,
     min_voxels: int = 0,
     spline_smoothing: float = 0,
@@ -119,9 +117,6 @@ def compute_axis_fits(
         Foreground mask aligned with ``volume``.
     full_shape : tuple of int
         Target shape of the full-resolution dataset (z, y, x).
-    smooth_sigma : float or None, default=None
-        Optional Gaussian sigma for smoothing the masked profiles prior to
-        normalisation.
     percentile : float or None, default=None
         Percentile used to summarise intensities along each axis; defaults to
         the median.
@@ -153,7 +148,6 @@ def compute_axis_fits(
         volume,
         mask,
         axes=axis_indices,
-        smooth_sigma=smooth_sigma,
         percentile=percentile,
         min_voxels=min_voxels,
         weights=weights,
@@ -308,8 +302,6 @@ def masked_axis_profile(
     volume: "np.ndarray | da.Array",
     mask: "np.ndarray | da.Array",
     axes: Iterable[int],
-    *,
-    smooth_sigma: "float | None" = None,
     percentile: "float | None" = None,
     min_voxels: int = 0,
     weights: "np.ndarray | None" = None,
@@ -326,8 +318,6 @@ def masked_axis_profile(
         Binary mask with the same shape as ``volume``.
     axes : iterable of int
         Axes along which to evaluate the profiles.
-    smooth_sigma : float, optional
-        Standard deviation for optional 1D Gaussian smoothing of the profile.
     percentile : float, optional
         Percentile to use instead of the median when summarising each plane.
     min_voxels : int, optional
@@ -418,12 +408,7 @@ def masked_axis_profile(
         return results, 0.0
 
     for axis, profile_np in profiles.items():
-        smoothed = profile_np
-        if smooth_sigma and smooth_sigma > 0:
-            smoothed = gaussian_filter1d(
-                smoothed, sigma=smooth_sigma, mode="nearest"
-            )
-        norm_profile = (smoothed / global_med_value).astype(
+        norm_profile = (profile_np / global_med_value).astype(
             np.float32, copy=False
         )
         results[axis] = norm_profile
