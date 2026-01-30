@@ -617,7 +617,9 @@ def flatfield_fitting(
 
     # Clamp the intensity values to reduce the impact of very bright neurites on the profile fit
     _LOGGER.info(f"Clipping low_res with median factor: {med_factor}")
-    low_res = np.clip(low_res.compute(), 0, global_val * med_factor)
+    low_res = da.clip(low_res, 0, global_val * med_factor)
+    _LOGGER.info(f"Smoothing low res with sigma: {profile_sigma}")
+    low_res = gaussian_filter_dask(low_res, sigma=profile_sigma).compute()
 
     _LOGGER.info(
         "Computing masked profiles (sigma=%s, percentile=%s, min_voxels=%s)",
@@ -629,7 +631,6 @@ def flatfield_fitting(
         low_res,
         mask,
         full_res.shape,
-        smooth_sigma=profile_sigma,
         percentile=profile_percentile,
         min_voxels=profile_min_voxels,
         spline_smoothing=spline_smoothing,
