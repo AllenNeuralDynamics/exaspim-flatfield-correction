@@ -18,6 +18,8 @@ import dask.array as da
 import tifffile
 from dask.distributed import performance_report
 from dask_image.ndfilters import gaussian_filter as gaussian_filter_dask
+from scipy.ndimage import binary_fill_holes
+
 from exaspim_flatfield_correction.background import estimate_bkg, subtract_bkg
 from exaspim_flatfield_correction.basic import fit_basic, transform_basic
 from exaspim_flatfield_correction.config import (
@@ -405,9 +407,10 @@ def _create_mask_artifacts(
         _LOGGER.warning(f"Mask does not exist for tile {tile_name}. Skipping correction.")
         return None
     initial_mask = _preprocess_mask(
-        size_filter(
-            initial_mask, k_largest=1, min_size=None
-        ),
+        binary_fill_holes(
+            size_filter(
+                initial_mask, k_largest=2, min_size=None
+        )),
         low_res.shape,
         results_dir,
         tile_name,
