@@ -399,9 +399,14 @@ def _create_mask_artifacts(
     """
     _LOGGER.info("Creating mask artifacts using tile %s", tile_name)
     mask_chunks = array_chunks(low_res)
+    try:
+        initial_mask = load_mask_from_dir(mask_dir, tile_name)
+    except FileNotFoundError as e:
+        _LOGGER.warning(f"Mask does not exist for tile {tile_name}. Skipping correction.")
+        return None
     initial_mask = _preprocess_mask(
         size_filter(
-            load_mask_from_dir(mask_dir, tile_name), k_largest=1, min_size=None
+            initial_mask, k_largest=1, min_size=None
         ),
         low_res.shape,
         results_dir,
@@ -548,6 +553,9 @@ def flatfield_fitting(
         _LOGGER.info(
             "Reusing precomputed mask artifacts for tile %s", tile_name
         )
+    if mask_artifacts is None:
+        _LOGGER.warning(f"mask_artifacts is None. Skipping correction for tile {tile_name}")
+        return full_res, None, None
 
     mask = mask_artifacts.mask_low_res
 
