@@ -473,13 +473,40 @@ def load_mask_from_dir(mask_dir: str, tile_name: str) -> np.ndarray:
     _LOGGER.info(
         f"Loading mask from directory: {mask_dir} for tile: {tile_name}"
     )
-    tile_prefix = "_".join(tile_name.split("_")[:2])
+
+    def _extract_identifier(name: str) -> str | None:
+        """Return tile identifier without channel to allow cross-channel reuse."""
+
+        patterns = (
+            r"(tile_x_\d+_y_\d+_z_\d+)(?:_ch_\d+)?",  # tile_x_* style with optional channel
+            r"(tile_\d+)(?:_ch_\d+)?",  # tile_* style with optional channel
+        )
+        for pattern in patterns:
+            match = re.search(pattern, name)
+            if match:
+                return match.group(1)
+        return None
+
+    tile_identifier = _extract_identifier(tile_name)
+    if tile_identifier is None:
+        raise ValueError(
+            "Unable to extract tile identifier; expected patterns like "
+            "'tile_x_0003_y_0001_z_0000_ch_561' or 'tile_000000_ch_488'."
+        )
+
+    matches: list[str] = []
     for root, _, files in os.walk(mask_dir, followlinks=True):
         for f in files:
-            if tile_prefix in f:
-                maskp = os.path.join(root, f)
-                _LOGGER.info(f"Found mask file: {maskp}")
-                return tifffile.imread(maskp)
+            if not f.lower().endswith((".tif", ".tiff")):
+                continue
+            file_identifier = _extract_identifier(f)
+            if file_identifier == tile_identifier:
+                matches.append(os.path.join(root, f))
+
+    if matches:
+        maskp = sorted(matches)[0]  # deterministic choice if multiples exist
+        _LOGGER.info(f"Found mask file: {maskp}")
+        return tifffile.imread(maskp)
     raise FileNotFoundError(f"No mask file found for tile: {tile_name}")
 
 
