@@ -65,6 +65,24 @@
 			"type": "text",
 			"value_type": "string",
 			"default_value": "processes"
+		},
+		{
+			"id": "pWM35N17uRUfucWT",
+			"name": "skip-flat-field",
+			"type": "text",
+			"value_type": "integer",
+			"default_value": "0",
+			"minimum": 0,
+			"maximum": 1
+		},
+		{
+			"id": "ufSIMjpaUp4kqLD4",
+			"name": "skip-bkg-sub",
+			"type": "text",
+			"value_type": "integer",
+			"default_value": "0",
+			"minimum": 0,
+			"maximum": 1
 		}
 	]
 }

@@ -11,18 +11,24 @@ export MALLOC_TRIM_THRESHOLD_=65536
 
 # This is the master script for the capsule. When you click "Reproducible Run", the code in this file will execute.
 
-# Check if eighth argument is 1
-BINNED_FLAG=""
+EXTRA_FLAGS=""
+
 if [ "$8" == "1" ]; then
-  BINNED_FLAG="--is-binned"
+  EXTRA_FLAGS="--is-binned"
 fi
+
+if [ "${11}" == "1" ]; then
+  EXTRA_FLAGS="${EXTRA_FLAGS} --skip-flat-field"
+fi
+
+if [ "${12}" == "1" ]; then
+  EXTRA_FLAGS="${EXTRA_FLAGS} --skip-bkg-sub"
+fi
+
+echo "Extra flags: $EXTRA_FLAGS"
 
 TILE_NUM=$(basename "$1")
 echo "Processing tile: $TILE_NUM"
-
-# create a artifacts directory with the parent directory of the output S3 path
-ARTIFACTS_PATH="$(dirname "$2")/artifacts/$TILE_NUM"
-echo "Creating artifacts directory at: $ARTIFACTS_PATH"
 
 python -m exaspim_flatfield_correction.pipeline \
 --zarr "$1" \
@@ -37,7 +43,6 @@ python -m exaspim_flatfield_correction.pipeline \
 --save-outputs \
 --fitting-config "$9" \
 --worker-mode "${10}" \
---overwrite \
-$BINNED_FLAG
+--overwrite $EXTRA_FLAGS
 
 echo "Done!"
