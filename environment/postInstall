@@ -326,7 +326,7 @@ conda activate correction
 
 git clone https://github.com/AllenNeuralDynamics/exaspim-flatfield-correction.git
 cd exaspim-flatfield-correction
-git checkout 0b2a65e15a200edd84c4d06decb3d51213f6c5aa
+git checkout 1ef3b175e1356f2e77a91e6605d27c69c4279ab2
 pip install .
 
 curl "https://awscli.amazonaws.com/awscli-exe-linux-x86_64.zip" -o "awscliv2.zip"
