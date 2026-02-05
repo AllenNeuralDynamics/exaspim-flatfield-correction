@@ -31,7 +31,8 @@ TILE_NUM=$(basename "$1")
 echo "Processing tile: $TILE_NUM"
 
 python -m exaspim_flatfield_correction.pipeline \
---zarr "$1" \
+--config "/data/config.json" \
+--tile-paths "$1" \
 --output "$2" \
 --res "$3" \
 --method "$4" \
