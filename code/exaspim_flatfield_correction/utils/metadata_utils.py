@@ -62,7 +62,6 @@ def save_metadata(
     data_process: Any,
     out_path: str,
     tile_name: str,
-    tile_path: str,
     results_dir: str,
 ) -> None:
     """Persist processing metadata alongside the corrected tile outputs.
@@ -75,8 +74,6 @@ def save_metadata(
         Target path of the corrected tile Zarr store.
     tile_name : str
         Identifier of the tile being processed.
-    tile_path : str
-        Source Zarr path for the tile.
     results_dir : str
         Directory in which metadata JSON artifacts are saved.
     """
@@ -87,19 +84,3 @@ def save_metadata(
     )
     with open(process_json_path, "w") as f:
         f.write(process_json)
-
-    input_metadata_path = get_parent_s3_path(get_parent_s3_path(tile_path))
-    output_metadata_path = get_parent_s3_path(get_parent_s3_path(out_path))
-    metadata_json_path = str(
-        Path(results_dir)
-        / f"metadata_paths_{Path(out_path).parent.name}_{tile_name}.json"
-    )
-    with open(metadata_json_path, "w") as f:
-        f.write(
-            json.dumps(
-                {
-                    "input_metadata": input_metadata_path,
-                    "output_metadata": output_metadata_path,
-                }
-            )
-        )

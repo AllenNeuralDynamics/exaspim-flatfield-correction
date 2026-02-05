@@ -961,7 +961,7 @@ def process_tile(
 
             data_process.end_date_time = datetime.now()
             save_metadata(
-                data_process, out_path, tile_name, tile_path, results_dir
+                data_process, out_path, tile_name, results_dir
             )
         except Exception as exc:  # noqa: BLE001
             _LOGGER.error(
