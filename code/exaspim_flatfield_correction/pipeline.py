@@ -1,5 +1,4 @@
 import argparse
-import glob
 import json
 import logging
 import os
@@ -78,66 +77,121 @@ class MaskArtifacts:
 
 
 def resolve_args(
-    args: argparse.Namespace,
-) -> dict[str, str | list[str] | None]:
-    """Collect pipeline inputs from CLI arguments and optional metadata.
+    args: argparse.Namespace, parser: argparse.ArgumentParser
+) -> argparse.Namespace:
+    """Merge CLI args with optional JSON config (config takes precedence).
 
     Parameters
     ----------
     args : argparse.Namespace
-        Parsed command-line arguments.
+        Parsed command-line arguments (pre-merge with config).
+    parser : argparse.ArgumentParser
+        Argument parser used to define available options; used to reconcile
+        config keys against all CLI arguments.
 
     Returns
     -------
-    dict of str to (str, list[str], or None)
-        Mapping that includes the tile paths, output destination, method,
-        resolution, and binned-channel identifier (when present).
+    argparse.Namespace
+        The input namespace updated with config overrides and inferred values.
 
     Raises
     ------
     ValueError
-        If no metadata file can be located when ``--zarr`` is omitted.
+        If required values cannot be resolved.
     """
-    if args.zarr != "":
-        tile_paths = [args.zarr]
-        out_path = args.output
-        method = args.method
-        res = str(args.res)
-        binned_channel = None
-        if args.is_binned:
-            tile_name = Path(args.zarr).name
-            inferred_channel = extract_channel_from_tile_name(tile_name)
-            if inferred_channel is not None:
-                binned_channel = inferred_channel
-            else:
-                _LOGGER.warning(
-                    "Unable to infer channel number from tile %s despite --is-binned",
-                    tile_name,
-                )
-    else:
-        try:
-            tile_file = glob.glob("../data/tile_*.json")[0]
-        except IndexError:
-            raise ValueError(
-                "No tile metadata file found. "
-                "Please provide a valid zarr file "
-                "or a tile metadata JSON file."
+    config: dict[str, Any] = {}
+    if args.config:
+        config_path = Path(args.config)
+        if not config_path.is_file():
+            raise ValueError(f"Config file not found: {args.config}")
+        with open(config_path, "r") as f:
+            config = json.load(f)
+
+    allowed_config_keys = {
+        action.dest for action in parser._actions if action.dest != "help"
+    } | {"binned_channel"}
+    unknown_keys = set(config) - allowed_config_keys
+    if unknown_keys:
+        _LOGGER.warning(
+            "Ignoring unrecognized config keys: %s",
+            ", ".join(sorted(unknown_keys)),
+        )
+
+    # Merge config over CLI for every parser-defined argument
+    merged_cli: dict[str, Any] = {}
+    for action in parser._actions:
+        dest = action.dest
+        if dest == "help":
+            continue
+        if dest in config and config[dest] not in (None, ""):
+            val = config[dest]
+            if action.type and val is not None:
+                try:
+                    if isinstance(val, (list, tuple)):
+                        val = [action.type(v) for v in val]
+                    else:
+                        val = action.type(val)
+                except Exception as exc:  # noqa: BLE001
+                    raise ValueError(
+                        f"Invalid value for '{dest}' in config: {val}"
+                    ) from exc
+            merged_cli[dest] = val
+        else:
+            merged_cli[dest] = getattr(args, dest, action.default)
+
+    # Resolve primary inputs (config → CLI)
+    tile_paths = merged_cli.get("tile_paths")
+    if isinstance(tile_paths, str):
+        tile_paths = [tile_paths]
+    elif tile_paths is not None:
+        tile_paths = [str(p) for p in tile_paths]
+    merged_cli["tile_paths"] = tile_paths
+    if not tile_paths:
+        raise ValueError(
+            "No tile paths provided. Supply --tile-paths or set 'tile_paths' "
+            "in the config file."
+        )
+
+    if not merged_cli.get("output"):
+        raise ValueError(
+            "No output path provided. Supply --output or set 'output' in the "
+            "config file."
+        )
+
+    if merged_cli.get("method") not in {"basicpy", "reference", "fitting"}:
+        raise ValueError(
+            "Invalid method specified. Choose from 'basicpy', 'reference', or 'fitting'."
+        )
+
+    res_value = merged_cli.get("res")
+    res = str(res_value) if res_value not in (None, "") else None
+    merged_cli["res"] = res
+    if res is None:
+        raise ValueError(
+            "--res cannot be None."
+        )
+
+    merged_cli["skip_bkg_sub"] = merged_cli.get("skip_bkg_sub", False)
+    merged_cli["skip_flat_field"] = merged_cli.get("skip_flat_field", False)
+    merged_cli["is_binned"] = merged_cli.get("is_binned", False)
+
+    binned_channel = merged_cli.get("binned_channel")
+    if binned_channel is None and merged_cli["is_binned"]:
+        tile_name = Path(tile_paths[0]).name
+        inferred_channel = extract_channel_from_tile_name(tile_name)
+        if inferred_channel is not None:
+            binned_channel = inferred_channel
+        else:
+            _LOGGER.warning(
+                "Unable to infer channel number from tile %s despite --is-binned/config flag",
+                tile_name,
             )
-        with open(tile_file, "r") as f:
-            meta = json.load(f)
-        tile_paths = list(sorted(meta["tile_paths"]))
-        out_path = meta["output_zarr"]
-        method = meta["method"]
-        binned_channel = meta["binned_channel"]
-        res = str(meta["resolution"])
-    params: dict[str, str | list[str] | None] = {
-        "tile_paths": tile_paths,
-        "out_path": out_path,
-        "method": method,
-        "res": res,
-        "binned_channel": binned_channel,
-    }
-    return params
+    merged_cli["binned_channel"] = binned_channel
+
+    # Propagate merged values back into args for downstream consumers
+    for key, value in merged_cli.items():
+        setattr(args, key, value)
+    return args
 
 
 def background_subtraction(
@@ -946,32 +1000,29 @@ def get_channel_resolution(
     return is_binned, binned_res if is_binned else res
 
 
-def parse_and_validate_args() -> argparse.Namespace:
-    """
-    Parse and validate command-line arguments for the flatfield
-    correction pipeline.
-
-    Returns
-    -------
-    argparse.Namespace
-        Parsed and validated command-line arguments.
-
-    Raises
-    ------
-    ValueError
-        If required arguments are missing or invalid.
-    """
+def build_parser() -> argparse.ArgumentParser:
+    """Create the argument parser for the flatfield correction pipeline."""
     parser = argparse.ArgumentParser()
     parser.add_argument(
-        "--zarr",
+        "--config",
         type=str,
-        required=True,
-        help="Input zarr path for the tile data",
+        default=None,
+        help="Path to a JSON config file containing pipeline inputs.",
+    )
+    parser.add_argument(
+        "--tile-paths",
+        nargs="+",
+        dest="tile_paths",
+        type=str,
+        required=False,
+        default=None,
+        help="One or more input zarr paths for the tile data",
     )
     parser.add_argument(
         "--output",
         type=str,
-        required=True,
+        required=False,
+        default=None,
         help="Output zarr path for the corrected data",
     )
     parser.add_argument(
@@ -1032,6 +1083,12 @@ def parse_and_validate_args() -> argparse.Namespace:
         default=False,
         help="Use reference background image from S3 instead of estimating background.",
     )
+    parser.add_argument(
+        "--binned-channel",
+        type=str,
+        default=None,
+        help="Substring identifying binned channel tiles (e.g., '488').",
+    )
     parser.add_argument("--is-binned", action="store_true", default=False)
     parser.add_argument(
         "--median-summary-path",
@@ -1043,19 +1100,7 @@ def parse_and_validate_args() -> argparse.Namespace:
             "configuration when provided."
         ),
     )
-    args = parser.parse_args()
-
-    if args.method == "fitting" and args.mask_dir is None:
-        raise ValueError(
-            "Mask directory (--mask-dir) must be specified when using the "
-            "'fitting' method."
-        )
-    if args.skip_bkg_sub and args.skip_flat_field:
-        raise ValueError(
-            "Cannot skip both flat field correction and "
-            "background subtraction. At least one must be performed."
-        )
-    return args
+    return parser
 
 
 def create_zarr_artifact_path(out_zarr_path: str, dirname: str) -> str:
@@ -1080,19 +1125,20 @@ def create_zarr_artifact_path(out_zarr_path: str, dirname: str) -> str:
 
 def main() -> None:
     """Execute the flatfield correction pipeline for the requested tiles."""
-    args = parse_and_validate_args()
+    parser = build_parser()
+    args = parser.parse_args()
     _LOGGER.setLevel(args.log_level)
 
     _LOGGER.info(f"args: {args}")
 
-    params = resolve_args(args)
-    _LOGGER.info(f"Parsed parameters: {params}")
+    args = resolve_args(args, parser)
+    _LOGGER.info(f"Resolved parameters: {args}")
 
-    tile_paths = params["tile_paths"]
-    out_path = params["out_path"]
-    method = params["method"]
-    res = params["res"]
-    binned_channel = params["binned_channel"]
+    if args.method == "fitting" and args.mask_dir is None:
+        raise ValueError(
+            "Mask directory (--mask-dir) must be specified when using the "
+            "'fitting' method."
+        )
 
     results_dir = args.results_dir
     if not os.path.exists(results_dir):
@@ -1108,34 +1154,36 @@ def main() -> None:
     )
     _LOGGER.info(f"Dask client: {client}")
 
-    out_mask_path = create_zarr_artifact_path(out_path, "mask")
-    out_probability_path = create_zarr_artifact_path(out_path, "probability")
+    out_mask_path = create_zarr_artifact_path(args.output, "mask")
+    out_probability_path = create_zarr_artifact_path(args.output, "probability")
     initialize_zarr_group(out_mask_path)
     initialize_zarr_group(out_probability_path)
 
     artifacts_destination = None
-    tile_name_for_artifacts = Path(tile_paths[0]).name if tile_paths else None
-    if tile_name_for_artifacts and out_path.startswith("s3://"):
+    tile_name_for_artifacts = (
+        Path(args.tile_paths[0]).name if args.tile_paths else None
+    )
+    if tile_name_for_artifacts and args.output.startswith("s3://"):
         try:
-            parent_output = get_parent_s3_path(out_path)
+            parent_output = get_parent_s3_path(args.output)
             artifacts_destination = (
                 f"{parent_output}/artifacts/{tile_name_for_artifacts}"
             )
         except ValueError:
             _LOGGER.warning(
                 "Unable to determine artifacts destination from output path %s",
-                out_path,
+                args.output,
             )
 
     start_date_time = datetime.now()
     data_process = create_processing_metadata(
-        args, tile_paths[0], out_path, start_date_time, res
+        args, args.tile_paths[0], args.output, start_date_time, args.res
     )
 
     mask_artifacts: MaskArtifacts | None = None
     fitting_config: FittingConfig | None = None
     median_summary: dict[str, float] = {}
-    if method == "fitting":
+    if args.method == "fitting":
         fitting_config = load_fitting_config(args.fitting_config)
         if args.fitting_config:
             _LOGGER.info("Loaded fitting config from %s", args.fitting_config)
@@ -1156,16 +1204,16 @@ def main() -> None:
                 ", ".join(sorted(median_summary)),
             )
 
-    for tile_path in tile_paths:
+    for tile_path in args.tile_paths:
         mask_artifacts = process_tile(
             tile_path,
             args=args,
-            method=method,
-            res=res,
-            binned_channel=binned_channel,
+            method=args.method,
+            res=args.res,
+            binned_channel=args.binned_channel,
             binned_res=binned_res,
             results_dir=results_dir,
-            out_path=out_path,
+            out_path=args.output,
             out_mask_path=out_mask_path,
             out_probability_path=out_probability_path,
             data_process=data_process,
