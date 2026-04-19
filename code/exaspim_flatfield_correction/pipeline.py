@@ -653,7 +653,7 @@ def flatfield_fitting(
     weights = mask_artifacts.probability_volume
 
     global_val = weighted_percentile(
-        low_res.astype(np.uint16),
+        low_res.round().astype(np.uint16),
         mask,
         profile_percentile,
         weights=weights,
@@ -929,7 +929,7 @@ def process_tile(
             else:
                 corrected = full_res
 
-            corrected = corrected.astype(np.uint16)
+            corrected = corrected.round().astype(np.uint16)
             _LOGGER.info(f"Corrected array dtype: {corrected.dtype}")
 
             t0 = time.time()
