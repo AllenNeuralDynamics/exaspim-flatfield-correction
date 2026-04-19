@@ -9,7 +9,7 @@ conda activate correction
 
 git clone https://github.com/AllenNeuralDynamics/exaspim-flatfield-correction.git
 cd exaspim-flatfield-correction
-git checkout 7b2b51e0d14364ca57ae5bde2a7e142c691f7f3e
+git checkout d001086ded7d115c38453258a660f943bd85f056
 pip install .
 
 pip install "aind-data-schema==2.6.0"
