@@ -83,6 +83,14 @@
 			"default_value": "0",
 			"minimum": 0,
 			"maximum": 1
+		},
+		{
+			"id": "u2ZmvoxU1E8LChOA",
+			"name": "background smoothing sigma",
+			"type": "text",
+			"value_type": "number",
+			"default_value": "1.0",
+			"minimum": 0
 		}
 	]
 }
