@@ -174,6 +174,14 @@ def resolve_args(
     merged_cli["skip_bkg_sub"] = merged_cli.get("skip_bkg_sub", False)
     merged_cli["skip_flat_field"] = merged_cli.get("skip_flat_field", False)
     merged_cli["is_binned"] = merged_cli.get("is_binned", False)
+    background_smoothing_sigma = merged_cli.get("background_smoothing_sigma")
+    if background_smoothing_sigma is None:
+        background_smoothing_sigma = 1.0
+    if background_smoothing_sigma < 0:
+        raise ValueError(
+            "--background-smoothing-sigma must be non-negative."
+        )
+    merged_cli["background_smoothing_sigma"] = background_smoothing_sigma
 
     binned_channel = merged_cli.get("binned_channel")
     if binned_channel is None and merged_cli["is_binned"]:
@@ -200,6 +208,7 @@ def background_subtraction(
     z: zarr.hierarchy.Group,
     is_binned_channel: bool = False,
     use_reference_bkg: bool = False,
+    background_smoothing_sigma: float = 1.0,
 ) -> tuple[da.Array, np.ndarray, np.ndarray | None]:
     """Remove background estimates from the full-resolution volume.
 
@@ -216,6 +225,9 @@ def background_subtraction(
     use_reference_bkg : bool, default=False
         When ``True`` load a static reference background, otherwise estimate
         it from the data.
+    background_smoothing_sigma : float, default=1.0
+        Gaussian smoothing sigma applied before background estimation. Set to
+        0 to disable smoothing.
 
     Returns
     -------
@@ -231,10 +243,16 @@ def background_subtraction(
     else:
         bkg_res = "0" if is_binned_channel else "3"
         _LOGGER.info(f"Using resolution {bkg_res} for background estimation")
-        low_res = da.from_zarr(z[bkg_res]).squeeze().astype(np.float32)
-        bkg, bkg_slice_indices = estimate_bkg(
-            gaussian_filter_dask(low_res, sigma=1).compute()
+        _LOGGER.info(
+            "Background estimation smoothing sigma: %s",
+            background_smoothing_sigma,
         )
+        low_res = da.from_zarr(z[bkg_res]).squeeze().astype(np.float32)
+        if background_smoothing_sigma > 0:
+            low_res = gaussian_filter_dask(
+                low_res, sigma=background_smoothing_sigma
+            )
+        bkg, bkg_slice_indices = estimate_bkg(low_res.compute())
 
     full_res = subtract_bkg(
         full_res,
@@ -870,7 +888,8 @@ def process_tile(
                     full_res,
                     z,
                     is_binned_channel,
-                    args.use_reference_bkg,
+                    use_reference_bkg=args.use_reference_bkg,
+                    background_smoothing_sigma=args.background_smoothing_sigma,
                 )
 
             axis_fits = None
@@ -1082,6 +1101,15 @@ def build_parser() -> argparse.ArgumentParser:
         action="store_true",
         default=False,
         help="Use reference background image from S3 instead of estimating background.",
+    )
+    parser.add_argument(
+        "--background-smoothing-sigma",
+        type=float,
+        default=1.0,
+        help=(
+            "Gaussian smoothing sigma applied before background estimation. "
+            "Set to 0 to disable smoothing."
+        ),
     )
     parser.add_argument(
         "--binned-channel",

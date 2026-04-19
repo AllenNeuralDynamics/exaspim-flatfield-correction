@@ -38,6 +38,7 @@ Frequently used options:
 - `--save-outputs`: persist intermediate TIFFs and plots inside `results/`.
 - `--n-levels`: number of multiscale pyramid levels to generate for outputs.
 - `--use-reference-bkg`: reuse precomputed background instead of estimating from the data.
+- `--background-smoothing-sigma`: Gaussian smoothing sigma applied before background estimation; set to `0` to disable smoothing.
 - `--fitting-config`: JSON file with overrides for mask refinement, percentile weights, spline smoothing, and global normalization.
 - `--median-summary-path`: per-channel normalization overrides produced by upstream statistics.
 - `--is-binned`: flag tiles that correspond to a binned channel so the pipeline adjusts resolution handling.
