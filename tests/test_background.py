@@ -1,7 +1,10 @@
 from __future__ import annotations
 
+import json
+
 import numpy as np
 import pytest
+import tifffile
 
 import dask.array as da
 import zarr
@@ -10,7 +13,10 @@ from exaspim_flatfield_correction.background import (
     estimate_bkg_from_mapped_slices,
     map_slice_indices_to_target,
 )
-from exaspim_flatfield_correction.pipeline import background_subtraction
+from exaspim_flatfield_correction.pipeline import (
+    background_subtraction,
+    save_method_outputs,
+)
 
 
 def _transform(z_scale: float, z_translation: float = 0.0) -> dict:
@@ -144,3 +150,25 @@ def test_background_subtraction_builds_background_from_target_planes() -> None:
         corrected.compute(),
         np.clip(full_res_data - expected_bkg, 0, None),
     )
+
+
+def test_save_method_outputs_writes_background_and_indices(tmp_path) -> None:
+    bkg = np.asarray([[1.5, 2.5], [3.5, 4.5]], dtype=np.float32)
+    indices = np.asarray([1, 3, 5], dtype=np.int64)
+
+    save_method_outputs(
+        "fitting",
+        "tile_000001",
+        str(tmp_path),
+        True,
+        bkg=bkg,
+        bkg_slice_indices=indices,
+    )
+
+    bkg_path = tmp_path / "tile_000001_bkg.tif"
+    indices_path = tmp_path / "tile_000001_bkg_slice_indices.json"
+
+    assert bkg_path.is_file()
+    assert indices_path.is_file()
+    np.testing.assert_array_equal(tifffile.imread(bkg_path), bkg)
+    assert json.loads(indices_path.read_text()) == [1, 3, 5]

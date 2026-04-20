@@ -802,7 +802,7 @@ def save_method_outputs(
     if not save_outputs or results_dir is None:
         return
 
-    # Always try to save background-derived outputs if provided
+    # Save background-derived outputs independently when provided.
     try:
         if bkg_slice_indices is not None:
             indices_out = os.path.join(
@@ -813,7 +813,7 @@ def save_method_outputs(
                     np.asarray(bkg_slice_indices, dtype=np.int64).tolist(),
                     handle,
                 )
-        elif bkg is not None:
+        if bkg is not None:
             tifffile.imwrite(
                 os.path.join(results_dir, f"{tile_name}_bkg.tif"),
                 np.asarray(bkg, dtype=np.float32),
