@@ -19,7 +19,11 @@ from dask.distributed import performance_report
 from dask_image.ndfilters import gaussian_filter as gaussian_filter_dask
 from scipy.ndimage import binary_fill_holes
 
-from exaspim_flatfield_correction.background import estimate_bkg, subtract_bkg
+from exaspim_flatfield_correction.background import (
+    estimate_bkg,
+    estimate_bkg_from_mapped_slices,
+    subtract_bkg,
+)
 from exaspim_flatfield_correction.basic import fit_basic, transform_basic
 from exaspim_flatfield_correction.config import (
     FittingConfig,
@@ -209,6 +213,7 @@ def background_subtraction(
     is_binned_channel: bool = False,
     use_reference_bkg: bool = False,
     background_smoothing_sigma: float = 1.0,
+    target_resolution: str = "0",
 ) -> tuple[da.Array, np.ndarray, np.ndarray | None]:
     """Remove background estimates from the full-resolution volume.
 
@@ -227,19 +232,31 @@ def background_subtraction(
         it from the data.
     background_smoothing_sigma : float, default=1.0
         Gaussian smoothing sigma applied before background estimation. Set to
-        0 to disable smoothing.
+        0 to disable smoothing. Smoothing is only used to select background
+        slices; estimated subtraction backgrounds are built from raw target
+        resolution planes.
+    target_resolution : str, default="0"
+        Resolution key of ``full_res`` within ``z``. Used to map background
+        slice selections from the estimation resolution to the corrected
+        target resolution.
 
     Returns
     -------
     tuple
-        ``(full_res_corrected, background_image, background_slice_indices)``
-        where ``background_slice_indices`` may be ``None`` if no probabilistic
-        model is required.
+        ``(full_res_corrected, background_image, background_slice_indices)``.
+        ``background_image`` is in the target resolution, while
+        ``background_slice_indices`` remain in the estimation-resolution
+        coordinate system. ``background_slice_indices`` may be ``None`` when
+        a reference background is used.
     """
     if use_reference_bkg:
         bkg_path = get_bkg_path(tile_path)
         bkg = read_bkg_image(bkg_path).astype(np.float32)
         bkg_slice_indices = None
+        if bkg.shape != full_res.shape[1:]:
+            bkg = resize(bkg, full_res.shape[1:]).astype(
+                np.float32, copy=False
+            )
     else:
         bkg_res = "0" if is_binned_channel else "3"
         _LOGGER.info(f"Using resolution {bkg_res} for background estimation")
@@ -248,17 +265,33 @@ def background_subtraction(
             background_smoothing_sigma,
         )
         low_res = da.from_zarr(z[bkg_res]).squeeze().astype(np.float32)
+        low_res_shape = tuple(int(dim) for dim in low_res.shape)
         if background_smoothing_sigma > 0:
             low_res = gaussian_filter_dask(
                 low_res, sigma=background_smoothing_sigma
             )
-        bkg, bkg_slice_indices = estimate_bkg(low_res.compute())
+        _, bkg_slice_indices = estimate_bkg(low_res.compute())
+
+        source_transformations = parse_ome_zarr_transformations(z, bkg_res)
+        target_transformations = parse_ome_zarr_transformations(
+            z, target_resolution
+        )
+        bkg, target_slice_indices = estimate_bkg_from_mapped_slices(
+            full_res,
+            bkg_slice_indices,
+            low_res_shape,
+            source_transformations=source_transformations,
+            target_transformations=target_transformations,
+        )
+        _LOGGER.info(
+            "Computed target-resolution background from target slices %s..%s",
+            int(target_slice_indices[0]),
+            int(target_slice_indices[-1]),
+        )
 
     full_res = subtract_bkg(
         full_res,
-        da.from_array(
-            resize(bkg, full_res.shape[1:]), chunks=full_res.chunksize[1:]
-        ),
+        da.from_array(bkg, chunks=full_res.chunksize[1:]),
     )
     return full_res, bkg, bkg_slice_indices
 
@@ -890,6 +923,7 @@ def process_tile(
                     is_binned_channel,
                     use_reference_bkg=args.use_reference_bkg,
                     background_smoothing_sigma=args.background_smoothing_sigma,
+                    target_resolution=resolution,
                 )
 
             axis_fits = None
