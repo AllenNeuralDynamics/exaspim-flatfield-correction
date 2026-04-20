@@ -8,13 +8,17 @@ import tifffile
 
 import dask.array as da
 import zarr
+from scipy.ndimage import gaussian_filter as gaussian_filter_np
 
+from exaspim_flatfield_correction import pipeline as pipeline_module
 from exaspim_flatfield_correction.background import (
     estimate_bkg_from_mapped_slices,
     map_slice_indices_to_target,
 )
 from exaspim_flatfield_correction.pipeline import (
     background_subtraction,
+    build_parser,
+    resolve_args,
     save_method_outputs,
 )
 
@@ -139,6 +143,7 @@ def test_background_subtraction_builds_background_from_target_planes() -> None:
         root,
         is_binned_channel=False,
         background_smoothing_sigma=0,
+        background_final_smoothing_sigma=0,
         target_resolution="0",
     )
 
@@ -147,6 +152,67 @@ def test_background_subtraction_builds_background_from_target_planes() -> None:
     np.testing.assert_array_equal(bkg_slice_indices, np.asarray([1]))
     assert np.max(bkg_slice_indices) < root["3"].shape[0]
     np.testing.assert_array_equal(
+        corrected.compute(),
+        np.clip(full_res_data - expected_bkg, 0, None),
+    )
+
+
+def test_background_subtraction_blurs_final_background_with_dask(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    store = zarr.storage.MemoryStore()
+    root = zarr.group(store=store)
+
+    raw_bkg = np.zeros((3, 3), dtype=np.float32)
+    raw_bkg[1, 1] = 90
+
+    full_res_data = np.zeros((4, 3, 3), dtype=np.float32)
+    full_res_data[2] = raw_bkg
+    full_res_data[3] = raw_bkg
+    low_res_data = np.asarray(
+        [
+            [[0, 100, 0], [100, 0, 100], [0, 100, 0]],
+            np.full((3, 3), 1000, dtype=np.float32),
+        ],
+        dtype=np.float32,
+    )
+
+    root.create_dataset("0", data=full_res_data, chunks=(1, 3, 3))
+    root.create_dataset("3", data=low_res_data, chunks=(1, 3, 3))
+    _write_multiscale_metadata(root)
+
+    calls = []
+    original_gaussian_filter = pipeline_module.gaussian_filter_dask
+
+    def spy_gaussian_filter(image, sigma, *args, **kwargs):
+        calls.append((image, sigma))
+        return original_gaussian_filter(image, sigma, *args, **kwargs)
+
+    monkeypatch.setattr(
+        pipeline_module,
+        "gaussian_filter_dask",
+        spy_gaussian_filter,
+    )
+
+    full_res = da.from_zarr(root["0"]).astype(np.float32)
+    corrected, bkg, _ = background_subtraction(
+        "synthetic_tile.zarr",
+        full_res,
+        root,
+        is_binned_channel=False,
+        background_smoothing_sigma=0,
+        background_final_smoothing_sigma=1,
+        target_resolution="0",
+    )
+
+    expected_bkg = gaussian_filter_np(raw_bkg, sigma=1).astype(np.float32)
+    assert bkg.dtype == np.float32
+    assert not np.array_equal(bkg, raw_bkg)
+    assert calls
+    assert calls[-1][1] == 1
+    assert calls[-1][0].shape == raw_bkg.shape
+    np.testing.assert_allclose(bkg, expected_bkg)
+    np.testing.assert_allclose(
         corrected.compute(),
         np.clip(full_res_data - expected_bkg, 0, None),
     )
@@ -172,3 +238,27 @@ def test_save_method_outputs_writes_background_and_indices(tmp_path) -> None:
     assert indices_path.is_file()
     np.testing.assert_array_equal(tifffile.imread(bkg_path), bkg)
     assert json.loads(indices_path.read_text()) == [1, 3, 5]
+
+
+def test_resolve_args_rejects_negative_final_background_smoothing() -> None:
+    parser = build_parser()
+    args = parser.parse_args(
+        [
+            "--tile-paths",
+            "tile.zarr",
+            "--output",
+            "out.zarr",
+            "--res",
+            "0",
+            "--method",
+            "fitting",
+            "--background-final-smoothing-sigma",
+            "-1",
+        ]
+    )
+
+    with pytest.raises(
+        ValueError,
+        match="--background-final-smoothing-sigma must be non-negative",
+    ):
+        resolve_args(args, parser)

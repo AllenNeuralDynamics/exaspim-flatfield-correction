@@ -187,6 +187,19 @@ def resolve_args(
         )
     merged_cli["background_smoothing_sigma"] = background_smoothing_sigma
 
+    background_final_smoothing_sigma = merged_cli.get(
+        "background_final_smoothing_sigma"
+    )
+    if background_final_smoothing_sigma is None:
+        background_final_smoothing_sigma = 0.0
+    if background_final_smoothing_sigma < 0:
+        raise ValueError(
+            "--background-final-smoothing-sigma must be non-negative."
+        )
+    merged_cli["background_final_smoothing_sigma"] = (
+        background_final_smoothing_sigma
+    )
+
     binned_channel = merged_cli.get("binned_channel")
     if binned_channel is None and merged_cli["is_binned"]:
         tile_name = Path(tile_paths[0]).name
@@ -213,6 +226,7 @@ def background_subtraction(
     is_binned_channel: bool = False,
     use_reference_bkg: bool = False,
     background_smoothing_sigma: float = 1.0,
+    background_final_smoothing_sigma: float = 0.0,
     target_resolution: str = "0",
 ) -> tuple[da.Array, np.ndarray, np.ndarray | None]:
     """Remove background estimates from the full-resolution volume.
@@ -235,6 +249,10 @@ def background_subtraction(
         0 to disable smoothing. Smoothing is only used to select background
         slices; estimated subtraction backgrounds are built from raw target
         resolution planes.
+    background_final_smoothing_sigma : float, default=0.0
+        Gaussian smoothing sigma applied to the final target-resolution 2D
+        background image before subtraction and artifact saving. Set to 0 to
+        disable final background smoothing.
     target_resolution : str, default="0"
         Resolution key of ``full_res`` within ``z``. Used to map background
         slice selections from the estimation resolution to the corrected
@@ -249,6 +267,11 @@ def background_subtraction(
         coordinate system. ``background_slice_indices`` may be ``None`` when
         a reference background is used.
     """
+    if background_final_smoothing_sigma < 0:
+        raise ValueError(
+            "background_final_smoothing_sigma must be non-negative."
+        )
+
     if use_reference_bkg:
         bkg_path = get_bkg_path(tile_path)
         bkg = read_bkg_image(bkg_path).astype(np.float32)
@@ -289,9 +312,22 @@ def background_subtraction(
             int(target_slice_indices[-1]),
         )
 
+    _LOGGER.info(
+        "Final background smoothing sigma: %s",
+        background_final_smoothing_sigma,
+    )
+    bkg_da = da.from_array(bkg, chunks=full_res.chunksize[1:])
+    if background_final_smoothing_sigma > 0:
+        bkg_da = gaussian_filter_dask(
+            bkg_da,
+            sigma=background_final_smoothing_sigma,
+        ).astype(np.float32)
+        bkg = bkg_da.compute().astype(np.float32, copy=False)
+        bkg_da = da.from_array(bkg, chunks=full_res.chunksize[1:])
+
     full_res = subtract_bkg(
         full_res,
-        da.from_array(bkg, chunks=full_res.chunksize[1:]),
+        bkg_da,
     )
     return full_res, bkg, bkg_slice_indices
 
@@ -923,6 +959,9 @@ def process_tile(
                     is_binned_channel,
                     use_reference_bkg=args.use_reference_bkg,
                     background_smoothing_sigma=args.background_smoothing_sigma,
+                    background_final_smoothing_sigma=(
+                        args.background_final_smoothing_sigma
+                    ),
                     target_resolution=resolution,
                 )
 
@@ -1143,6 +1182,16 @@ def build_parser() -> argparse.ArgumentParser:
         help=(
             "Gaussian smoothing sigma applied before background estimation. "
             "Set to 0 to disable smoothing."
+        ),
+    )
+    parser.add_argument(
+        "--background-final-smoothing-sigma",
+        type=float,
+        default=0.0,
+        help=(
+            "Gaussian smoothing sigma applied to the final 2D background "
+            "image before subtraction and saving. Set to 0 to disable final "
+            "background smoothing."
         ),
     )
     parser.add_argument(

@@ -45,6 +45,7 @@ python -m exaspim_flatfield_correction.pipeline \
 --fitting-config "$9" \
 --worker-mode "${10}" \
 --background-smoothing-sigma "${13}" \
+--background-final-smoothing-sigma "${14:-0}" \
 --overwrite $EXTRA_FLAGS
 
 echo "Done!"
