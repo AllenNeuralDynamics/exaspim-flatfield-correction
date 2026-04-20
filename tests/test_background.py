@@ -18,6 +18,7 @@ from exaspim_flatfield_correction.background import (
 from exaspim_flatfield_correction.pipeline import (
     background_subtraction,
     build_parser,
+    cleanup_background_cache,
     resolve_args,
     save_method_outputs,
 )
@@ -57,6 +58,13 @@ def _write_multiscale_metadata(root: zarr.Group) -> None:
             ]
         }
     ]
+
+
+def _graph_contains_text(arr: da.Array, text: str) -> bool:
+    graph = arr.__dask_graph__()
+    keys = list(graph.keys())
+    layer_names = list(getattr(graph, "layers", {}).keys())
+    return any(text in str(key) for key in keys + layer_names)
 
 
 def test_map_slice_indices_identity_with_metadata() -> None:
@@ -112,7 +120,7 @@ def test_estimate_bkg_from_mapped_slices_uses_target_planes() -> None:
     np.testing.assert_array_equal(bkg, np.median(data[[2, 3]], axis=0))
 
 
-def test_background_subtraction_builds_background_from_target_planes() -> None:
+def test_background_subtraction_uses_cached_background_zarr(tmp_path) -> None:
     store = zarr.storage.MemoryStore()
     root = zarr.group(store=store)
 
@@ -137,10 +145,12 @@ def test_background_subtraction_builds_background_from_target_planes() -> None:
     _write_multiscale_metadata(root)
 
     full_res = da.from_zarr(root["0"]).astype(np.float32)
-    corrected, bkg, bkg_slice_indices = background_subtraction(
+    corrected, bkg, bkg_slice_indices, cache_path = background_subtraction(
         "synthetic_tile.zarr",
         full_res,
         root,
+        str(tmp_path),
+        "synthetic_tile.zarr",
         is_binned_channel=False,
         background_smoothing_sigma=0,
         background_final_smoothing_sigma=0,
@@ -151,34 +161,43 @@ def test_background_subtraction_builds_background_from_target_planes() -> None:
     np.testing.assert_array_equal(bkg, expected_bkg)
     np.testing.assert_array_equal(bkg_slice_indices, np.asarray([1]))
     assert np.max(bkg_slice_indices) < root["3"].shape[0]
+    assert cache_path is not None
+    assert (cache_path / "final.zarr").is_dir()
+    assert _graph_contains_text(corrected, "bkg-cache-final")
     np.testing.assert_array_equal(
         corrected.compute(),
         np.clip(full_res_data - expected_bkg, 0, None),
     )
+    cleanup_background_cache(cache_path)
+    assert not cache_path.exists()
 
 
-def test_background_subtraction_blurs_final_background_with_dask(
+def test_background_subtraction_blurs_final_cached_background_with_dask(
+    tmp_path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     store = zarr.storage.MemoryStore()
     root = zarr.group(store=store)
 
-    raw_bkg = np.zeros((3, 3), dtype=np.float32)
-    raw_bkg[1, 1] = 90
+    raw_bkg = np.zeros((11, 11), dtype=np.float32)
+    raw_bkg[5, 5] = 90
 
-    full_res_data = np.zeros((4, 3, 3), dtype=np.float32)
+    full_res_data = np.zeros((4, 11, 11), dtype=np.float32)
     full_res_data[2] = raw_bkg
     full_res_data[3] = raw_bkg
+    foreground_slice = np.zeros((11, 11), dtype=np.float32)
+    foreground_slice[::2, 1::2] = 100
+    foreground_slice[1::2, ::2] = 100
     low_res_data = np.asarray(
         [
-            [[0, 100, 0], [100, 0, 100], [0, 100, 0]],
-            np.full((3, 3), 1000, dtype=np.float32),
+            foreground_slice,
+            np.full((11, 11), 1000, dtype=np.float32),
         ],
         dtype=np.float32,
     )
 
-    root.create_dataset("0", data=full_res_data, chunks=(1, 3, 3))
-    root.create_dataset("3", data=low_res_data, chunks=(1, 3, 3))
+    root.create_dataset("0", data=full_res_data, chunks=(1, 11, 11))
+    root.create_dataset("3", data=low_res_data, chunks=(1, 11, 11))
     _write_multiscale_metadata(root)
 
     calls = []
@@ -195,10 +214,12 @@ def test_background_subtraction_blurs_final_background_with_dask(
     )
 
     full_res = da.from_zarr(root["0"]).astype(np.float32)
-    corrected, bkg, _ = background_subtraction(
+    corrected, bkg, _, cache_path = background_subtraction(
         "synthetic_tile.zarr",
         full_res,
         root,
+        str(tmp_path),
+        "synthetic_tile.zarr",
         is_binned_channel=False,
         background_smoothing_sigma=0,
         background_final_smoothing_sigma=1,
@@ -211,11 +232,17 @@ def test_background_subtraction_blurs_final_background_with_dask(
     assert calls
     assert calls[-1][1] == 1
     assert calls[-1][0].shape == raw_bkg.shape
+    assert cache_path is not None
+    assert (cache_path / "raw.zarr").is_dir()
+    assert (cache_path / "final.zarr").is_dir()
+    assert _graph_contains_text(corrected, "bkg-cache-final")
     np.testing.assert_allclose(bkg, expected_bkg)
     np.testing.assert_allclose(
         corrected.compute(),
         np.clip(full_res_data - expected_bkg, 0, None),
     )
+    cleanup_background_cache(cache_path)
+    assert not cache_path.exists()
 
 
 def test_save_method_outputs_writes_background_and_indices(tmp_path) -> None:
