@@ -158,7 +158,7 @@ def map_slice_indices_to_target(
     else:
         raise ValueError(
             "OME-Zarr scale/translation metadata unavailable for background "
-            "slice mapping; falling back to shape-ratio mapping."
+            "slice mapping."
         )
 
     mapped_indices: list[int] = []
