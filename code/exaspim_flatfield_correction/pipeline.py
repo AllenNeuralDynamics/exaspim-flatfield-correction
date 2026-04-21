@@ -2,7 +2,9 @@ import argparse
 import json
 import logging
 import os
+import shutil
 import time
+import uuid
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
@@ -19,7 +21,11 @@ from dask.distributed import performance_report
 from dask_image.ndfilters import gaussian_filter as gaussian_filter_dask
 from scipy.ndimage import binary_fill_holes
 
-from exaspim_flatfield_correction.background import estimate_bkg, subtract_bkg
+from exaspim_flatfield_correction.background import (
+    estimate_bkg,
+    estimate_bkg_from_mapped_slices,
+    subtract_bkg,
+)
 from exaspim_flatfield_correction.basic import fit_basic, transform_basic
 from exaspim_flatfield_correction.config import (
     FittingConfig,
@@ -183,6 +189,19 @@ def resolve_args(
         )
     merged_cli["background_smoothing_sigma"] = background_smoothing_sigma
 
+    background_final_smoothing_sigma = merged_cli.get(
+        "background_final_smoothing_sigma"
+    )
+    if background_final_smoothing_sigma is None:
+        background_final_smoothing_sigma = 0.0
+    if background_final_smoothing_sigma < 0:
+        raise ValueError(
+            "--background-final-smoothing-sigma must be non-negative."
+        )
+    merged_cli["background_final_smoothing_sigma"] = (
+        background_final_smoothing_sigma
+    )
+
     binned_channel = merged_cli.get("binned_channel")
     if binned_channel is None and merged_cli["is_binned"]:
         tile_name = Path(tile_paths[0]).name
@@ -206,10 +225,14 @@ def background_subtraction(
     tile_path: str,
     full_res: da.Array,
     z: zarr.hierarchy.Group,
+    results_dir: str | None = None,
+    tile_name: str | None = None,
     is_binned_channel: bool = False,
     use_reference_bkg: bool = False,
     background_smoothing_sigma: float = 1.0,
-) -> tuple[da.Array, np.ndarray, np.ndarray | None]:
+    background_final_smoothing_sigma: float = 0.0,
+    target_resolution: str = "0",
+) -> tuple[da.Array, np.ndarray, np.ndarray | None, Path | None]:
     """Remove background estimates from the full-resolution volume.
 
     Parameters
@@ -220,6 +243,10 @@ def background_subtraction(
         Full-resolution image volume to correct (modified lazily).
     z : zarr.hierarchy.Group
         Open Zarr hierarchy for the tile.
+    results_dir : str or None, default=None
+        Directory where the temporary background Zarr cache should be written.
+    tile_name : str or None, default=None
+        Tile identifier used to create unique Dask names and cache paths.
     is_binned_channel : bool, default=False
         Flag indicating whether the tile represents the binned channel.
     use_reference_bkg : bool, default=False
@@ -227,19 +254,49 @@ def background_subtraction(
         it from the data.
     background_smoothing_sigma : float, default=1.0
         Gaussian smoothing sigma applied before background estimation. Set to
-        0 to disable smoothing.
+        0 to disable smoothing. Smoothing is only used to select background
+        slices; estimated subtraction backgrounds are built from raw target
+        resolution planes.
+    background_final_smoothing_sigma : float, default=0.0
+        Gaussian smoothing sigma applied to the final target-resolution 2D
+        background image before subtraction and artifact saving. Set to 0 to
+        disable final background smoothing.
+    target_resolution : str, default="0"
+        Resolution key of ``full_res`` within ``z``. Used to map background
+        slice selections from the estimation resolution to the corrected
+        target resolution.
 
     Returns
     -------
     tuple
-        ``(full_res_corrected, background_image, background_slice_indices)``
-        where ``background_slice_indices`` may be ``None`` if no probabilistic
-        model is required.
+        ``(full_res_corrected, background_image, background_slice_indices,
+        background_cache_path)``. ``background_image`` is in the target
+        resolution, while ``background_slice_indices`` remain in the
+        estimation-resolution coordinate system. ``background_slice_indices``
+        may be ``None`` when a reference background is used.
     """
+    if results_dir is None:
+        raise ValueError(
+            "results_dir is required for background cache writes."
+        )
+    if tile_name is None:
+        tile_name = Path(tile_path).name
+    if background_final_smoothing_sigma < 0:
+        raise ValueError(
+            "background_final_smoothing_sigma must be non-negative."
+        )
+
+    dask_name_token = uuid.uuid4().hex
+    safe_tile_name = _safe_dask_name(tile_name)
+
     if use_reference_bkg:
         bkg_path = get_bkg_path(tile_path)
         bkg = read_bkg_image(bkg_path).astype(np.float32)
         bkg_slice_indices = None
+        if bkg.shape != full_res.shape[1:]:
+            bkg = resize(bkg, full_res.shape[1:]).astype(
+                np.float32, copy=False
+            )
     else:
         bkg_res = "0" if is_binned_channel else "3"
         _LOGGER.info(f"Using resolution {bkg_res} for background estimation")
@@ -247,20 +304,127 @@ def background_subtraction(
             "Background estimation smoothing sigma: %s",
             background_smoothing_sigma,
         )
-        low_res = da.from_zarr(z[bkg_res]).squeeze().astype(np.float32)
+        low_res = da.from_zarr(
+            z[bkg_res],
+            name=f"bkg-selector-{safe_tile_name}-{bkg_res}-{dask_name_token}",
+        ).squeeze().astype(np.float32)
+        low_res_shape = tuple(int(dim) for dim in low_res.shape)
         if background_smoothing_sigma > 0:
             low_res = gaussian_filter_dask(
                 low_res, sigma=background_smoothing_sigma
             )
-        bkg, bkg_slice_indices = estimate_bkg(low_res.compute())
+        _, bkg_slice_indices = estimate_bkg(low_res.compute())
+
+        source_transformations = parse_ome_zarr_transformations(z, bkg_res)
+        target_transformations = parse_ome_zarr_transformations(
+            z, target_resolution
+        )
+        bkg, target_slice_indices = estimate_bkg_from_mapped_slices(
+            full_res,
+            bkg_slice_indices,
+            low_res_shape,
+            source_transformations=source_transformations,
+            target_transformations=target_transformations,
+        )
+        _LOGGER.info(
+            "Computed target-resolution background from target slices %s..%s",
+            int(target_slice_indices[0]),
+            int(target_slice_indices[-1]),
+        )
+
+    _LOGGER.info(
+        "Final background smoothing sigma: %s",
+        background_final_smoothing_sigma,
+    )
+    cache_dir = _background_cache_dir(results_dir, tile_name, dask_name_token)
+    spatial_chunks = chunks_2d(full_res)
+    try:
+        if background_final_smoothing_sigma > 0:
+            raw_cache_path = _write_background_cache(
+                bkg,
+                cache_dir / "raw.zarr",
+                spatial_chunks,
+            )
+            raw_bkg_da = _read_background_cache(
+                raw_cache_path,
+                name=f"bkg-cache-raw-{safe_tile_name}-{dask_name_token}",
+            )
+            blurred_bkg_da = gaussian_filter_dask(
+                raw_bkg_da,
+                sigma=background_final_smoothing_sigma,
+            ).astype(np.float32)
+            bkg = blurred_bkg_da.compute().astype(np.float32, copy=False)
+
+        final_cache_path = _write_background_cache(
+            bkg,
+            cache_dir / "final.zarr",
+            spatial_chunks,
+        )
+        bkg_da = _read_background_cache(
+            final_cache_path,
+            name=f"bkg-cache-final-{safe_tile_name}-{dask_name_token}",
+        )
+    except Exception:
+        cleanup_background_cache(cache_dir)
+        raise
 
     full_res = subtract_bkg(
         full_res,
-        da.from_array(
-            resize(bkg, full_res.shape[1:]), chunks=full_res.chunksize[1:]
-        ),
+        bkg_da,
     )
-    return full_res, bkg, bkg_slice_indices
+    return full_res, bkg, bkg_slice_indices, cache_dir
+
+
+def _safe_dask_name(value: str) -> str:
+    """Normalize user-facing identifiers for Dask graph layer names."""
+
+    return "".join(
+        char if char.isalnum() or char in "._-" else "_" for char in value
+    )
+
+
+def _background_cache_dir(
+    results_dir: str,
+    tile_name: str,
+    token: str,
+) -> Path:
+    """Create a unique local cache directory for a tile background image."""
+
+    cache_root = Path(results_dir) / "dask-temp" / "background-cache"
+    cache_dir = cache_root / f"{_safe_dask_name(tile_name)}_{token}"
+    cache_dir.mkdir(parents=True, exist_ok=False)
+    return cache_dir
+
+
+def _write_background_cache(
+    bkg: np.ndarray,
+    cache_path: Path,
+    chunks: tuple[int, ...],
+) -> Path:
+    """Write a 2D background image to a local chunked Zarr array."""
+
+    if cache_path.exists():
+        shutil.rmtree(cache_path)
+    zarr.save_array(
+        str(cache_path),
+        np.asarray(bkg, dtype=np.float32),
+        chunks=chunks,
+        compressor=blosc.Blosc(cname="zstd", clevel=1),
+    )
+    return cache_path
+
+
+def _read_background_cache(cache_path: Path, name: str) -> da.Array:
+    """Read a cached background image with a unique Dask graph name."""
+
+    return da.from_zarr(str(cache_path), name=name).astype(np.float32)
+
+
+def cleanup_background_cache(cache_path: Path | None) -> None:
+    """Remove a temporary background cache directory if it exists."""
+
+    if cache_path is not None:
+        shutil.rmtree(cache_path, ignore_errors=True)
 
 
 def flatfield_reference(full_res: da.Array, flatfield_path: str) -> da.Array:
@@ -769,7 +933,7 @@ def save_method_outputs(
     if not save_outputs or results_dir is None:
         return
 
-    # Always try to save background-derived outputs if provided
+    # Save background-derived outputs independently when provided.
     try:
         if bkg_slice_indices is not None:
             indices_out = os.path.join(
@@ -780,7 +944,7 @@ def save_method_outputs(
                     np.asarray(bkg_slice_indices, dtype=np.int64).tolist(),
                     handle,
                 )
-        elif bkg is not None:
+        if bkg is not None:
             tifffile.imwrite(
                 os.path.join(results_dir, f"{tile_name}_bkg.tif"),
                 np.asarray(bkg, dtype=np.float32),
@@ -856,6 +1020,7 @@ def process_tile(
     tile_name = Path(tile_path).name
     _LOGGER.info(f"Processing tile: {tile_name}")
     report_path = os.path.join(results_dir, f"dask-report_{tile_name}.html")
+    background_cache_path: Path | None = None
 
     with performance_report(filename=report_path):
         try:
@@ -876,20 +1041,37 @@ def process_tile(
                 f"Coordinate transformations: {coordinate_transformations}"
             )
 
-            full_res = da.from_zarr(z[resolution]).squeeze().astype(np.float32)
+            full_res = da.from_zarr(
+                z[resolution],
+                name=(
+                    f"input-{_safe_dask_name(tile_name)}-{resolution}-"
+                    f"{uuid.uuid4().hex}"
+                ),
+            ).squeeze().astype(np.float32)
             _LOGGER.info(f"Full resolution array shape: {full_res.shape}")
 
             bkg = None
             bkg_slice_indices = None
             if not args.skip_bkg_sub:
                 _LOGGER.info("Performing background subtraction")
-                full_res, bkg, bkg_slice_indices = background_subtraction(
+                (
+                    full_res,
+                    bkg,
+                    bkg_slice_indices,
+                    background_cache_path,
+                ) = background_subtraction(
                     tile_path,
                     full_res,
                     z,
+                    results_dir,
+                    tile_name,
                     is_binned_channel,
                     use_reference_bkg=args.use_reference_bkg,
                     background_smoothing_sigma=args.background_smoothing_sigma,
+                    background_final_smoothing_sigma=(
+                        args.background_final_smoothing_sigma
+                    ),
+                    target_resolution=resolution,
                 )
 
             axis_fits = None
@@ -987,6 +1169,8 @@ def process_tile(
                 f"Error processing tile {tile_name}: {exc}", exc_info=True
             )
             raise
+        finally:
+            cleanup_background_cache(background_cache_path)
 
     return mask_artifacts
 
@@ -1109,6 +1293,16 @@ def build_parser() -> argparse.ArgumentParser:
         help=(
             "Gaussian smoothing sigma applied before background estimation. "
             "Set to 0 to disable smoothing."
+        ),
+    )
+    parser.add_argument(
+        "--background-final-smoothing-sigma",
+        type=float,
+        default=0.0,
+        help=(
+            "Gaussian smoothing sigma applied to the final 2D background "
+            "image before subtraction and saving. Set to 0 to disable final "
+            "background smoothing."
         ),
     )
     parser.add_argument(
