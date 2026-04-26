@@ -9,7 +9,6 @@ COPY git-ask-pass /
 RUN apt-get update \
     && apt-get install -y --no-install-recommends \
         build-essential=12.9ubuntu3 \
-        jq=1.6-2.1ubuntu3.1 \
         ninja-build=1.10.1-1 \
         wget=1.21.2-2ubuntu1.1 \
         zip=3.0-12build2 \
