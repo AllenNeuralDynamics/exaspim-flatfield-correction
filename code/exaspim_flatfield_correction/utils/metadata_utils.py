@@ -94,7 +94,6 @@ def create_processing_metadata(
 
 def save_metadata(
     data_process: Any,
-    out_path: str,
     tile_name: str,
     results_dir: str,
 ) -> None:
@@ -104,8 +103,6 @@ def save_metadata(
     ----------
     data_process : Any
         Structured metadata object exposing ``model_dump_json``.
-    out_path : str
-        Target path of the corrected tile Zarr store.
     tile_name : str
         Identifier of the tile being processed.
     results_dir : str
@@ -113,8 +110,7 @@ def save_metadata(
     """
     process_json = data_process.model_dump_json()
     process_json_path = str(
-        Path(results_dir)
-        / f"process_{Path(out_path).parent.name}_{tile_name}.json"
+        Path(results_dir) / f"flatfield_data_process_{tile_name}.json"
     )
     with open(process_json_path, "w") as f:
         f.write(process_json)
