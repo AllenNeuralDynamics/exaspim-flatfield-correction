@@ -9,43 +9,13 @@ export AWS_RESPONSE_CHECKSUM_VALIDATION=when_required
 
 export MALLOC_TRIM_THRESHOLD_=65536
 
+export OMP_NUM_THREADS=1
+export MKL_NUM_THREADS=1
+export OPENBLAS_NUM_THREADS=1
+export NUMEXPR_NUM_THREADS=1
+
 # This is the master script for the capsule. When you click "Reproducible Run", the code in this file will execute.
 
-EXTRA_FLAGS=""
-
-if [ "$8" == "1" ]; then
-  EXTRA_FLAGS="--is-binned"
-fi
-
-if [ "${11}" == "1" ]; then
-  EXTRA_FLAGS="${EXTRA_FLAGS} --skip-flat-field"
-fi
-
-if [ "${12}" == "1" ]; then
-  EXTRA_FLAGS="${EXTRA_FLAGS} --skip-bkg-sub"
-fi
-
-echo "Extra flags: $EXTRA_FLAGS"
-
-TILE_NUM=$(basename "$1")
-echo "Processing tile: $TILE_NUM"
-
-python -m exaspim_flatfield_correction.pipeline \
---config "/data/config.json" \
---tile-paths "$1" \
---output "$2" \
---res "$3" \
---method "$4" \
---flatfield-path "$5" \
---num-workers "$6" \
---mask-dir "$7" \
---n-levels 7 \
---results-dir "/results" \
---save-outputs \
---fitting-config "$9" \
---worker-mode "${10}" \
---background-smoothing-sigma "${13}" \
---background-final-smoothing-sigma "${14:-0}" \
---overwrite $EXTRA_FLAGS
+python -m exaspim_flatfield_correction.pipeline --config "/data/config.json" 
 
 echo "Done!"
