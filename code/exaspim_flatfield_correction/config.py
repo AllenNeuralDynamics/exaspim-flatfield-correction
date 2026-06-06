@@ -1,15 +1,167 @@
-"""Configuration helpers for fitting-based flatfield correction."""
+"""Configuration helpers for flatfield correction."""
 
 from __future__ import annotations
 
 import json
 import logging
+import os
 from pathlib import Path
-from typing import Any
+from typing import Any, Literal
 
-from pydantic import BaseModel, ConfigDict, Field, model_validator
+from pydantic import (
+    BaseModel,
+    ConfigDict,
+    Field,
+    field_validator,
+    model_validator,
+)
+
+from exaspim_flatfield_correction.utils.utils import (
+    extract_channel_from_tile_name,
+)
 
 _LOGGER = logging.getLogger(__name__)
+
+
+class PipelineConfig(BaseModel):
+    """Top-level configuration for the flatfield correction pipeline."""
+
+    model_config = ConfigDict(extra="forbid", validate_assignment=True)
+
+    tile_paths: list[str] = Field(
+        min_length=1,
+        description="One or more input OME-Zarr tile paths.",
+    )
+    output: str = Field(
+        min_length=1,
+        description="Output OME-Zarr path for corrected data.",
+    )
+    save_outputs: bool = Field(
+        default=False,
+        description="Save intermediate output files.",
+    )
+    results_dir: str = Field(
+        default_factory=lambda: os.path.join(os.getcwd(), "results"),
+        description="Directory for results, diagnostics, and metadata.",
+    )
+    res: str = Field(
+        default="0",
+        min_length=1,
+        description="Resolution level to process.",
+    )
+    method: Literal["basicpy", "reference", "fitting"] = Field(
+        default="fitting",
+        description="Flatfield correction method.",
+    )
+    overwrite: bool = Field(
+        default=False,
+        description="Overwrite existing outputs.",
+    )
+    skip_flat_field: bool = Field(
+        default=False,
+        description="Skip flatfield correction.",
+    )
+    skip_bkg_sub: bool = Field(
+        default=False,
+        description="Skip background subtraction.",
+    )
+    flatfield_path: str | None = Field(
+        default=None,
+        description="Reference flatfield image path.",
+    )
+    mask_dir: str | None = Field(
+        default=None,
+        description="Directory containing fitting masks.",
+    )
+    fitting_config: str | None = Field(
+        default=None,
+        description="Path to fitting configuration overrides.",
+    )
+    num_workers: int = Field(
+        default=1,
+        ge=1,
+        description="Number of Dask workers to launch.",
+    )
+    worker_mode: Literal["processes", "threads"] = Field(
+        default="processes",
+        description="Dask worker execution mode.",
+    )
+    log_level: int | str = Field(
+        default=logging.INFO,
+        description="Python logging level for the pipeline logger.",
+    )
+    n_levels: int = Field(
+        default=1,
+        ge=1,
+        description="Number of OME-Zarr pyramid levels to write.",
+    )
+    use_reference_bkg: bool = Field(
+        default=False,
+        description="Use a reference background image instead of estimating.",
+    )
+    background_smoothing_sigma: float = Field(
+        default=1.0,
+        ge=0,
+        description="Gaussian sigma applied before background estimation.",
+    )
+    background_final_smoothing_sigma: float = Field(
+        default=0.0,
+        ge=0,
+        description="Gaussian sigma applied to the final background image.",
+    )
+    binned_channel: str | None = Field(
+        default=None,
+        description="Substring identifying binned channel tiles.",
+    )
+    is_binned: bool = Field(
+        default=False,
+        description="Treat all configured tiles as binned channel data.",
+    )
+    median_summary_path: str | None = Field(
+        default=None,
+        description="Path to per-channel median intensity summary JSON.",
+    )
+
+    @field_validator("res", mode="before")
+    @classmethod
+    def _normalize_res(cls, value: Any) -> str:
+        if value in (None, ""):
+            raise ValueError("res cannot be empty")
+        return str(value)
+
+    @model_validator(mode="after")
+    def _validate_method_requirements(self) -> "PipelineConfig":
+        if self.method == "fitting" and self.mask_dir is None:
+            raise ValueError("mask_dir is required when method='fitting'")
+        if (
+            self.method == "fitting"
+            and not self.skip_flat_field
+            and self.skip_bkg_sub
+        ):
+            raise ValueError(
+                "active fitting correction requires background subtraction"
+            )
+        if (
+            self.method == "reference"
+            and not self.skip_flat_field
+            and self.flatfield_path is None
+        ):
+            raise ValueError(
+                "flatfield_path is required when active method='reference'"
+            )
+
+        if self.is_binned and self.binned_channel is None:
+            tile_name = Path(self.tile_paths[0]).name
+            inferred_channel = extract_channel_from_tile_name(tile_name)
+            if inferred_channel is not None:
+                self.binned_channel = inferred_channel
+            else:
+                _LOGGER.warning(
+                    "Unable to infer channel number from tile %s despite "
+                    "is_binned=true",
+                    tile_name,
+                )
+        return self
 
 
 class FittingConfig(BaseModel):
@@ -248,6 +400,17 @@ def load_fitting_config(path: str | Path | None = None) -> FittingConfig:
     if path is None:
         return FittingConfig()
     return FittingConfig.from_file(path)
+
+
+def load_pipeline_config(path: str | Path) -> PipelineConfig:
+    """Load and validate the top-level pipeline configuration."""
+
+    config_path = Path(path)
+    if not config_path.is_file():
+        raise ValueError(f"Config file not found: {config_path}")
+    raw = config_path.read_text()
+    data: Any = json.loads(raw)
+    return PipelineConfig.model_validate(data)
 
 
 def read_median_intensity_summary(

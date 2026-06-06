@@ -29,8 +29,10 @@ from exaspim_flatfield_correction.background import (
 from exaspim_flatfield_correction.basic import fit_basic, transform_basic
 from exaspim_flatfield_correction.config import (
     FittingConfig,
+    PipelineConfig,
     apply_median_summary_override,
     load_fitting_config,
+    load_pipeline_config,
     read_median_intensity_summary,
 )
 from exaspim_flatfield_correction.fitting import (
@@ -49,7 +51,6 @@ from exaspim_flatfield_correction.utils.metadata_utils import (
 from exaspim_flatfield_correction.utils.utils import (
     array_chunks,
     chunks_2d,
-    extract_channel_from_tile_name,
     get_bkg_path,
     get_parent_s3_path,
     load_mask_from_dir,
@@ -57,7 +58,7 @@ from exaspim_flatfield_correction.utils.utils import (
     resize,
     save_correction_curve_plot,
     upload_artifacts,
-    weighted_percentile
+    weighted_percentile,
 )
 from exaspim_flatfield_correction.utils.zarr_utils import (
     initialize_zarr_group,
@@ -80,145 +81,6 @@ class MaskArtifacts:
 
     mask_low_res: da.Array
     probability_volume: da.Array | None = None
-
-
-def resolve_args(
-    args: argparse.Namespace, parser: argparse.ArgumentParser
-) -> argparse.Namespace:
-    """Merge CLI args with optional JSON config (config takes precedence).
-
-    Parameters
-    ----------
-    args : argparse.Namespace
-        Parsed command-line arguments (pre-merge with config).
-    parser : argparse.ArgumentParser
-        Argument parser used to define available options; used to reconcile
-        config keys against all CLI arguments.
-
-    Returns
-    -------
-    argparse.Namespace
-        The input namespace updated with config overrides and inferred values.
-
-    Raises
-    ------
-    ValueError
-        If required values cannot be resolved.
-    """
-    config: dict[str, Any] = {}
-    if args.config:
-        config_path = Path(args.config)
-        if not config_path.is_file():
-            raise ValueError(f"Config file not found: {args.config}")
-        with open(config_path, "r") as f:
-            config = json.load(f)
-
-    allowed_config_keys = {
-        action.dest for action in parser._actions if action.dest != "help"
-    } | {"binned_channel"}
-    unknown_keys = set(config) - allowed_config_keys
-    if unknown_keys:
-        _LOGGER.warning(
-            "Ignoring unrecognized config keys: %s",
-            ", ".join(sorted(unknown_keys)),
-        )
-
-    # Merge config over CLI for every parser-defined argument
-    merged_cli: dict[str, Any] = {}
-    for action in parser._actions:
-        dest = action.dest
-        if dest == "help":
-            continue
-        if dest in config and config[dest] not in (None, ""):
-            val = config[dest]
-            if action.type and val is not None:
-                try:
-                    if isinstance(val, (list, tuple)):
-                        val = [action.type(v) for v in val]
-                    else:
-                        val = action.type(val)
-                except Exception as exc:  # noqa: BLE001
-                    raise ValueError(
-                        f"Invalid value for '{dest}' in config: {val}"
-                    ) from exc
-            merged_cli[dest] = val
-        else:
-            merged_cli[dest] = getattr(args, dest, action.default)
-
-    # Resolve primary inputs (config → CLI)
-    tile_paths = merged_cli.get("tile_paths")
-    if isinstance(tile_paths, str):
-        tile_paths = [tile_paths]
-    elif tile_paths is not None:
-        tile_paths = [str(p) for p in tile_paths]
-    merged_cli["tile_paths"] = tile_paths
-    if not tile_paths:
-        raise ValueError(
-            "No tile paths provided. Supply --tile-paths or set 'tile_paths' "
-            "in the config file."
-        )
-
-    if not merged_cli.get("output"):
-        raise ValueError(
-            "No output path provided. Supply --output or set 'output' in the "
-            "config file."
-        )
-
-    if merged_cli.get("method") not in {"basicpy", "reference", "fitting"}:
-        raise ValueError(
-            "Invalid method specified. Choose from 'basicpy', 'reference', or 'fitting'."
-        )
-
-    res_value = merged_cli.get("res")
-    res = str(res_value) if res_value not in (None, "") else None
-    merged_cli["res"] = res
-    if res is None:
-        raise ValueError(
-            "--res cannot be None."
-        )
-
-    merged_cli["skip_bkg_sub"] = merged_cli.get("skip_bkg_sub", False)
-    merged_cli["skip_flat_field"] = merged_cli.get("skip_flat_field", False)
-    merged_cli["is_binned"] = merged_cli.get("is_binned", False)
-    background_smoothing_sigma = merged_cli.get("background_smoothing_sigma")
-    if background_smoothing_sigma is None:
-        background_smoothing_sigma = 1.0
-    if background_smoothing_sigma < 0:
-        raise ValueError(
-            "--background-smoothing-sigma must be non-negative."
-        )
-    merged_cli["background_smoothing_sigma"] = background_smoothing_sigma
-
-    background_final_smoothing_sigma = merged_cli.get(
-        "background_final_smoothing_sigma"
-    )
-    if background_final_smoothing_sigma is None:
-        background_final_smoothing_sigma = 0.0
-    if background_final_smoothing_sigma < 0:
-        raise ValueError(
-            "--background-final-smoothing-sigma must be non-negative."
-        )
-    merged_cli["background_final_smoothing_sigma"] = (
-        background_final_smoothing_sigma
-    )
-
-    binned_channel = merged_cli.get("binned_channel")
-    if binned_channel is None and merged_cli["is_binned"]:
-        tile_name = Path(tile_paths[0]).name
-        inferred_channel = extract_channel_from_tile_name(tile_name)
-        if inferred_channel is not None:
-            binned_channel = inferred_channel
-        else:
-            _LOGGER.warning(
-                "Unable to infer channel number from tile %s despite --is-binned/config flag",
-                tile_name,
-            )
-    merged_cli["binned_channel"] = binned_channel
-
-    # Propagate merged values back into args for downstream consumers
-    for key, value in merged_cli.items():
-        setattr(args, key, value)
-    return args
 
 
 def background_subtraction(
@@ -1001,7 +863,7 @@ def save_method_outputs(
 def process_tile(
     tile_path: str,
     *,
-    args: argparse.Namespace,
+    args: PipelineConfig,
     method: str,
     res: str,
     binned_channel: str | None,
@@ -1207,118 +1069,8 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--config",
         type=str,
-        default=None,
+        required=True,
         help="Path to a JSON config file containing pipeline inputs.",
-    )
-    parser.add_argument(
-        "--tile-paths",
-        nargs="+",
-        dest="tile_paths",
-        type=str,
-        required=False,
-        default=None,
-        help="One or more input zarr paths for the tile data",
-    )
-    parser.add_argument(
-        "--output",
-        type=str,
-        required=False,
-        default=None,
-        help="Output zarr path for the corrected data",
-    )
-    parser.add_argument(
-        "--save-outputs",
-        default=False,
-        action="store_true",
-        help="Save intermediate output files.",
-    )
-    parser.add_argument(
-        "--results-dir",
-        type=str,
-        default=os.path.join(os.getcwd(), "results"),
-        help="Directory to save results and metadata.",
-    )
-    parser.add_argument(
-        "--res",
-        type=str,
-        default="0",
-        help="Resolution level to process (default: 0)",
-    )
-    parser.add_argument(
-        "--method",
-        type=str,
-        choices=["basicpy", "reference", "fitting"],
-        default="fitting",
-    )
-    parser.add_argument("--overwrite", default=False, action="store_true")
-    parser.add_argument(
-        "--skip-flat-field", action="store_true", default=False
-    )
-    parser.add_argument("--skip-bkg-sub", action="store_true", default=False)
-    parser.add_argument("--flatfield-path", type=str, default=None)
-    parser.add_argument("--mask-dir", type=str, default=None)
-    parser.add_argument(
-        "--fitting-config",
-        type=str,
-        default=None,
-        help="Path to a JSON file with fitting configuration overrides.",
-    )
-    parser.add_argument("--num-workers", type=int, default=1)
-    parser.add_argument(
-        "--worker-mode",
-        type=str,
-        choices=["processes", "threads"],
-        default="processes",
-        help="Execution mode for Dask workers (default: processes).",
-    )
-    parser.add_argument("--log-level", type=str, default=logging.INFO)
-    parser.add_argument(
-        "--n-levels",
-        type=int,
-        default=1,
-        help="Number of zarr pyramid levels (default: 1)",
-    )
-    parser.add_argument(
-        "--use-reference-bkg",
-        action="store_true",
-        default=False,
-        help="Use reference background image from S3 instead of estimating background.",
-    )
-    parser.add_argument(
-        "--background-smoothing-sigma",
-        type=float,
-        default=1.0,
-        help=(
-            "Gaussian smoothing sigma applied before background estimation. "
-            "Set to 0 to disable smoothing."
-        ),
-    )
-    parser.add_argument(
-        "--background-final-smoothing-sigma",
-        type=float,
-        default=0.0,
-        help=(
-            "Gaussian smoothing sigma applied to the final 2D background "
-            "image before subtraction and saving. Set to 0 to disable final "
-            "background smoothing."
-        ),
-    )
-    parser.add_argument(
-        "--binned-channel",
-        type=str,
-        default=None,
-        help="Substring identifying binned channel tiles (e.g., '488').",
-    )
-    parser.add_argument("--is-binned", action="store_true", default=False)
-    parser.add_argument(
-        "--median-summary-path",
-        type=str,
-        default=None,
-        help=(
-            "Path to a JSON file containing per-channel mean_of_medians values "
-            "for global normalization. Overrides the value stored in the fitting "
-            "configuration when provided."
-        ),
     )
     return parser
 
@@ -1346,19 +1098,11 @@ def create_zarr_artifact_path(out_zarr_path: str, dirname: str) -> str:
 def main() -> None:
     """Execute the flatfield correction pipeline for the requested tiles."""
     parser = build_parser()
-    args = parser.parse_args()
+    cli_args = parser.parse_args()
+    args = load_pipeline_config(cli_args.config)
     _LOGGER.setLevel(args.log_level)
 
-    _LOGGER.info(f"args: {args}")
-
-    args = resolve_args(args, parser)
-    _LOGGER.info(f"Resolved parameters: {args}")
-
-    if args.method == "fitting" and args.mask_dir is None:
-        raise ValueError(
-            "Mask directory (--mask-dir) must be specified when using the "
-            "'fitting' method."
-        )
+    _LOGGER.info("Pipeline parameters: %s", args.model_dump(mode="json"))
 
     results_dir = args.results_dir
     if not os.path.exists(results_dir):
