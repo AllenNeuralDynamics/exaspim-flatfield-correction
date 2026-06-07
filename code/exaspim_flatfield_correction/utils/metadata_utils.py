@@ -37,9 +37,14 @@ def _serialize_parameter_value(value: Any) -> Any:
 
 def _get_code_parameters(args: Any, output_path: str, res: str) -> dict[str, Any]:
     """Build metadata for the resolved pipeline invocation."""
+    model_dump = getattr(args, "model_dump", None)
+    if callable(model_dump):
+        raw_parameters = model_dump(mode="json")
+    else:
+        raw_parameters = vars(args)
     parameters = {
         key: _serialize_parameter_value(value)
-        for key, value in vars(args).items()
+        for key, value in raw_parameters.items()
     }
     if parameters.get("res") in (None, ""):
         parameters["res"] = res

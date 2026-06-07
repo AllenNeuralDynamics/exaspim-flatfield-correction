@@ -1,0 +1,122 @@
+from __future__ import annotations
+
+import json
+
+import pytest
+
+from exaspim_flatfield_correction.config import (
+    PipelineConfig,
+    load_pipeline_config,
+)
+
+
+def _sample_pipeline_config() -> dict[str, object]:
+    return {
+        "method": "fitting",
+        "tile_paths": [
+            (
+                "s3://aind-open-data/"
+                "exaSPIM_826506_2026-05-19_14-00-17_processed_"
+                "2026-06-04_14-18-27/denoised/SPIM.ome.zarr/"
+                "tile_000001_ch_488.zarr"
+            ),
+            (
+                "s3://aind-open-data/"
+                "exaSPIM_826506_2026-05-19_14-00-17_processed_"
+                "2026-06-04_14-18-27/denoised/SPIM.ome.zarr/"
+                "tile_000001_ch_561.zarr"
+            ),
+        ],
+        "output": (
+            "s3://aind-open-data/"
+            "exaSPIM_826506_2026-05-19_14-00-17_processed_"
+            "2026-06-04_14-18-27/flatfield_correction/SPIM.ome.zarr"
+        ),
+        "binned_channel": "561",
+        "res": 0,
+        "skip_flat_field": False,
+        "skip_bkg_sub": False,
+        "mask_dir": "/data/masks",
+        "fitting_config": "/data/fitting_config.json",
+        "worker_mode": "processes",
+        "background_smoothing_sigma": 3.0,
+        "num_workers": 16,
+        "n_levels": 7,
+        "results_dir": "/results",
+        "save_outputs": True,
+        "overwrite": True,
+    }
+
+
+def test_pipeline_config_validates_sample_and_normalizes_res() -> None:
+    config = PipelineConfig.model_validate(_sample_pipeline_config())
+
+    assert config.res == "0"
+    assert config.method == "fitting"
+    assert config.tile_paths[0].endswith("tile_000001_ch_488.zarr")
+    assert config.output.endswith("flatfield_correction/SPIM.ome.zarr")
+
+
+def test_load_pipeline_config_from_file(tmp_path) -> None:
+    config_path = tmp_path / "config.json"
+    config_path.write_text(json.dumps(_sample_pipeline_config()))
+
+    config = load_pipeline_config(config_path)
+
+    assert config.res == "0"
+    assert config.num_workers == 16
+
+
+@pytest.mark.parametrize("extra_key", ["output_zarr", "resolution"])
+def test_pipeline_config_rejects_legacy_schema_keys(extra_key: str) -> None:
+    payload = _sample_pipeline_config()
+    payload[extra_key] = "legacy-value"
+
+    with pytest.raises(ValueError, match=extra_key):
+        PipelineConfig.model_validate(payload)
+
+
+def test_pipeline_config_rejects_negative_final_background_smoothing() -> None:
+    payload = _sample_pipeline_config()
+    payload["background_final_smoothing_sigma"] = -1
+
+    with pytest.raises(
+        ValueError,
+        match="background_final_smoothing_sigma",
+    ):
+        PipelineConfig.model_validate(payload)
+
+
+def test_pipeline_config_requires_mask_dir_for_fitting() -> None:
+    payload = _sample_pipeline_config()
+    payload.pop("mask_dir")
+
+    with pytest.raises(ValueError, match="mask_dir"):
+        PipelineConfig.model_validate(payload)
+
+
+def test_pipeline_config_rejects_active_fitting_without_background() -> None:
+    payload = _sample_pipeline_config()
+    payload["skip_bkg_sub"] = True
+
+    with pytest.raises(ValueError, match="background subtraction"):
+        PipelineConfig.model_validate(payload)
+
+
+def test_pipeline_config_requires_flatfield_for_active_reference() -> None:
+    payload = _sample_pipeline_config()
+    payload["method"] = "reference"
+    payload.pop("mask_dir")
+
+    with pytest.raises(ValueError, match="flatfield_path"):
+        PipelineConfig.model_validate(payload)
+
+
+def test_pipeline_config_infers_binned_channel_when_marked_binned() -> None:
+    payload = _sample_pipeline_config()
+    payload.pop("binned_channel")
+    payload["is_binned"] = True
+
+    config = PipelineConfig.model_validate(payload)
+
+    assert config.binned_channel == "488"

@@ -17,9 +17,7 @@ from exaspim_flatfield_correction.background import (
 )
 from exaspim_flatfield_correction.pipeline import (
     background_subtraction,
-    build_parser,
     cleanup_background_cache,
-    resolve_args,
     save_method_outputs,
 )
 
@@ -265,27 +263,3 @@ def test_save_method_outputs_writes_background_and_indices(tmp_path) -> None:
     assert indices_path.is_file()
     np.testing.assert_array_equal(tifffile.imread(bkg_path), bkg)
     assert json.loads(indices_path.read_text()) == [1, 3, 5]
-
-
-def test_resolve_args_rejects_negative_final_background_smoothing() -> None:
-    parser = build_parser()
-    args = parser.parse_args(
-        [
-            "--tile-paths",
-            "tile.zarr",
-            "--output",
-            "out.zarr",
-            "--res",
-            "0",
-            "--method",
-            "fitting",
-            "--background-final-smoothing-sigma",
-            "-1",
-        ]
-    )
-
-    with pytest.raises(
-        ValueError,
-        match="--background-final-smoothing-sigma must be non-negative",
-    ):
-        resolve_args(args, parser)
