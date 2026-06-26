@@ -1,307 +1,308 @@
+"""Zarr I/O and OME-Zarr multiscale writing for the flatfield pipeline.
+
+Reads and writes both Zarr v2 and Zarr v3 (OME-NGFF 0.4 / 0.5) by delegating to
+the ``zarr-io`` and ``zarr-multiscale`` libraries. The corrected output is written
+in the same Zarr format as the input tile (chosen by the caller).
+"""
+
 import logging
 from functools import partial
-from pathlib import Path
-from typing import Callable
+from typing import Any, Callable
 
 import dask.array as da
 import numpy as np
-import s3fs
 import zarr
-from aind_data_transfer.transformations.ome_zarr import (
-    downsample_and_store,
-    store_array,
+
+from xarray_multiscale import multiscale as _xarray_multiscale
+from xarray_multiscale.reducers import windowed_rank
+
+from zarr_io.arrays import (
+    ArraySpec,
+    ArrayTarget,
+    open_group,
+    read_zarr_array,
+    write_dask_array,
+)
+from zarr_io.backends import ArrayIOBackend, io_backend_from_name
+from zarr_io.config import IOBackendName, IOConcurrencyConfig, OutputShards
+from zarr_io.ome import (
+    axes_from_attrs,
+    parse_ome_zarr_transformations,  # re-exported for callers (v0.4 + v0.5 aware)
     write_ome_ngff_metadata,
 )
-from numcodecs import blosc
-from numcodecs.abc import Codec
-from zarr.errors import ContainsGroupError
-
-blosc.use_threads = False
-from xarray_multiscale.reducers import windowed_mean, windowed_rank
+from zarr_multiscale.pyramid import reducer_name, write_multiscale_pyramid
 
 _LOGGER = logging.getLogger(__name__)
 
+DEFAULT_SCALE_FACTORS = (1, 1, 2, 2, 2)
+DEFAULT_REDUCER = partial(windowed_rank, rank=-2)
 
-def initialize_zarr_group(
+__all__ = [
+    "store_ome_zarr",
+    "parse_ome_zarr_transformations",
+    "ensure_group",
+    "get_zarr_tiles",
+]
+
+
+def ensure_group(
     path: str,
     *,
+    zarr_format: int,
     mode: str = "a",
     aws_region: str = "us-west-2",
     s3_use_ssl: bool = False,
-    s3_batch_size: int = 64,
-    s3_multipart_threshold: int = 256 * 1024 * 1024,
     s3_total_max_attempts: int = 10,
     s3_retry_mode: str = "adaptive",
-) -> zarr.hierarchy.Group:
-    """Open (and create if needed) a Zarr group.
+) -> zarr.Group:
+    """Open (creating if needed) a container Zarr group, local or on S3.
 
-    Parameters
-    ----------
-    path : str
-        Local filesystem path or S3 URI where the group should reside.
-    mode : str, optional
-        Zarr open mode to use (e.g. ``"a"``, ``"w"``, ``"w-"``). Defaults to
-        ``"a"`` which creates the group when missing and reuses it otherwise.
-    aws_region : str, optional
-        AWS region to use when ``path`` points to S3. Default "us-west-2".
-    s3_use_ssl : bool, optional
-        Whether to use SSL when communicating with S3. Default ``False``.
-    s3_batch_size : int, optional
-        Batch size for S3 multipart uploads. Default ``64``.
-    s3_multipart_threshold : int, optional
-        Threshold (in bytes) before S3 multipart uploads are used.
-        Default ``256 * 1024 * 1024`` (256 MB).
-    s3_total_max_attempts : int, optional
-        Maximum number of retry attempts for S3 operations. Default ``10``.
-    s3_retry_mode : str, optional
-        Retry mode passed to the S3 client. Default ``"adaptive"``.
-    Returns
-    -------
-    zarr.hierarchy.Group
-        The opened Zarr group handle.
+    Replaces the old ``initialize_zarr_group`` helper; supports both Zarr v2 and
+    v3 via ``zarr-io``.
     """
-
-    target_path = path.rstrip("/")
-    if target_path.startswith("s3://"):
-        s3 = s3fs.S3FileSystem(
-            anon=False,
-            client_kwargs={
-                "region_name": aws_region,
-            },
-            config_kwargs={
-                "s3": {
-                    "multipart_threshold": s3_multipart_threshold,
-                },
-                "retries": {
-                    "total_max_attempts": s3_total_max_attempts,
-                    "mode": s3_retry_mode,
-                },
-            },
-            use_ssl=s3_use_ssl,
-            s3_additional_kwargs={"batch_size": s3_batch_size},
-        )
-        store = s3fs.S3Map(root=target_path, s3=s3, check=False)
-    else:
-        Path(target_path).mkdir(parents=True, exist_ok=True)
-        store = zarr.DirectoryStore(target_path)
-    return zarr.open_group(store=store, mode=mode)
+    return open_group(
+        path,
+        mode=mode,
+        zarr_format=zarr_format,
+        aws_region=aws_region,
+        s3_use_ssl=s3_use_ssl,
+        s3_total_max_attempts=s3_total_max_attempts,
+        s3_retry_mode=s3_retry_mode,
+    )
 
 
 def store_ome_zarr(
-    corrected: da.Array,
+    data: da.Array,
     output_zarr: str,
     n_levels: int = 1,
     voxel_size: tuple[float, float, float] = (1.0, 1.0, 1.0),
-    origin: tuple[int, int, int, int, int] = (0, 0, 0, 0, 0),
+    origin: tuple[float, ...] = (0, 0, 0, 0, 0),
+    *,
     overwrite: bool = False,
-    reducer: Callable = windowed_mean,
-    aws_region: str = "us-west-2",
-    s3_use_ssl: bool = False,
+    zarr_format: int = 2,
+    io_backend: IOBackendName | ArrayIOBackend = "tensorstore",
+    io_concurrency: IOConcurrencyConfig | None = None,
+    reducer: Callable[..., Any] = DEFAULT_REDUCER,
     write_empty_chunks: bool = True,
     scale_factors: tuple[int, ...] | None = None,
-    block_shape: tuple[int, ...] | None = None,
-    codec: Codec | None = None,
-    s3_batch_size: int = 64,
-    s3_multipart_threshold: int = 256 * 1024 * 1024,
+    chunks: tuple[int, ...] | None = None,
+    output_shards: OutputShards = "none",
+    codec: Any | None = None,
+    aws_region: str = "us-west-2",
+    s3_use_ssl: bool = False,
     s3_total_max_attempts: int = 10,
     s3_retry_mode: str = "adaptive",
 ) -> None:
-    """
-    Store a Dask array as an OME-Zarr multiscale dataset, with optional S3
-    support and metadata.
+    """Store a Dask array as an OME-Zarr multiscale dataset (Zarr v2 or v3).
+
+    Writes level ``0`` directly, then generates pyramid levels ``1..n-1`` with
+    ``zarr-multiscale`` and writes OME-NGFF metadata. The output Zarr format is
+    chosen by ``zarr_format`` (match the input tile for round-trip compatibility).
 
     Parameters
     ----------
-    corrected : dask.array.Array
-        The image data to store (will be expanded to 5D if needed).
+    data : dask.array.Array
+        Image data to store (expanded to 5D TCZYX if needed).
     output_zarr : str
-        Path or S3 URL to the output zarr group.
-    n_levels : int, optional
-        Number of pyramid levels to generate. Default is 1.
-    voxel_size : tuple of float, optional
-        Physical voxel size (ZYX) for metadata. Default is (1.0, 1.0, 1.0).
-    origin : tuple of int, optional
-        Origin for the OME-NGFF metadata. Default is (0, 0, 0, 0, 0).
-    overwrite : bool, optional
-        Whether to overwrite existing data. Default is False.
-    reducer : Callable, optional
-        Function to use for downsampling. Should accept (array, ...) and
-        return downsampled array. Default is windowed_rank.
-    aws_region : str, optional
-        AWS region name for S3 access. Default is 'us-west-2'.
-    s3_use_ssl : bool, optional
-        Whether to use SSL for S3 access. Default is False.
-    write_empty_chunks : bool, optional
-        Whether to write empty chunks to the store. Default is True.
+        Local path or ``s3://`` URI of the output OME-Zarr group.
+    n_levels : int
+        Requested number of pyramid levels (clamped to what the shape supports).
+    voxel_size : tuple of float
+        Physical voxel size (ZYX) written as the level-0 scale transform.
+    origin : tuple of float
+        Translation transform (TCZYX, or ZYX which is front-padded with zeros).
+    overwrite : bool
+        Overwrite an existing group; when False an existing group is left intact
+        (the tile is skipped).
+    zarr_format : int
+        Output Zarr format, 2 or 3.
+    io_backend : str or ArrayIOBackend
+        ``"tensorstore"`` (default) or ``"zarr"``. Both honor
+        ``write_empty_chunks``.
+    reducer : Callable
+        Downsampling reducer (e.g. ``partial(windowed_rank, rank=-2)`` for image
+        data, ``windowed_mode`` for label/mask data).
+    write_empty_chunks : bool
+        When False, chunks equal to the fill value are not written (sparse output).
     scale_factors : tuple of int, optional
-        Per-axis scale factors used when generating the image pyramid.
-        Defaults to (1, 1, 2, 2, 2).
-    block_shape : tuple of int, optional
-        Chunk shape to use when storing the arrays (TCZYX order).
-        Defaults to (1, 1, 4096, 4096, 4096).
-    codec : numcodecs.abc.Codec, optional
-        Compressor to use when writing the arrays. Defaults to
-        blosc.Blosc(cname="zstd", clevel=1, shuffle=blosc.SHUFFLE).
-    s3_batch_size : int, optional
-        Batch size for S3 multipart uploads. Default is 64.
-    s3_multipart_threshold : int, optional
-        Size threshold in bytes that triggers multipart uploads.
-        Default is 256 * 1024 * 1024 (256 MB).
-    s3_total_max_attempts : int, optional
-        Maximum number of retry attempts for S3 operations. Default is 10.
-    s3_retry_mode : str, optional
-        Retry mode passed to the S3 client. Default is "adaptive".
-
-    Returns
-    -------
-    None
-
-    Raises
-    ------
-    ValueError
-        If the provided scale_factors has fewer than three elements or the
-        block_shape does not describe all five TCZYX axes.
+        Per-axis (TCZYX) downsampling factors. Defaults to (1, 1, 2, 2, 2). A
+        3-tuple (ZYX) is front-padded with (1, 1).
+    chunks : tuple of int, optional
+        Level-0 chunk shape (TCZYX). Defaults to the source array's own chunking
+        (``data.chunksize``).
+    output_shards : "inherit" | "none" | tuple
+        Shard layout for written levels (Zarr v3 only); "none" disables sharding.
+    codec : optional
+        Compressor. Defaults to zstd Blosc appropriate to ``zarr_format``.
     """
-    mode = "w" if overwrite else "w-"
-    try:
-        root_group = initialize_zarr_group(
-            output_zarr,
-            mode=mode,
-            aws_region=aws_region,
-            s3_use_ssl=s3_use_ssl,
-            s3_batch_size=s3_batch_size,
-            s3_multipart_threshold=s3_multipart_threshold,
-            s3_total_max_attempts=s3_total_max_attempts,
-            s3_retry_mode=s3_retry_mode,
-        )
-    except ContainsGroupError:
-        _LOGGER.info(f"Not overwriting tile {output_zarr}")
-        return
-
-    if codec is None:
-        codec = blosc.Blosc(cname="zstd", clevel=1, shuffle=blosc.SHUFFLE)
+    if zarr_format not in (2, 3):
+        raise ValueError(f"Unsupported Zarr format: {zarr_format}")
 
     if scale_factors is None:
-        scale_factors = (1, 1, 2, 2, 2)
+        scale_factors = DEFAULT_SCALE_FACTORS
+    if len(scale_factors) == 3:
+        scale_factors = (1, 1, *scale_factors)
+    if len(scale_factors) != 5:
+        raise ValueError("scale_factors must describe all five TCZYX axes")
 
-    if block_shape is None:
-        block_shape = (1, 1, 4096, 4096, 4096)
+    # Expand to 5D TCZYX.
+    while data.ndim < 5:
+        data = data[np.newaxis, ...]
 
-    if len(scale_factors) < 3:
-        raise ValueError("scale_factors must contain at least three elements")
+    # Default the chunk shape to the source array's own chunking (TCZYX). Inheriting
+    # the input chunks keeps the output layout aligned with the tile being written.
+    if chunks is None:
+        chunks = data.chunksize
+    if len(chunks) != 5:
+        raise ValueError("chunks must be a tuple of length 5")
 
-    if len(block_shape) != 5:
-        raise ValueError("block_shape must be a tuple of length 5")
-
-    while corrected.ndim < 5:
-        corrected = corrected[np.newaxis, ...]
-
-    _LOGGER.info("storing array")
-    store_array(
-        corrected,
-        root_group,
-        "0",
-        block_shape,
-        codec,
-        write_empty_chunks=write_empty_chunks,
+    # Clamp the chunk shape to the array shape so a single chunk never exceeds
+    # the data; otherwise small volumes try to allocate a full oversized chunk.
+    chunks = tuple(
+        max(1, min(int(c), int(s))) for c, s in zip(chunks, data.shape)
     )
-    _LOGGER.info("downsampling array")
-    if reducer == windowed_rank:
-        reducer = partial(reducer, rank=-2)
-    downsample_and_store(
-        corrected,
-        root_group,
-        n_levels,
-        scale_factors,
-        block_shape,
-        codec,
-        reducer,
-        write_empty_chunks=write_empty_chunks,
+
+    backend = io_backend_from_name(io_backend, io_concurrency)
+
+    if codec is None:
+        codec = _default_codec(zarr_format)
+
+    target = _open_output_group(
+        output_zarr,
+        overwrite=overwrite,
+        zarr_format=zarr_format,
+        aws_region=aws_region,
+        s3_use_ssl=s3_use_ssl,
+        s3_total_max_attempts=s3_total_max_attempts,
+        s3_retry_mode=s3_retry_mode,
     )
-    _LOGGER.info("writing ome metadata")
+    if target is None:
+        _LOGGER.info("Not overwriting existing tile %s", output_zarr)
+        return
+
+    # Level-0 spec (format-aware codec/shards).
+    level0_shards = output_shards if (zarr_format == 3 and isinstance(output_shards, tuple)) else None
+    spec_kwargs: dict[str, Any] = {
+        "zarr_format": zarr_format,
+        "chunks": tuple(chunks),
+        "write_empty_chunks": write_empty_chunks,
+        # An explicit (non-null) fill value is required for the tensorstore
+        # backend to elide all-fill-value chunks when write_empty_chunks=False;
+        # a null v2 fill value leaves nothing to compare against. 0 is the
+        # background value for these volumes and matches the v3 default.
+        "fill_value": 0,
+    }
+    if zarr_format == 2:
+        spec_kwargs["compressor"] = codec
+    else:
+        spec_kwargs["compressors"] = (codec,)
+        spec_kwargs["shards"] = level0_shards
+        spec_kwargs["dimension_names"] = ("t", "c", "z", "y", "x")
+    spec0 = ArraySpec.from_dask(data, **spec_kwargs)
+
+    _LOGGER.info("Writing level 0 to %s (zarr v%d, %s)", output_zarr, zarr_format, backend.name)
+    write_dask_array(data, target, "0", spec=spec0, io_backend=backend, overwrite=True)
+
+    # Generate pyramid levels 1..levels-1 (clamped to what the shape supports).
+    levels = _max_levels(data, scale_factors, reducer, n_levels)
+    if levels < n_levels:
+        _LOGGER.warning(
+            "Requested %d levels but shape %s only supports %d; clamping.",
+            n_levels,
+            tuple(int(s) for s in data.shape),
+            levels,
+        )
+    if levels > 1:
+        _LOGGER.info("Generating %d pyramid levels", levels - 1)
+        write_multiscale_pyramid(
+            target,
+            target,
+            io_backend=backend,
+            n_levels=levels,
+            scale_factors=scale_factors,
+            output_shards=output_shards,
+            reducer=reducer,
+            ome_metadata=False,
+            include_level_zero=True,
+            write_empty_chunks=write_empty_chunks,
+        )
+
+    # Write OME-NGFF metadata, preserving voxel_size/origin from the input tile.
+    base_scale = _to_5d_vector(voxel_size, fill=1.0)
+    base_translation = _to_5d_vector(origin, fill=0.0)
+    _LOGGER.info("Writing OME-NGFF metadata for %s", output_zarr)
     write_ome_ngff_metadata(
-        root_group,
-        corrected,
-        Path(output_zarr).stem,
-        n_levels,
-        scale_factors[-3:],  # must be 3D
-        voxel_size,  # must be 3D ZYX
-        origin,
+        target.group,
+        source_attrs={},
+        source_path=output_zarr,
+        level_paths=[str(i) for i in range(levels)],
+        base_scale=base_scale,
+        base_translation=base_translation,
+        scale_factors=scale_factors,
+        axes=axes_from_attrs({}, ndim=5),
+        downsample_type=reducer_name(reducer),
     )
 
 
-def parse_ome_zarr_transformations(z: zarr.hierarchy.Group, res: str) -> dict:
-    """
-    Parse scale and translation transformations for a given resolution in
-    an OME-Zarr dataset.
-
-    Parameters
-    ----------
-    z : zarr.hierarchy.Group
-        Opened zarr group for the dataset.
-    res : str
-        Resolution key to extract transformations for.
-
-    Returns
-    -------
-    dict
-        Dictionary containing 'scale' and 'translation' for the
-        specified resolution.
-
-    Raises
-    ------
-    ValueError
-        If OME-Zarr metadata is not found.
-    """
-
-    # Read the metadata from .zattrs
+def _open_output_group(
+    output_zarr: str,
+    *,
+    overwrite: bool,
+    zarr_format: int,
+    **s3_kwargs: Any,
+) -> ArrayTarget | None:
+    """Open the output group, returning None if it exists and overwrite is False."""
+    mode = "w" if overwrite else "w-"
     try:
-        metadata = z.attrs.asdict()
-    except KeyError:
-        raise ValueError("OME-Zarr metadata not found.")
+        group = open_group(output_zarr, mode=mode, zarr_format=zarr_format, **s3_kwargs)
+    except (FileExistsError, ContainsGroupError):
+        return None
+    return ArrayTarget.from_group(group, path=output_zarr)
 
-    res = str(res)
 
-    # Extract transformations for the first dataset
-    transformations = {}
-    multiscales = metadata.get("multiscales", [])
+def _default_codec(zarr_format: int) -> Any:
+    """Return a zstd Blosc compressor appropriate to the Zarr format."""
+    if zarr_format == 2:
+        from numcodecs import blosc
 
-    if multiscales:
-        datasets = multiscales[0].get("datasets", [])
-        for ds in datasets:
-            if ds["path"] == res:
-                coord_transforms = ds.get("coordinateTransformations", [])
-                scale = next(
-                    (
-                        t["scale"]
-                        for t in coord_transforms
-                        if t["type"] == "scale"
-                    ),
-                    None,
-                )
-                translation = next(
-                    (
-                        t["translation"]
-                        for t in coord_transforms
-                        if t["type"] == "translation"
-                    ),
-                    None,
-                )
-                transformations = {"scale": scale, "translation": translation}
-                break
+        return blosc.Blosc(cname="zstd", clevel=1, shuffle=blosc.SHUFFLE)
+    from zarr.codecs import BloscCodec, BloscShuffle
 
-    return transformations
+    return BloscCodec(cname="zstd", clevel=1, shuffle=BloscShuffle.shuffle)
+
+
+def _to_5d_vector(values: tuple[float, ...] | list[float], *, fill: float) -> list[float]:
+    """Coerce a transform vector to length 5 (TCZYX), front-padding with ``fill``."""
+    vec = [float(v) for v in values]
+    if len(vec) >= 5:
+        return vec[:5]
+    return [fill] * (5 - len(vec)) + vec
+
+
+def _max_levels(
+    data: da.Array,
+    scale_factors: tuple[int, ...],
+    reducer: Callable[..., Any],
+    requested: int,
+) -> int:
+    """Number of pyramid levels (incl. level 0) the data supports, capped at ``requested``.
+
+    Uses xarray-multiscale to count levels so the result matches exactly what
+    ``write_multiscale_pyramid`` validates against (a heuristic can over-count and
+    trigger a ValueError downstream). The lazy pyramid built here is discarded.
+    """
+    levels = _xarray_multiscale(data, reducer, scale_factors)
+    return min(requested, len(levels))
 
 
 def get_zarr_tiles(
-    z, res: int = 5, chunks: tuple[int, ...] = None
+    z: zarr.Group, res: int = 5, chunks: tuple[int, ...] = None
 ) -> list[da.Array]:
-    """
-    Extract tiles from a zarr group at a given resolution as Dask arrays.
+    """Extract tiles from a zarr group at a given resolution as Dask arrays.
 
     Parameters
     ----------
-    z : zarr.hierarchy.Group
+    z : zarr.Group
         Zarr group containing tiles.
     res : int, optional
         Resolution level to extract. Default is 5.

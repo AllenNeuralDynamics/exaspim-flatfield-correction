@@ -95,6 +95,28 @@ class PipelineConfig(BaseModel):
         ge=1,
         description="Number of OME-Zarr pyramid levels to write.",
     )
+    io_backend: Literal["tensorstore", "zarr"] = Field(
+        default="tensorstore",
+        description=(
+            "Backend used for Zarr reads/writes. 'tensorstore' is faster on S3; "
+            "'zarr' uses zarr-python. Sparse mask/probability writes "
+            "(write_empty_chunks=False) always use the zarr backend."
+        ),
+    )
+    output_zarr_format: Literal["match", "2", "3"] = Field(
+        default="match",
+        description=(
+            "Zarr format for corrected/mask/probability outputs. 'match' uses "
+            "the input tile's format (v2 or v3); '2' or '3' force a format."
+        ),
+    )
+    corrected_rank: int = Field(
+        default=-2,
+        description=(
+            "Rank passed to windowed_rank when downsampling the corrected and "
+            "probability volumes (-2 is the second brightest voxel); masks use windowed_mode."
+        ),
+    )
     use_reference_bkg: bool = Field(
         default=False,
         description="Use a reference background image instead of estimating.",

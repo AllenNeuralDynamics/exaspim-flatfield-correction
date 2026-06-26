@@ -1,18 +1,9 @@
 #!/usr/bin/env bash
 set -euo pipefail
-
-conda update conda -y
-conda update mamba -y
-mamba create -n correction -c conda-forge python=3.11 -y
-source $(conda info --base)/etc/profile.d/conda.sh
-conda activate correction
-
 git clone https://github.com/AllenNeuralDynamics/exaspim-flatfield-correction.git
 cd exaspim-flatfield-correction
-git checkout 8427ec6ec9c2976e6f4726ae929ec05643a608d2
+git checkout feat-zarr3
 pip install .
-
-pip install "aind-data-schema==2.6.0"
 
 curl "https://awscli.amazonaws.com/awscli-exe-linux-x86_64.zip" -o "awscliv2.zip"
 unzip awscliv2.zip

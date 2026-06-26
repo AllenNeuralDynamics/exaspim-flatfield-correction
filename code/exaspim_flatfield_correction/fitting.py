@@ -510,8 +510,13 @@ def calc_percentile_weight(
             # block is normalized t
             # compute exponent part
             z = -B * np.clip(block, 0.0, 1.0)
-            # compute (1 + Q exp(z))^(−1/nu); z is <= 0 so exp(z) is stable
-            return (1.0 / (1.0 + Q * np.exp(z))) ** (1.0 / nu)
+            # compute (1 + Q exp(z))^(−1/nu); z is <= 0 so exp(z) is stable.
+            # Cast back to float32: under NEP 50, the np.float64 scalar ``B``
+            # promotes the float32 block to float64, which would otherwise
+            # violate the dtype=np.float32 declared on map_blocks below and
+            # leak float64 chunks into the float32 output store.
+            out = (1.0 / (1.0 + Q * np.exp(z))) ** (1.0 / nu)
+            return out.astype(np.float32, copy=False)
 
         weights = da.map_blocks(_richards, t, dtype=np.float32)
 

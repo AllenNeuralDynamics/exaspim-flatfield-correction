@@ -7,14 +7,12 @@ import time
 import uuid
 from dataclasses import dataclass
 from datetime import datetime
+from functools import partial
 from pathlib import Path
 from typing import Any
 
 import numpy as np
 import zarr
-from numcodecs import blosc
-
-blosc.use_threads = False
 import dask.array as da
 import tifffile
 from dask.distributed import performance_report
@@ -61,11 +59,14 @@ from exaspim_flatfield_correction.utils.utils import (
     weighted_percentile,
 )
 from exaspim_flatfield_correction.utils.zarr_utils import (
-    initialize_zarr_group,
+    ensure_group,
     parse_ome_zarr_transformations,
     store_ome_zarr,
 )
 from exaspim_flatfield_correction.utils.dask_utils import create_dask_client
+from xarray_multiscale.reducers import windowed_mode, windowed_rank
+from zarr_io.arrays import open_group, read_zarr_array
+from zarr_io.config import IOBackendName
 
 
 logging.basicConfig(
@@ -83,10 +84,43 @@ class MaskArtifacts:
     probability_volume: da.Array | None = None
 
 
+def _save_local_zarr(
+    path: str, array: np.ndarray, chunks: tuple[int, ...]
+) -> str:
+    """Write a numpy array to a local Zarr array (overwriting).
+
+    Used for ephemeral, local-only caches (background images, preprocessed
+    masks). Uses the default Zarr v3 zstd compressor; reads use ``da.from_zarr``.
+    """
+    if os.path.exists(path):
+        shutil.rmtree(path)
+    z_arr = zarr.create_array(
+        store=str(path),
+        shape=tuple(int(s) for s in array.shape),
+        dtype=array.dtype,
+        chunks=tuple(int(c) for c in chunks),
+    )
+    z_arr[...] = array
+    return str(path)
+
+
+def resolve_output_format(args: PipelineConfig) -> int:
+    """Resolve the output Zarr format (2 or 3) from config and the input tile.
+
+    ``output_zarr_format="match"`` reads the first input tile's format so the
+    corrected output round-trips in the same Zarr format as the input.
+    """
+    preference = args.output_zarr_format
+    if preference in ("2", "3"):
+        return int(preference)
+    first_tile = open_group(args.tile_paths[0], mode="r")
+    return int(first_tile.metadata.zarr_format)
+
+
 def background_subtraction(
     tile_path: str,
     full_res: da.Array,
-    z: zarr.hierarchy.Group,
+    z: zarr.Group,
     results_dir: str | None = None,
     tile_name: str | None = None,
     is_binned_channel: bool = False,
@@ -94,6 +128,7 @@ def background_subtraction(
     background_smoothing_sigma: float = 1.0,
     background_final_smoothing_sigma: float = 0.0,
     target_resolution: str = "0",
+    io_backend: IOBackendName = "tensorstore",
 ) -> tuple[da.Array, np.ndarray, np.ndarray | None, Path | None]:
     """Remove background estimates from the full-resolution volume.
 
@@ -103,7 +138,7 @@ def background_subtraction(
         Filesystem or S3 path to the tile Zarr group.
     full_res : dask.array.Array
         Full-resolution image volume to correct (modified lazily).
-    z : zarr.hierarchy.Group
+    z : zarr.Group
         Open Zarr hierarchy for the tile.
     results_dir : str or None, default=None
         Directory where the temporary background Zarr cache should be written.
@@ -166,9 +201,8 @@ def background_subtraction(
             "Background estimation smoothing sigma: %s",
             background_smoothing_sigma,
         )
-        low_res = da.from_zarr(
-            z[bkg_res],
-            name=f"bkg-selector-{safe_tile_name}-{bkg_res}-{dask_name_token}",
+        low_res = read_zarr_array(
+            z, component=bkg_res, io_backend=io_backend
         ).squeeze().astype(np.float32)
         low_res_shape = tuple(int(dim) for dim in low_res.shape)
         if background_smoothing_sigma > 0:
@@ -265,14 +299,7 @@ def _write_background_cache(
 ) -> Path:
     """Write a 2D background image to a local chunked Zarr array."""
 
-    if cache_path.exists():
-        shutil.rmtree(cache_path)
-    zarr.save_array(
-        str(cache_path),
-        np.asarray(bkg, dtype=np.float32),
-        chunks=chunks,
-        compressor=blosc.Blosc(cname="zstd", clevel=1),
-    )
+    _save_local_zarr(str(cache_path), np.asarray(bkg, dtype=np.float32), chunks)
     return cache_path
 
 
@@ -329,7 +356,7 @@ def flatfield_reference(full_res: da.Array, flatfield_path: str) -> da.Array:
 
 def flatfield_basicpy(
     full_res: da.Array,
-    z: zarr.hierarchy.Group,
+    z: zarr.Group,
     is_binned_channel: bool,
     bkg: np.ndarray | None = None,
     mask_dir: str | None = None,
@@ -340,6 +367,7 @@ def flatfield_basicpy(
     shuffle_frames: bool = False,
     autotune: bool = False,
     results_dir: str | None = None,
+    io_backend: IOBackendName = "tensorstore",
 ) -> da.Array:
     """Apply BasicPy flatfield correction to the supplied volume.
 
@@ -347,7 +375,7 @@ def flatfield_basicpy(
     ----------
     full_res : dask.array.Array
         Full-resolution image volume to correct.
-    z : zarr.hierarchy.Group
+    z : zarr.Group
         Zarr hierarchy for the tile.
     is_binned_channel : bool
         ``True`` when processing the binned channel.
@@ -376,7 +404,9 @@ def flatfield_basicpy(
         Lazily evaluated corrected volume.
     """
     basicpy_res = "0" if is_binned_channel else "3"
-    low_res = da.from_zarr(z[basicpy_res]).squeeze().astype(np.float32)
+    low_res = read_zarr_array(
+        z, component=basicpy_res, io_backend=io_backend
+    ).squeeze().astype(np.float32)
     if bkg is not None:
         low_res = subtract_bkg(
             low_res,
@@ -444,18 +474,13 @@ def _preprocess_mask(
             chunks=chunks,
         ).compute()
     mask = mask.astype(np.uint8)
-    zarr.save_array(
-        str(mask_name),
-        mask,
-        chunks=chunks,
-        compressor=blosc.Blosc(cname="zstd", clevel=1),
-    )
+    _save_local_zarr(str(mask_name), mask, chunks)
     return da.from_zarr(mask_name)
 
 
 def _create_mask_artifacts(
     low_res: da.Array,
-    z: zarr.hierarchy.Group,
+    z: zarr.Group,
     fitting_res: str,
     mask_dir: str,
     tile_name: str,
@@ -464,6 +489,9 @@ def _create_mask_artifacts(
     bkg_slice_indices: np.ndarray,
     out_probability_path: str,
     overwrite: bool,
+    output_zarr_format: int = 2,
+    io_backend: IOBackendName = "tensorstore",
+    corrected_rank: int = -2,
 ) -> MaskArtifacts:
     """Generate mask artifacts and optional probability volumes for a tile.
 
@@ -471,7 +499,7 @@ def _create_mask_artifacts(
     ----------
     low_res : dask.array.Array
         Low-resolution stack used for mask inference.
-    z : zarr.hierarchy.Group
+    z : zarr.Group
         Zarr hierarchy that contains the tile data.
     fitting_res : str
         Resolution key within ``z`` from which the mask is derived.
@@ -554,11 +582,14 @@ def _create_mask_artifacts(
             tuple(probability_scale[-3:]),
             tuple(probability_translation),
             overwrite=overwrite,
+            zarr_format=output_zarr_format,
+            io_backend=io_backend,
+            reducer=partial(windowed_rank, rank=corrected_rank),
             write_empty_chunks=False,
         )
         # Do not materialize into memory until needed
-        probability_volume = da.from_zarr(
-            probability_path, component="0"
+        probability_volume = read_zarr_array(
+            probability_path, component="0", io_backend=io_backend
         ).squeeze()
 
     return MaskArtifacts(
@@ -569,7 +600,7 @@ def _create_mask_artifacts(
 
 def flatfield_fitting(
     full_res: da.Array,
-    z: zarr.hierarchy.Group,
+    z: zarr.Group,
     is_binned_channel: bool,
     mask_dir: str,
     tile_name: str,
@@ -583,6 +614,9 @@ def flatfield_fitting(
     bkg_slice_indices: np.ndarray,
     results_dir: str | None = None,
     mask_artifacts: MaskArtifacts | None = None,
+    output_zarr_format: int = 2,
+    io_backend: IOBackendName = "tensorstore",
+    corrected_rank: int = -2,
 ) -> tuple[da.Array, dict[str, np.ndarray], MaskArtifacts | None]:
     """Run the fitting-based flatfield workflow for a single tile.
 
@@ -590,7 +624,7 @@ def flatfield_fitting(
     ----------
     full_res : dask.array.Array
         Full-resolution volume to correct.
-    z : zarr.hierarchy.Group
+    z : zarr.Group
         Zarr hierarchy that stores the tile data.
     is_binned_channel : bool
         Indicates whether the tile corresponds to the binned channel.
@@ -627,7 +661,9 @@ def flatfield_fitting(
         ``axis_fits`` maps ``{"x", "y", "z"}`` to their correction curves.
     """
     fitting_res = "0" if is_binned_channel else "3"
-    low_res = da.from_zarr(z[fitting_res]).squeeze().astype(np.float32)
+    low_res = read_zarr_array(
+        z, component=fitting_res, io_backend=io_backend
+    ).squeeze().astype(np.float32)
 
     low_res = subtract_bkg(
         low_res,
@@ -649,6 +685,9 @@ def flatfield_fitting(
             bkg_slice_indices=bkg_slice_indices,
             out_probability_path=out_probability_path,
             overwrite=overwrite,
+            output_zarr_format=output_zarr_format,
+            io_backend=io_backend,
+            corrected_rank=corrected_rank,
         )
     else:
         _LOGGER.info(
@@ -679,10 +718,15 @@ def flatfield_fitting(
         coordinate_transformations["scale"][-3:],
         coordinate_transformations["translation"],
         overwrite=overwrite,
+        zarr_format=output_zarr_format,
+        io_backend=io_backend,
+        reducer=windowed_mode,
         write_empty_chunks=False,
     )
     # Re-read the computed mask back from S3 for performance
-    mask_upscaled = da.from_zarr(mask_path, component="0").squeeze()
+    mask_upscaled = read_zarr_array(
+        mask_path, component="0", io_backend=io_backend
+    ).squeeze()
 
     med_factor = (
         config.med_factor_binned
@@ -876,6 +920,7 @@ def process_tile(
     fitting_config: FittingConfig | None,
     median_summary: dict[str, float],
     mask_artifacts: MaskArtifacts | None,
+    output_format: int,
 ) -> MaskArtifacts | None:
     """Execute the flatfield pipeline for a single tile and persist outputs."""
 
@@ -895,7 +940,7 @@ def process_tile(
                 )
             _LOGGER.info(f"{tile_name} is binned: {is_binned_channel}")
 
-            z = zarr.open(tile_path, mode="r")
+            z = open_group(tile_path, mode="r")
             coordinate_transformations = parse_ome_zarr_transformations(
                 z, resolution
             )
@@ -903,12 +948,8 @@ def process_tile(
                 f"Coordinate transformations: {coordinate_transformations}"
             )
 
-            full_res = da.from_zarr(
-                z[resolution],
-                name=(
-                    f"input-{_safe_dask_name(tile_name)}-{resolution}-"
-                    f"{uuid.uuid4().hex}"
-                ),
+            full_res = read_zarr_array(
+                z, component=resolution, io_backend=args.io_backend
             ).squeeze().astype(np.float32)
             _LOGGER.info(f"Full resolution array shape: {full_res.shape}")
 
@@ -934,6 +975,7 @@ def process_tile(
                         args.background_final_smoothing_sigma
                     ),
                     target_resolution=resolution,
+                    io_backend=args.io_backend,
                 )
 
             axis_fits = None
@@ -951,6 +993,7 @@ def process_tile(
                         args.mask_dir,
                         tile_name,
                         results_dir=results_dir,
+                        io_backend=args.io_backend,
                     )
                 elif method == "fitting":
                     if fitting_config is None:
@@ -985,6 +1028,9 @@ def process_tile(
                         bkg=bkg,
                         bkg_slice_indices=bkg_slice_indices,
                         mask_artifacts=mask_artifacts,
+                        output_zarr_format=output_format,
+                        io_backend=args.io_backend,
+                        corrected_rank=args.corrected_rank,
                     )
                 else:
                     _LOGGER.error(f"Invalid method: {method}")
@@ -1004,6 +1050,9 @@ def process_tile(
                 coordinate_transformations["scale"][-3:],
                 coordinate_transformations["translation"],
                 overwrite=args.overwrite,
+                zarr_format=output_format,
+                io_backend=args.io_backend,
+                reducer=partial(windowed_rank, rank=args.corrected_rank),
                 write_empty_chunks=True,
             )
             _LOGGER.info(f"Storing OME-Zarr took {time.time() - t0:.2f}s")
@@ -1118,10 +1167,13 @@ def main() -> None:
     )
     _LOGGER.info(f"Dask client: {client}")
 
+    output_format = resolve_output_format(args)
+    _LOGGER.info("Output Zarr format: v%d", output_format)
+
     out_mask_path = create_zarr_artifact_path(args.output, "mask")
     out_probability_path = create_zarr_artifact_path(args.output, "probability")
-    initialize_zarr_group(out_mask_path)
-    initialize_zarr_group(out_probability_path)
+    ensure_group(out_mask_path, zarr_format=output_format)
+    ensure_group(out_probability_path, zarr_format=output_format)
 
     artifacts_destination = None
     tile_name_for_artifacts = (
@@ -1184,6 +1236,7 @@ def main() -> None:
             fitting_config=fitting_config,
             median_summary=median_summary,
             mask_artifacts=mask_artifacts,
+            output_format=output_format,
         )
 
     if artifacts_destination:

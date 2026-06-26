@@ -120,3 +120,39 @@ def test_pipeline_config_infers_binned_channel_when_marked_binned() -> None:
     config = PipelineConfig.model_validate(payload)
 
     assert config.binned_channel == "488"
+
+
+def test_pipeline_config_defaults_for_zarr_v3_fields() -> None:
+    config = PipelineConfig.model_validate(_sample_pipeline_config())
+
+    assert config.io_backend == "tensorstore"
+    assert config.output_zarr_format == "match"
+    assert config.corrected_rank == -2
+
+
+def test_pipeline_config_accepts_zarr_v3_field_overrides() -> None:
+    payload = _sample_pipeline_config()
+    payload["io_backend"] = "zarr"
+    payload["output_zarr_format"] = "3"
+    payload["corrected_rank"] = 0
+
+    config = PipelineConfig.model_validate(payload)
+
+    assert config.io_backend == "zarr"
+    assert config.output_zarr_format == "3"
+    assert config.corrected_rank == 0
+
+
+@pytest.mark.parametrize(
+    "field, value",
+    [
+        ("io_backend", "numpy"),
+        ("output_zarr_format", "5"),
+    ],
+)
+def test_pipeline_config_rejects_invalid_zarr_v3_fields(field, value) -> None:
+    payload = _sample_pipeline_config()
+    payload[field] = value
+
+    with pytest.raises(ValueError, match=field):
+        PipelineConfig.model_validate(payload)

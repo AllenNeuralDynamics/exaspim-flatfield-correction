@@ -29,8 +29,8 @@ def _transform(z_scale: float, z_translation: float = 0.0) -> dict:
     }
 
 
-def _write_multiscale_metadata(root: zarr.Group) -> None:
-    root.attrs["multiscales"] = [
+def _multiscale_block() -> list[dict]:
+    return [
         {
             "datasets": [
                 {
@@ -56,6 +56,29 @@ def _write_multiscale_metadata(root: zarr.Group) -> None:
             ]
         }
     ]
+
+
+def _write_multiscale_metadata(root: zarr.Group, zarr_format: int = 2) -> None:
+    """Write OME-NGFF multiscales in the layout matching the Zarr format.
+
+    Zarr v3 -> OME-NGFF 0.5 (nested under ``ome``); Zarr v2 -> 0.4 (top level).
+    """
+    block = _multiscale_block()
+    if zarr_format == 3:
+        root.attrs["ome"] = {"version": "0.5", "multiscales": block}
+    else:
+        root.attrs["multiscales"] = block
+
+
+def _create_array(
+    root: zarr.Group, name: str, data: np.ndarray, chunks: tuple[int, ...]
+) -> zarr.Array:
+    """Create a Zarr array (v2 or v3, per the group) and fill it with ``data``."""
+    arr = root.create_array(
+        name, shape=data.shape, dtype=data.dtype, chunks=chunks
+    )
+    arr[:] = data
+    return arr
 
 
 def _graph_contains_text(arr: da.Array, text: str) -> bool:
@@ -118,9 +141,12 @@ def test_estimate_bkg_from_mapped_slices_uses_target_planes() -> None:
     np.testing.assert_array_equal(bkg, np.median(data[[2, 3]], axis=0))
 
 
-def test_background_subtraction_uses_cached_background_zarr(tmp_path) -> None:
+@pytest.mark.parametrize("zarr_format", [2, 3])
+def test_background_subtraction_uses_cached_background_zarr(
+    tmp_path, zarr_format
+) -> None:
     store = zarr.storage.MemoryStore()
-    root = zarr.group(store=store)
+    root = zarr.group(store=store, zarr_format=zarr_format)
 
     full_res_data = np.asarray(
         [
@@ -138,11 +164,13 @@ def test_background_subtraction_uses_cached_background_zarr(tmp_path) -> None:
         dtype=np.float32,
     )
 
-    root.create_dataset("0", data=full_res_data, chunks=(1, 2, 2))
-    root.create_dataset("3", data=low_res_data, chunks=(1, 2, 2))
-    _write_multiscale_metadata(root)
+    _create_array(root, "0", full_res_data, (1, 2, 2))
+    _create_array(root, "3", low_res_data, (1, 2, 2))
+    _write_multiscale_metadata(root, zarr_format)
 
     full_res = da.from_zarr(root["0"]).astype(np.float32)
+    # MemoryStore is only reachable via the zarr backend (TensorStore opens by
+    # URI/kvstore, not an in-memory zarr-python store).
     corrected, bkg, bkg_slice_indices, cache_path = background_subtraction(
         "synthetic_tile.zarr",
         full_res,
@@ -153,6 +181,7 @@ def test_background_subtraction_uses_cached_background_zarr(tmp_path) -> None:
         background_smoothing_sigma=0,
         background_final_smoothing_sigma=0,
         target_resolution="0",
+        io_backend="zarr",
     )
 
     expected_bkg = np.full((2, 2), 40, dtype=np.float32)
@@ -170,12 +199,14 @@ def test_background_subtraction_uses_cached_background_zarr(tmp_path) -> None:
     assert not cache_path.exists()
 
 
+@pytest.mark.parametrize("zarr_format", [2, 3])
 def test_background_subtraction_blurs_final_cached_background_with_dask(
     tmp_path,
     monkeypatch: pytest.MonkeyPatch,
+    zarr_format,
 ) -> None:
     store = zarr.storage.MemoryStore()
-    root = zarr.group(store=store)
+    root = zarr.group(store=store, zarr_format=zarr_format)
 
     raw_bkg = np.zeros((11, 11), dtype=np.float32)
     raw_bkg[5, 5] = 90
@@ -194,9 +225,9 @@ def test_background_subtraction_blurs_final_cached_background_with_dask(
         dtype=np.float32,
     )
 
-    root.create_dataset("0", data=full_res_data, chunks=(1, 11, 11))
-    root.create_dataset("3", data=low_res_data, chunks=(1, 11, 11))
-    _write_multiscale_metadata(root)
+    _create_array(root, "0", full_res_data, (1, 11, 11))
+    _create_array(root, "3", low_res_data, (1, 11, 11))
+    _write_multiscale_metadata(root, zarr_format)
 
     calls = []
     original_gaussian_filter = pipeline_module.gaussian_filter_dask
@@ -222,6 +253,7 @@ def test_background_subtraction_blurs_final_cached_background_with_dask(
         background_smoothing_sigma=0,
         background_final_smoothing_sigma=1,
         target_resolution="0",
+        io_backend="zarr",
     )
 
     expected_bkg = gaussian_filter_np(raw_bkg, sigma=1).astype(np.float32)
