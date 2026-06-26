@@ -16,11 +16,60 @@ from pydantic import (
     model_validator,
 )
 
+from zarr_io.config import IOConcurrencyConfig as _ZarrIOConcurrencyConfig
+
 from exaspim_flatfield_correction.utils.utils import (
     extract_channel_from_tile_name,
 )
 
 _LOGGER = logging.getLogger(__name__)
+
+
+class IOConcurrencyConfig(BaseModel):
+    """Per-worker concurrency limits for the Zarr/TensorStore I/O backends.
+
+    Each field maps 1:1 to ``zarr_io.config.IOConcurrencyConfig``. Limits apply
+    per Dask worker process, so the effective cluster-wide concurrency is roughly
+    ``num_workers`` times these values. Set a field to ``null`` to fall back to the
+    backend library's built-in default for that limit.
+    """
+
+    model_config = ConfigDict(extra="forbid", validate_assignment=True)
+
+    zarr_async_concurrency: int | None = Field(
+        default=4,
+        ge=1,
+        description="Zarr async I/O concurrency limit (zarr backend).",
+    )
+    zarr_threading_max_workers: int | None = Field(
+        default=4,
+        ge=1,
+        description="Zarr internal thread-pool worker limit (zarr backend).",
+    )
+    tensorstore_data_copy_concurrency: int | None = Field(
+        default=4,
+        ge=1,
+        description="TensorStore data-copy concurrency limit (tensorstore backend).",
+    )
+    tensorstore_file_io_concurrency: int | None = Field(
+        default=4,
+        ge=1,
+        description="TensorStore file I/O concurrency limit (tensorstore backend).",
+    )
+    tensorstore_s3_request_concurrency: int | None = Field(
+        default=4,
+        ge=1,
+        description="TensorStore S3 request concurrency limit (tensorstore backend).",
+    )
+    tensorstore_http_request_concurrency: int | None = Field(
+        default=4,
+        ge=1,
+        description="TensorStore HTTP request concurrency limit (tensorstore backend).",
+    )
+
+    def to_io_concurrency(self) -> _ZarrIOConcurrencyConfig:
+        """Convert to the ``zarr_io`` dataclass consumed by the I/O backends."""
+        return _ZarrIOConcurrencyConfig(**self.model_dump())
 
 
 class PipelineConfig(BaseModel):
@@ -101,6 +150,13 @@ class PipelineConfig(BaseModel):
             "Backend used for Zarr reads/writes. 'tensorstore' is faster on S3; "
             "'zarr' uses zarr-python. Sparse mask/probability writes "
             "(write_empty_chunks=False) always use the zarr backend."
+        ),
+    )
+    io_concurrency: IOConcurrencyConfig = Field(
+        default_factory=IOConcurrencyConfig,
+        description=(
+            "Per-worker concurrency limits applied to the I/O backend for reads "
+            "and writes (see IOConcurrencyConfig)."
         ),
     )
     output_zarr_format: Literal["match", "2", "3"] = Field(

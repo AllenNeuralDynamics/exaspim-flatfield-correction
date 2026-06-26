@@ -66,6 +66,11 @@ from exaspim_flatfield_correction.utils.zarr_utils import (
 from exaspim_flatfield_correction.utils.dask_utils import create_dask_client
 from xarray_multiscale.reducers import windowed_mode, windowed_rank
 from zarr_io.arrays import open_group, read_zarr_array
+from zarr_io.backends import (
+    ArrayIOBackend,
+    configure_io_backend_on_dask_workers,
+    io_backend_from_name,
+)
 from zarr_io.config import IOBackendName
 
 
@@ -128,7 +133,7 @@ def background_subtraction(
     background_smoothing_sigma: float = 1.0,
     background_final_smoothing_sigma: float = 0.0,
     target_resolution: str = "0",
-    io_backend: IOBackendName = "tensorstore",
+    io_backend: IOBackendName | ArrayIOBackend = "tensorstore",
 ) -> tuple[da.Array, np.ndarray, np.ndarray | None, Path | None]:
     """Remove background estimates from the full-resolution volume.
 
@@ -367,7 +372,7 @@ def flatfield_basicpy(
     shuffle_frames: bool = False,
     autotune: bool = False,
     results_dir: str | None = None,
-    io_backend: IOBackendName = "tensorstore",
+    io_backend: IOBackendName | ArrayIOBackend = "tensorstore",
 ) -> da.Array:
     """Apply BasicPy flatfield correction to the supplied volume.
 
@@ -490,7 +495,7 @@ def _create_mask_artifacts(
     out_probability_path: str,
     overwrite: bool,
     output_zarr_format: int = 2,
-    io_backend: IOBackendName = "tensorstore",
+    io_backend: IOBackendName | ArrayIOBackend = "tensorstore",
     corrected_rank: int = -2,
 ) -> MaskArtifacts:
     """Generate mask artifacts and optional probability volumes for a tile.
@@ -615,7 +620,7 @@ def flatfield_fitting(
     results_dir: str | None = None,
     mask_artifacts: MaskArtifacts | None = None,
     output_zarr_format: int = 2,
-    io_backend: IOBackendName = "tensorstore",
+    io_backend: IOBackendName | ArrayIOBackend = "tensorstore",
     corrected_rank: int = -2,
 ) -> tuple[da.Array, dict[str, np.ndarray], MaskArtifacts | None]:
     """Run the fitting-based flatfield workflow for a single tile.
@@ -926,6 +931,12 @@ def process_tile(
 
     tile_name = Path(tile_path).name
     _LOGGER.info(f"Processing tile: {tile_name}")
+    # Build the I/O backend once with the configured concurrency limits baked in.
+    # Threading the backend object (rather than the backend name) makes both reads
+    # and writes honor IOConcurrencyConfig, including across pickled Dask tasks.
+    io_backend = io_backend_from_name(
+        args.io_backend, args.io_concurrency.to_io_concurrency()
+    )
     report_path = os.path.join(results_dir, f"dask-report_{tile_name}.html")
     background_cache_path: Path | None = None
 
@@ -949,7 +960,7 @@ def process_tile(
             )
 
             full_res = read_zarr_array(
-                z, component=resolution, io_backend=args.io_backend
+                z, component=resolution, io_backend=io_backend
             ).squeeze().astype(np.float32)
             _LOGGER.info(f"Full resolution array shape: {full_res.shape}")
 
@@ -975,7 +986,7 @@ def process_tile(
                         args.background_final_smoothing_sigma
                     ),
                     target_resolution=resolution,
-                    io_backend=args.io_backend,
+                    io_backend=io_backend,
                 )
 
             axis_fits = None
@@ -993,7 +1004,7 @@ def process_tile(
                         args.mask_dir,
                         tile_name,
                         results_dir=results_dir,
-                        io_backend=args.io_backend,
+                        io_backend=io_backend,
                     )
                 elif method == "fitting":
                     if fitting_config is None:
@@ -1029,7 +1040,7 @@ def process_tile(
                         bkg_slice_indices=bkg_slice_indices,
                         mask_artifacts=mask_artifacts,
                         output_zarr_format=output_format,
-                        io_backend=args.io_backend,
+                        io_backend=io_backend,
                         corrected_rank=args.corrected_rank,
                     )
                 else:
@@ -1051,7 +1062,7 @@ def process_tile(
                 coordinate_transformations["translation"],
                 overwrite=args.overwrite,
                 zarr_format=output_format,
-                io_backend=args.io_backend,
+                io_backend=io_backend,
                 reducer=partial(windowed_rank, rank=args.corrected_rank),
                 write_empty_chunks=True,
             )
@@ -1166,6 +1177,14 @@ def main() -> None:
         worker_mode=args.worker_mode,
     )
     _LOGGER.info(f"Dask client: {client}")
+
+    # Propagate Zarr concurrency limits to every worker process. This is a no-op
+    # for the tensorstore backend (whose limits travel with the pickled backend
+    # object) but is required for the zarr backend, whose zarr.config must be set
+    # on the workers themselves rather than only in the client process.
+    configure_io_backend_on_dask_workers(
+        client, args.io_backend, args.io_concurrency.to_io_concurrency()
+    )
 
     output_format = resolve_output_format(args)
     _LOGGER.info("Output Zarr format: v%d", output_format)
