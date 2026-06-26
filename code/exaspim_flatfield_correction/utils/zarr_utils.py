@@ -12,6 +12,7 @@ from typing import Any, Callable
 import dask.array as da
 import numpy as np
 import zarr
+from zarr.errors import ContainsGroupError
 
 from xarray_multiscale import multiscale as _xarray_multiscale
 from xarray_multiscale.reducers import windowed_rank
