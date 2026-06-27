@@ -195,6 +195,11 @@ def store_ome_zarr(
     }
     if zarr_format == 2:
         spec_kwargs["compressor"] = codec
+        # zarr-python defaults v2 arrays to the "." dimension separator; force
+        # "/" so chunks are nested (matching the AIND OME-Zarr convention and
+        # the pre-refactor output). The pyramid writer inherits this from the
+        # level-0 array via ArraySpec.from_zarr.
+        spec_kwargs["dimension_separator"] = "/"
     else:
         spec_kwargs["compressors"] = (codec,)
         spec_kwargs["shards"] = level0_shards
