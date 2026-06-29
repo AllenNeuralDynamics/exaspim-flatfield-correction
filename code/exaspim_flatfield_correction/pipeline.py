@@ -3,8 +3,10 @@ import json
 import logging
 import os
 import shutil
+import sys
 import time
 import uuid
+from contextlib import contextmanager
 from dataclasses import dataclass
 from datetime import datetime
 from functools import partial
@@ -79,6 +81,37 @@ logging.basicConfig(
     datefmt="%d-%b-%y %H:%M:%S",
 )
 _LOGGER = logging.getLogger(__name__)
+
+
+@contextmanager
+def safe_performance_report(filename: str):
+    """Wrap dask's ``performance_report`` so a report-rendering failure never
+    aborts a completed run.
+
+    The performance report is pure diagnostics, but it is generated in the
+    context manager's ``__exit__`` -- i.e. *after* all tile work has finished.
+    bokeh/distributed version skew (e.g. bokeh>=3.9 renaming ``file.html`` to
+    ``file.html.jinja``, which distributed 2024.11.2 still extends) raises a
+    ``TemplateNotFound`` there, which would otherwise discard hours of finished
+    work. Any error writing the report is logged and swallowed; genuine errors
+    from the wrapped body still propagate.
+    """
+    report = performance_report(filename=filename)
+    report.__enter__()
+    exc_info = (None, None, None)
+    try:
+        yield
+    except BaseException:
+        exc_info = sys.exc_info()
+        raise
+    finally:
+        try:
+            report.__exit__(*exc_info)
+        except Exception as report_exc:  # noqa: BLE001
+            _LOGGER.warning(
+                f"Failed to write dask performance report to {filename}: "
+                f"{report_exc}"
+            )
 
 
 @dataclass
@@ -945,7 +978,7 @@ def process_tile(
     report_path = os.path.join(results_dir, f"dask-report_{tile_name}.html")
     background_cache_path: Path | None = None
 
-    with performance_report(filename=report_path):
+    with safe_performance_report(filename=report_path):
         try:
             if args.is_binned:
                 is_binned_channel = True
