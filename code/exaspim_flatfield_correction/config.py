@@ -186,6 +186,17 @@ class PipelineConfig(BaseModel):
             "multiple of the array's inner chunk. Set to null to disable sharding."
         ),
     )
+    probability_shard_size: tuple[int, int, int] | None = Field(
+        default=(512, 512, 512),
+        description=(
+            "ZYX shard shape for the always-v3 probability volume. Kept smaller than "
+            "mask_shard_size because the probability volume is float32 and, for binned "
+            "channels, full-resolution: each write task materializes a full shard "
+            "(~shard_volume x 4 bytes of RAM), so 1024^3 (~4 GiB) overflows the ~8 GB "
+            "per-worker budget in processes mode. The shard is snapped to a whole "
+            "multiple of the inner chunk. Set to null to disable sharding."
+        ),
+    )
     corrected_shard_size: tuple[int, int, int] | None = Field(
         default=(512, 512, 512),
         description=(

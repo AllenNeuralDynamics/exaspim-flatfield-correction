@@ -531,7 +531,7 @@ def _create_mask_artifacts(
     io_backend: IOBackendName | ArrayIOBackend = "tensorstore",
     corrected_rank: int = -2,
     max_chunks_per_block: int | None = 16384,
-    mask_shards: OutputShards = "none",
+    probability_shards: OutputShards = "none",
 ) -> MaskArtifacts:
     """Generate mask artifacts and optional probability volumes for a tile.
 
@@ -629,7 +629,7 @@ def _create_mask_artifacts(
             reducer=partial(windowed_rank, rank=corrected_rank),
             write_empty_chunks=False,
             max_chunks_per_block=max_chunks_per_block,
-            output_shards=mask_shards,
+            output_shards=probability_shards,
         )
         # Do not materialize into memory until needed
         probability_volume = read_zarr_array(
@@ -663,6 +663,7 @@ def flatfield_fitting(
     corrected_rank: int = -2,
     max_chunks_per_block: int | None = 16384,
     mask_shards: OutputShards = "none",
+    probability_shards: OutputShards = "none",
 ) -> tuple[da.Array, dict[str, np.ndarray], MaskArtifacts | None]:
     """Run the fitting-based flatfield workflow for a single tile.
 
@@ -735,7 +736,7 @@ def flatfield_fitting(
             io_backend=io_backend,
             corrected_rank=corrected_rank,
             max_chunks_per_block=max_chunks_per_block,
-            mask_shards=mask_shards,
+            probability_shards=probability_shards,
         )
     else:
         _LOGGER.info(
@@ -983,6 +984,14 @@ def process_tile(
     mask_shards: OutputShards = (
         (1, 1, *args.mask_shard_size) if args.mask_shard_size else "none"
     )
+    # The probability volume is float32 (and full-res for binned channels), so it
+    # gets its own, smaller shard than the uint8 mask to keep each write task
+    # within the per-worker memory budget. Always v3, so no format guard.
+    probability_shards: OutputShards = (
+        (1, 1, *args.probability_shard_size)
+        if args.probability_shard_size
+        else "none"
+    )
     # Shard layout for the dense corrected output. Sharding is Zarr v3 only, so
     # only apply a shard tuple when the output format is v3; for v2 a shard tuple
     # would be rejected by the array spec / pyramid writer.
@@ -1104,6 +1113,7 @@ def process_tile(
                         corrected_rank=args.corrected_rank,
                         max_chunks_per_block=args.max_chunks_per_block,
                         mask_shards=mask_shards,
+                        probability_shards=probability_shards,
                     )
                 else:
                     _LOGGER.error(f"Invalid method: {method}")
