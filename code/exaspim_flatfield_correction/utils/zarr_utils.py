@@ -85,6 +85,7 @@ def store_ome_zarr(
     io_concurrency: IOConcurrencyConfig | None = None,
     reducer: Callable[..., Any] = DEFAULT_REDUCER,
     write_empty_chunks: bool = True,
+    max_chunks_per_block: int | None = 16384,
     scale_factors: tuple[int, ...] | None = None,
     chunks: tuple[int, ...] | None = None,
     output_shards: OutputShards = "none",
@@ -125,6 +126,11 @@ def store_ome_zarr(
         data, ``windowed_mode`` for label/mask data).
     write_empty_chunks : bool
         When False, chunks equal to the fill value are not written (sparse output).
+    max_chunks_per_block : int or None
+        Maximum chunks per ``dask.compute`` for the level-0 write. Large arrays
+        are written in chunk-aligned slabs of at most this many chunks so the
+        scheduler isn't overwhelmed by one giant graph. ``None`` writes in a
+        single compute (zarr_io's legacy behavior).
     scale_factors : tuple of int, optional
         Per-axis (TCZYX) downsampling factors. Defaults to (1, 1, 2, 2, 2). A
         3-tuple (ZYX) is front-padded with (1, 1).
@@ -207,7 +213,18 @@ def store_ome_zarr(
     spec0 = ArraySpec.from_dask(data, **spec_kwargs)
 
     _LOGGER.info("Writing level 0 to %s (zarr v%d, %s)", output_zarr, zarr_format, backend.name)
-    write_dask_array(data, target, "0", spec=spec0, io_backend=backend, overwrite=True)
+    # Slab the (potentially massive) level-0 write so the scheduler isn't handed a
+    # single million-task graph. Pyramid levels are downsampled and far smaller;
+    # write_multiscale_pyramid relies on zarr_io's own default budget for those.
+    write_dask_array(
+        data,
+        target,
+        "0",
+        spec=spec0,
+        io_backend=backend,
+        overwrite=True,
+        max_chunks_per_block=max_chunks_per_block,
+    )
 
     # Generate pyramid levels 1..levels-1 (clamped to what the shape supports).
     levels = _max_levels(data, scale_factors, reducer, n_levels)
@@ -231,6 +248,7 @@ def store_ome_zarr(
             ome_metadata=False,
             include_level_zero=True,
             write_empty_chunks=write_empty_chunks,
+            max_chunks_per_block=max_chunks_per_block,
         )
 
     # Write OME-NGFF metadata, preserving voxel_size/origin from the input tile.

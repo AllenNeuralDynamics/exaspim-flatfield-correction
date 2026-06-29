@@ -497,6 +497,7 @@ def _create_mask_artifacts(
     output_zarr_format: int = 2,
     io_backend: IOBackendName | ArrayIOBackend = "tensorstore",
     corrected_rank: int = -2,
+    max_chunks_per_block: int | None = 16384,
 ) -> MaskArtifacts:
     """Generate mask artifacts and optional probability volumes for a tile.
 
@@ -591,6 +592,7 @@ def _create_mask_artifacts(
             io_backend=io_backend,
             reducer=partial(windowed_rank, rank=corrected_rank),
             write_empty_chunks=False,
+            max_chunks_per_block=max_chunks_per_block,
         )
         # Do not materialize into memory until needed
         probability_volume = read_zarr_array(
@@ -622,6 +624,7 @@ def flatfield_fitting(
     output_zarr_format: int = 2,
     io_backend: IOBackendName | ArrayIOBackend = "tensorstore",
     corrected_rank: int = -2,
+    max_chunks_per_block: int | None = 16384,
 ) -> tuple[da.Array, dict[str, np.ndarray], MaskArtifacts | None]:
     """Run the fitting-based flatfield workflow for a single tile.
 
@@ -693,6 +696,7 @@ def flatfield_fitting(
             output_zarr_format=output_zarr_format,
             io_backend=io_backend,
             corrected_rank=corrected_rank,
+            max_chunks_per_block=max_chunks_per_block,
         )
     else:
         _LOGGER.info(
@@ -727,6 +731,7 @@ def flatfield_fitting(
         io_backend=io_backend,
         reducer=windowed_mode,
         write_empty_chunks=False,
+        max_chunks_per_block=max_chunks_per_block,
     )
     # Re-read the computed mask back from S3 for performance
     mask_upscaled = read_zarr_array(
@@ -1042,6 +1047,7 @@ def process_tile(
                         output_zarr_format=output_format,
                         io_backend=io_backend,
                         corrected_rank=args.corrected_rank,
+                        max_chunks_per_block=args.max_chunks_per_block,
                     )
                 else:
                     _LOGGER.error(f"Invalid method: {method}")
@@ -1065,6 +1071,7 @@ def process_tile(
                 io_backend=io_backend,
                 reducer=partial(windowed_rank, rank=args.corrected_rank),
                 write_empty_chunks=True,
+                max_chunks_per_block=args.max_chunks_per_block,
             )
             _LOGGER.info(f"Storing OME-Zarr took {time.time() - t0:.2f}s")
 

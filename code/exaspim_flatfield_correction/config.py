@@ -159,6 +159,17 @@ class PipelineConfig(BaseModel):
             "and writes (see IOConcurrencyConfig)."
         ),
     )
+    max_chunks_per_block: int = Field(
+        default=32768,
+        ge=1,
+        description=(
+            "Maximum chunks written per dask.compute when storing arrays. Large "
+            "arrays (e.g. the full-resolution mask and corrected output) are "
+            "written in chunk-aligned slabs of at most this many chunks so the "
+            "Dask scheduler isn't overwhelmed materializing one giant task graph. "
+            "Forwarded to zarr_io.write_dask_array via store_ome_zarr."
+        ),
+    )
     output_zarr_format: Literal["match", "2", "3"] = Field(
         default="match",
         description=(
