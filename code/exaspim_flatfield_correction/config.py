@@ -47,22 +47,22 @@ class IOConcurrencyConfig(BaseModel):
         description="Zarr internal thread-pool worker limit (zarr backend).",
     )
     tensorstore_data_copy_concurrency: int | None = Field(
-        default=4,
+        default=8,
         ge=1,
         description="TensorStore data-copy concurrency limit (tensorstore backend).",
     )
     tensorstore_file_io_concurrency: int | None = Field(
-        default=4,
+        default=8,
         ge=1,
         description="TensorStore file I/O concurrency limit (tensorstore backend).",
     )
     tensorstore_s3_request_concurrency: int | None = Field(
-        default=4,
+        default=8,
         ge=1,
         description="TensorStore S3 request concurrency limit (tensorstore backend).",
     )
     tensorstore_http_request_concurrency: int | None = Field(
-        default=4,
+        default=8,
         ge=1,
         description="TensorStore HTTP request concurrency limit (tensorstore backend).",
     )
