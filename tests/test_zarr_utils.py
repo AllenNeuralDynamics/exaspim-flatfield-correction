@@ -163,6 +163,118 @@ def test_store_ome_zarr_tensorstore_skips_empty_chunks(tmp_path, zarr_format) ->
     )
 
 
+def test_store_ome_zarr_v3_sharding(tmp_path) -> None:
+    """A tuple ``output_shards`` packs inner chunks into shards (Zarr v3)."""
+    raw = np.arange(8 * 16 * 16, dtype=np.uint8).reshape(8, 16, 16)
+    data = da.from_array(raw, chunks=(8, 16, 16))
+    out = str(tmp_path / "sharded.zarr")
+
+    store_ome_zarr(
+        data,
+        out,
+        n_levels=2,
+        overwrite=True,
+        zarr_format=3,
+        io_backend="zarr",
+        chunks=(1, 1, 4, 4, 4),
+        output_shards=(1, 1, 8, 8, 8),
+    )
+
+    level0 = open_group(out, mode="r")["0"]
+    chunks = tuple(int(c) for c in level0.chunks)
+    shards = tuple(int(s) for s in level0.shards)
+    assert chunks == (1, 1, 4, 4, 4)
+    assert shards == (1, 1, 8, 8, 8)
+    # Zarr v3 invariant: the shard is a whole multiple of the inner chunk.
+    assert all(s % c == 0 for s, c in zip(shards, chunks))
+
+    group = open_group(out, mode="r")
+    back = read_zarr_array(group, component="0", io_backend="zarr").squeeze().compute()
+    np.testing.assert_array_equal(back.astype(np.uint8), raw)
+
+
+def test_store_ome_zarr_v3_sharding_dense_tensorstore(tmp_path) -> None:
+    """Dense output shards correctly via the tensorstore backend (Zarr v3).
+
+    Covers the corrected-output path: write_empty_chunks=True (dense), the default
+    tensorstore backend, and an explicit shard tuple.
+    """
+    pytest.importorskip("tensorstore")
+    raw = np.arange(8 * 16 * 16, dtype=np.uint16).reshape(8, 16, 16)
+    data = da.from_array(raw, chunks=(4, 8, 8))
+    out = str(tmp_path / "sharded_dense_ts.zarr")
+
+    store_ome_zarr(
+        data,
+        out,
+        n_levels=2,
+        overwrite=True,
+        zarr_format=3,
+        io_backend="tensorstore",
+        write_empty_chunks=True,
+        chunks=(1, 1, 4, 8, 8),
+        output_shards=(1, 1, 8, 16, 16),
+    )
+
+    level0 = open_group(out, mode="r")["0"]
+    chunks = tuple(int(c) for c in level0.chunks)
+    shards = tuple(int(s) for s in level0.shards)
+    assert chunks == (1, 1, 4, 8, 8)
+    assert shards == (1, 1, 8, 16, 16)
+    assert all(s % c == 0 for s, c in zip(shards, chunks))
+
+    group = open_group(out, mode="r")
+    back = read_zarr_array(group, component="0", io_backend="zarr").squeeze().compute()
+    np.testing.assert_array_equal(back.astype(np.uint16), raw)
+
+
+def test_store_ome_zarr_shard_snaps_to_chunk_multiple(tmp_path) -> None:
+    """A shard that is not a clean multiple of the chunk is snapped to one."""
+    raw = np.zeros((20, 20, 20), dtype=np.uint8)
+    data = da.from_array(raw, chunks=(20, 20, 20))
+    out = str(tmp_path / "snap.zarr")
+
+    store_ome_zarr(
+        data,
+        out,
+        n_levels=1,
+        overwrite=True,
+        zarr_format=3,
+        io_backend="zarr",
+        chunks=(1, 1, 5, 5, 5),
+        # 16 is not a multiple of 5 -> round(16/5)=3 -> 15.
+        output_shards=(1, 1, 16, 16, 16),
+    )
+
+    level0 = open_group(out, mode="r")["0"]
+    assert tuple(int(s) for s in level0.shards) == (1, 1, 15, 15, 15)
+
+
+def test_store_ome_zarr_shard_larger_than_shape(tmp_path) -> None:
+    """A shard larger than the array shape is accepted (single partial shard)."""
+    raw = (np.arange(4 * 4 * 4) % 2).astype(np.uint8).reshape(4, 4, 4)
+    data = da.from_array(raw, chunks=(4, 4, 4))
+    out = str(tmp_path / "big_shard.zarr")
+
+    store_ome_zarr(
+        data,
+        out,
+        n_levels=1,
+        overwrite=True,
+        zarr_format=3,
+        io_backend="zarr",
+        chunks=(1, 1, 4, 4, 4),
+        output_shards=(1, 1, 1024, 1024, 1024),
+    )
+
+    level0 = open_group(out, mode="r")["0"]
+    # Snapped to a multiple of the (shape-clamped) chunk, still >> the shape.
+    assert tuple(int(s) for s in level0.shards) == (1, 1, 1024, 1024, 1024)
+    group = open_group(out, mode="r")
+    back = read_zarr_array(group, component="0", io_backend="zarr").squeeze().compute()
+    np.testing.assert_array_equal(back.astype(np.uint8), raw)
+
+
 def test_store_ome_zarr_clamps_levels(tmp_path) -> None:
     data = da.from_array(np.ones((4, 4, 4), dtype=np.uint16), chunks=(4, 4, 4))
     out = str(tmp_path / "tiny.zarr")

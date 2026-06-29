@@ -169,6 +169,22 @@ def store_ome_zarr(
         max(1, min(int(c), int(s))) for c, s in zip(chunks, data.shape)
     )
 
+    # Normalize an explicit shard request (Zarr v3). A 3-tuple is ZYX and is
+    # front-padded to TCZYX. Zarr v3 requires the shard shape to be a whole
+    # multiple of the inner chunk along every axis, and neither zarr-io nor
+    # zarr-multiscale enforces that, so snap each axis to the nearest chunk
+    # multiple (at least one chunk). The same shard is applied to every pyramid
+    # level; a shard larger than a level's shape is fine (one partial shard).
+    if zarr_format == 3 and isinstance(output_shards, tuple):
+        if len(output_shards) == 3:
+            output_shards = (1, 1, *output_shards)
+        if len(output_shards) != 5:
+            raise ValueError("output_shards must describe all five TCZYX axes")
+        output_shards = tuple(
+            max(c, max(1, round(s / c)) * c)
+            for s, c in zip(output_shards, chunks)
+        )
+
     backend = io_backend_from_name(io_backend, io_concurrency)
 
     if codec is None:

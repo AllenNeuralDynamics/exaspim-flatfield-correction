@@ -73,7 +73,7 @@ from zarr_io.backends import (
     configure_io_backend_on_dask_workers,
     io_backend_from_name,
 )
-from zarr_io.config import IOBackendName
+from zarr_io.config import IOBackendName, OutputShards
 
 
 logging.basicConfig(
@@ -531,6 +531,7 @@ def _create_mask_artifacts(
     io_backend: IOBackendName | ArrayIOBackend = "tensorstore",
     corrected_rank: int = -2,
     max_chunks_per_block: int | None = 16384,
+    mask_shards: OutputShards = "none",
 ) -> MaskArtifacts:
     """Generate mask artifacts and optional probability volumes for a tile.
 
@@ -621,11 +622,14 @@ def _create_mask_artifacts(
             tuple(probability_scale[-3:]),
             tuple(probability_translation),
             overwrite=overwrite,
-            zarr_format=output_zarr_format,
+            # Always Zarr v3 so the sparse, highly-compressed probability volume
+            # can be sharded (many tiny chunks -> one shard object on S3).
+            zarr_format=3,
             io_backend=io_backend,
             reducer=partial(windowed_rank, rank=corrected_rank),
             write_empty_chunks=False,
             max_chunks_per_block=max_chunks_per_block,
+            output_shards=mask_shards,
         )
         # Do not materialize into memory until needed
         probability_volume = read_zarr_array(
@@ -658,6 +662,7 @@ def flatfield_fitting(
     io_backend: IOBackendName | ArrayIOBackend = "tensorstore",
     corrected_rank: int = -2,
     max_chunks_per_block: int | None = 16384,
+    mask_shards: OutputShards = "none",
 ) -> tuple[da.Array, dict[str, np.ndarray], MaskArtifacts | None]:
     """Run the fitting-based flatfield workflow for a single tile.
 
@@ -730,6 +735,7 @@ def flatfield_fitting(
             io_backend=io_backend,
             corrected_rank=corrected_rank,
             max_chunks_per_block=max_chunks_per_block,
+            mask_shards=mask_shards,
         )
     else:
         _LOGGER.info(
@@ -760,11 +766,14 @@ def flatfield_fitting(
         coordinate_transformations["scale"][-3:],
         coordinate_transformations["translation"],
         overwrite=overwrite,
-        zarr_format=output_zarr_format,
+        # Always Zarr v3 so the sparse, highly-compressed upscaled mask can be
+        # sharded (many tiny chunks -> one shard object on S3).
+        zarr_format=3,
         io_backend=io_backend,
         reducer=windowed_mode,
         write_empty_chunks=False,
         max_chunks_per_block=max_chunks_per_block,
+        output_shards=mask_shards,
     )
     # Re-read the computed mask back from S3 for performance
     mask_upscaled = read_zarr_array(
@@ -969,6 +978,19 @@ def process_tile(
 
     tile_name = Path(tile_path).name
     _LOGGER.info(f"Processing tile: {tile_name}")
+    # Shard layout (TCZYX) for the always-v3 sparse mask/probability writes;
+    # "none" disables sharding. mask_shard_size is ZYX, front-padded with (1, 1).
+    mask_shards: OutputShards = (
+        (1, 1, *args.mask_shard_size) if args.mask_shard_size else "none"
+    )
+    # Shard layout for the dense corrected output. Sharding is Zarr v3 only, so
+    # only apply a shard tuple when the output format is v3; for v2 a shard tuple
+    # would be rejected by the array spec / pyramid writer.
+    corrected_shards: OutputShards = (
+        (1, 1, *args.corrected_shard_size)
+        if (args.corrected_shard_size and output_format == 3)
+        else "none"
+    )
     # Build the I/O backend once with the configured concurrency limits baked in.
     # Threading the backend object (rather than the backend name) makes both reads
     # and writes honor IOConcurrencyConfig, including across pickled Dask tasks.
@@ -1081,6 +1103,7 @@ def process_tile(
                         io_backend=io_backend,
                         corrected_rank=args.corrected_rank,
                         max_chunks_per_block=args.max_chunks_per_block,
+                        mask_shards=mask_shards,
                     )
                 else:
                     _LOGGER.error(f"Invalid method: {method}")
@@ -1105,6 +1128,7 @@ def process_tile(
                 reducer=partial(windowed_rank, rank=args.corrected_rank),
                 write_empty_chunks=True,
                 max_chunks_per_block=args.max_chunks_per_block,
+                output_shards=corrected_shards,
             )
             _LOGGER.info(f"Storing OME-Zarr took {time.time() - t0:.2f}s")
 
@@ -1231,8 +1255,11 @@ def main() -> None:
 
     out_mask_path = create_zarr_artifact_path(args.output, "mask")
     out_probability_path = create_zarr_artifact_path(args.output, "probability")
-    ensure_group(out_mask_path, zarr_format=output_format)
-    ensure_group(out_probability_path, zarr_format=output_format)
+    # The sparse mask/probability arrays are always written as Zarr v3 (so they
+    # can be sharded), so their parent groups must be v3 too, regardless of the
+    # corrected output's format.
+    ensure_group(out_mask_path, zarr_format=3)
+    ensure_group(out_probability_path, zarr_format=3)
 
     artifacts_destination = None
     tile_name_for_artifacts = (

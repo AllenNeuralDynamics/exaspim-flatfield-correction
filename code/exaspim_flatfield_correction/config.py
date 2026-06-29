@@ -177,6 +177,26 @@ class PipelineConfig(BaseModel):
             "the input tile's format (v2 or v3); '2' or '3' force a format."
         ),
     )
+    mask_shard_size: tuple[int, int, int] | None = Field(
+        default=(1024, 1024, 1024),
+        description=(
+            "ZYX shard shape for the sparse mask and probability volumes, which are "
+            "always written as Zarr v3 so many tiny compressed chunks pack into one "
+            "shard object (fewer S3 objects). The shard is snapped up/down to a whole "
+            "multiple of the array's inner chunk. Set to null to disable sharding."
+        ),
+    )
+    corrected_shard_size: tuple[int, int, int] | None = Field(
+        default=(512, 512, 512),
+        description=(
+            "ZYX shard shape for the dense corrected output, applied only when the "
+            "output is Zarr v3 (output_zarr_format=3); ignored for v2. Sharding packs "
+            "many inner chunks into one shard object (fewer S3 objects). Note: each "
+            "write task materializes a full shard (~shard_volume x 2 bytes of RAM), so "
+            "keep this modest relative to worker memory. The shard is snapped to a whole "
+            "multiple of the tile's inner chunk. Set to null to disable sharding."
+        ),
+    )
     corrected_rank: int = Field(
         default=-2,
         description=(
