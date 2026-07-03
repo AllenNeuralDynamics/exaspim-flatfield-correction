@@ -652,7 +652,6 @@ def flatfield_fitting(
     out_probability_path: str,
     coordinate_transformations: dict[str, Any],
     overwrite: bool,
-    n_levels: int,
     config: FittingConfig,
     bkg: np.ndarray,
     bkg_slice_indices: np.ndarray,
@@ -687,8 +686,6 @@ def flatfield_fitting(
         Transformation metadata copied into the OME-NGFF output.
     overwrite : bool
         Whether existing OME-Zarr outputs may be replaced.
-    n_levels : int
-        Number of pyramid levels to generate for outputs.
     config : FittingConfig
         Configuration controlling fitting behaviour and thresholds.
     bkg : numpy.ndarray
@@ -760,10 +757,16 @@ def flatfield_fitting(
         )
 
     mask_path = out_mask_path.rstrip("/") + f"/{tile_name}"
+    # Write only the channel's full-resolution mask as a single OME-Zarr level
+    # (no multiscale pyramid). The fitting mask is upscaled to full resolution for
+    # the unbinned channel and used as-is for the binned channel (which is natively
+    # ~8x downsampled, so its level 0 already matches the unbinned level 3). This
+    # single-level, full-resolution mask is the only array downstream consumes, so
+    # generating the pyramid would be wasted work.
     store_ome_zarr(
         mask_upscaled.astype(np.uint8),
         mask_path,
-        n_levels,
+        1,
         coordinate_transformations["scale"][-3:],
         coordinate_transformations["translation"],
         overwrite=overwrite,
@@ -1102,7 +1105,6 @@ def process_tile(
                         out_probability_path,
                         coordinate_transformations,
                         args.overwrite,
-                        args.n_levels,
                         fitting_config,
                         results_dir=results_dir,
                         bkg=bkg,
