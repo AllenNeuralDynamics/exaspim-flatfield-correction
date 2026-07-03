@@ -627,7 +627,7 @@ def _create_mask_artifacts(
             zarr_format=3,
             io_backend=io_backend,
             reducer=partial(windowed_rank, rank=corrected_rank),
-            write_empty_chunks=False,
+            write_empty_chunks=True,
             max_chunks_per_block=max_chunks_per_block,
             output_shards=probability_shards,
         )
@@ -772,7 +772,7 @@ def flatfield_fitting(
         zarr_format=3,
         io_backend=io_backend,
         reducer=windowed_mode,
-        write_empty_chunks=False,
+        write_empty_chunks=True,
         max_chunks_per_block=max_chunks_per_block,
         output_shards=mask_shards,
     )
