@@ -137,13 +137,20 @@ def store_ome_zarr(
     chunks : tuple of int, optional
         Level-0 chunk shape (TCZYX). Defaults to the source array's own chunking
         (``data.chunksize``).
-    output_shards : "inherit" | "none" | tuple
-        Shard layout for written levels (Zarr v3 only); "none" disables sharding.
+    output_shards : "inherit" | "none" | None | tuple
+        Shard layout for written levels (Zarr v3 only); "none" (or None)
+        disables sharding.
     codec : optional
         Compressor. Defaults to zstd Blosc appropriate to ``zarr_format``.
     """
     if zarr_format not in (2, 3):
         raise ValueError(f"Unsupported Zarr format: {zarr_format}")
+
+    # Accept None as an alias for "none": zarr_io's parse_output_shards only
+    # understands the string sentinels ("inherit"/"none") or a shard tuple, and
+    # chokes on None inside write_multiscale_pyramid.
+    if output_shards is None:
+        output_shards = "none"
 
     if scale_factors is None:
         scale_factors = DEFAULT_SCALE_FACTORS
