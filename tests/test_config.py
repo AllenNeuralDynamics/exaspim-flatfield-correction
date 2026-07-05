@@ -163,12 +163,12 @@ def test_io_concurrency_defaults_to_four_on_every_knob() -> None:
     config = PipelineConfig.model_validate(_sample_pipeline_config())
 
     io = config.io_concurrency
-    assert io.zarr_async_concurrency == 4
-    assert io.zarr_threading_max_workers == 4
-    assert io.tensorstore_data_copy_concurrency == 4
-    assert io.tensorstore_file_io_concurrency == 4
-    assert io.tensorstore_s3_request_concurrency == 4
-    assert io.tensorstore_http_request_concurrency == 4
+    assert io.zarr_async_concurrency == 8
+    assert io.zarr_threading_max_workers == 8
+    assert io.tensorstore_data_copy_concurrency == 8
+    assert io.tensorstore_file_io_concurrency == 8
+    assert io.tensorstore_s3_request_concurrency == 8
+    assert io.tensorstore_http_request_concurrency == 8
 
 
 def test_io_concurrency_converts_to_zarr_io_dataclass() -> None:
@@ -176,14 +176,14 @@ def test_io_concurrency_converts_to_zarr_io_dataclass() -> None:
 
     # All six knobs populated -> both backend spec builders are fully configured.
     assert converted.zarr_config() == {
-        "async.concurrency": 4,
-        "threading.max_workers": 4,
+        "async.concurrency": 8,
+        "threading.max_workers": 8,
     }
     assert converted.tensorstore_context_spec() == {
-        "data_copy_concurrency": {"limit": 4},
-        "file_io_concurrency": {"limit": 4},
-        "s3_request_concurrency": {"limit": 4},
-        "http_request_concurrency": {"limit": 4},
+        "data_copy_concurrency": {"limit": 8},
+        "file_io_concurrency": {"limit": 8},
+        "s3_request_concurrency": {"limit": 8},
+        "http_request_concurrency": {"limit": 8},
     }
 
 
@@ -200,7 +200,7 @@ def test_io_concurrency_accepts_overrides_and_null() -> None:
     # null -> fall back to the backend library default for that single limit.
     assert config.io_concurrency.zarr_async_concurrency is None
     assert config.io_concurrency.to_io_concurrency().zarr_config() == {
-        "threading.max_workers": 4,
+        "threading.max_workers": 8,
     }
 
 

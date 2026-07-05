@@ -37,12 +37,12 @@ class IOConcurrencyConfig(BaseModel):
     model_config = ConfigDict(extra="forbid", validate_assignment=True)
 
     zarr_async_concurrency: int | None = Field(
-        default=4,
+        default=8,
         ge=1,
         description="Zarr async I/O concurrency limit (zarr backend).",
     )
     zarr_threading_max_workers: int | None = Field(
-        default=4,
+        default=8,
         ge=1,
         description="Zarr internal thread-pool worker limit (zarr backend).",
     )
