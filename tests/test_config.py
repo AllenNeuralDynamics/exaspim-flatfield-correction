@@ -5,6 +5,7 @@ import json
 import pytest
 
 from exaspim_flatfield_correction.config import (
+    IOConcurrencyConfig,
     PipelineConfig,
     load_pipeline_config,
 )
@@ -120,3 +121,96 @@ def test_pipeline_config_infers_binned_channel_when_marked_binned() -> None:
     config = PipelineConfig.model_validate(payload)
 
     assert config.binned_channel == "488"
+
+
+def test_pipeline_config_defaults_for_zarr_v3_fields() -> None:
+    config = PipelineConfig.model_validate(_sample_pipeline_config())
+
+    assert config.io_backend == "tensorstore"
+    assert config.output_zarr_format == "match"
+    assert config.corrected_rank == -2
+
+
+def test_pipeline_config_accepts_zarr_v3_field_overrides() -> None:
+    payload = _sample_pipeline_config()
+    payload["io_backend"] = "zarr"
+    payload["output_zarr_format"] = "3"
+    payload["corrected_rank"] = 0
+
+    config = PipelineConfig.model_validate(payload)
+
+    assert config.io_backend == "zarr"
+    assert config.output_zarr_format == "3"
+    assert config.corrected_rank == 0
+
+
+@pytest.mark.parametrize(
+    "field, value",
+    [
+        ("io_backend", "numpy"),
+        ("output_zarr_format", "5"),
+    ],
+)
+def test_pipeline_config_rejects_invalid_zarr_v3_fields(field, value) -> None:
+    payload = _sample_pipeline_config()
+    payload[field] = value
+
+    with pytest.raises(ValueError, match=field):
+        PipelineConfig.model_validate(payload)
+
+
+def test_io_concurrency_defaults_to_four_on_every_knob() -> None:
+    config = PipelineConfig.model_validate(_sample_pipeline_config())
+
+    io = config.io_concurrency
+    assert io.zarr_async_concurrency == 8
+    assert io.zarr_threading_max_workers == 8
+    assert io.tensorstore_data_copy_concurrency == 8
+    assert io.tensorstore_file_io_concurrency == 8
+    assert io.tensorstore_s3_request_concurrency == 8
+    assert io.tensorstore_http_request_concurrency == 8
+
+
+def test_io_concurrency_converts_to_zarr_io_dataclass() -> None:
+    converted = IOConcurrencyConfig().to_io_concurrency()
+
+    # All six knobs populated -> both backend spec builders are fully configured.
+    assert converted.zarr_config() == {
+        "async.concurrency": 8,
+        "threading.max_workers": 8,
+    }
+    assert converted.tensorstore_context_spec() == {
+        "data_copy_concurrency": {"limit": 8},
+        "file_io_concurrency": {"limit": 8},
+        "s3_request_concurrency": {"limit": 8},
+        "http_request_concurrency": {"limit": 8},
+    }
+
+
+def test_io_concurrency_accepts_overrides_and_null() -> None:
+    payload = _sample_pipeline_config()
+    payload["io_concurrency"] = {
+        "tensorstore_s3_request_concurrency": 32,
+        "zarr_async_concurrency": None,
+    }
+
+    config = PipelineConfig.model_validate(payload)
+
+    assert config.io_concurrency.tensorstore_s3_request_concurrency == 32
+    # null -> fall back to the backend library default for that single limit.
+    assert config.io_concurrency.zarr_async_concurrency is None
+    assert config.io_concurrency.to_io_concurrency().zarr_config() == {
+        "threading.max_workers": 8,
+    }
+
+
+def test_io_concurrency_rejects_unknown_and_nonpositive_knobs() -> None:
+    bad_key = _sample_pipeline_config()
+    bad_key["io_concurrency"] = {"bogus_knob": 4}
+    with pytest.raises(ValueError, match="bogus_knob"):
+        PipelineConfig.model_validate(bad_key)
+
+    bad_value = _sample_pipeline_config()
+    bad_value["io_concurrency"] = {"tensorstore_file_io_concurrency": 0}
+    with pytest.raises(ValueError, match="tensorstore_file_io_concurrency"):
+        PipelineConfig.model_validate(bad_value)

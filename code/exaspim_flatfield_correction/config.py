@@ -16,11 +16,60 @@ from pydantic import (
     model_validator,
 )
 
+from zarr_io.config import IOConcurrencyConfig as _ZarrIOConcurrencyConfig
+
 from exaspim_flatfield_correction.utils.utils import (
     extract_channel_from_tile_name,
 )
 
 _LOGGER = logging.getLogger(__name__)
+
+
+class IOConcurrencyConfig(BaseModel):
+    """Per-worker concurrency limits for the Zarr/TensorStore I/O backends.
+
+    Each field maps 1:1 to ``zarr_io.config.IOConcurrencyConfig``. Limits apply
+    per Dask worker process, so the effective cluster-wide concurrency is roughly
+    ``num_workers`` times these values. Set a field to ``null`` to fall back to the
+    backend library's built-in default for that limit.
+    """
+
+    model_config = ConfigDict(extra="forbid", validate_assignment=True)
+
+    zarr_async_concurrency: int | None = Field(
+        default=8,
+        ge=1,
+        description="Zarr async I/O concurrency limit (zarr backend).",
+    )
+    zarr_threading_max_workers: int | None = Field(
+        default=8,
+        ge=1,
+        description="Zarr internal thread-pool worker limit (zarr backend).",
+    )
+    tensorstore_data_copy_concurrency: int | None = Field(
+        default=8,
+        ge=1,
+        description="TensorStore data-copy concurrency limit (tensorstore backend).",
+    )
+    tensorstore_file_io_concurrency: int | None = Field(
+        default=8,
+        ge=1,
+        description="TensorStore file I/O concurrency limit (tensorstore backend).",
+    )
+    tensorstore_s3_request_concurrency: int | None = Field(
+        default=8,
+        ge=1,
+        description="TensorStore S3 request concurrency limit (tensorstore backend).",
+    )
+    tensorstore_http_request_concurrency: int | None = Field(
+        default=8,
+        ge=1,
+        description="TensorStore HTTP request concurrency limit (tensorstore backend).",
+    )
+
+    def to_io_concurrency(self) -> _ZarrIOConcurrencyConfig:
+        """Convert to the ``zarr_io`` dataclass consumed by the I/O backends."""
+        return _ZarrIOConcurrencyConfig(**self.model_dump())
 
 
 class PipelineConfig(BaseModel):
@@ -94,6 +143,77 @@ class PipelineConfig(BaseModel):
         default=1,
         ge=1,
         description="Number of OME-Zarr pyramid levels to write.",
+    )
+    io_backend: Literal["tensorstore", "zarr"] = Field(
+        default="tensorstore",
+        description=(
+            "Backend used for Zarr reads/writes. 'tensorstore' is faster on S3; "
+            "'zarr' uses zarr-python. Sparse mask/probability writes "
+            "(write_empty_chunks=False) always use the zarr backend."
+        ),
+    )
+    io_concurrency: IOConcurrencyConfig = Field(
+        default_factory=IOConcurrencyConfig,
+        description=(
+            "Per-worker concurrency limits applied to the I/O backend for reads "
+            "and writes (see IOConcurrencyConfig)."
+        ),
+    )
+    max_chunks_per_block: int = Field(
+        default=32768,
+        ge=1,
+        description=(
+            "Maximum chunks written per dask.compute when storing arrays. Large "
+            "arrays (e.g. the full-resolution mask and corrected output) are "
+            "written in chunk-aligned slabs of at most this many chunks so the "
+            "Dask scheduler isn't overwhelmed materializing one giant task graph. "
+            "Forwarded to zarr_io.write_dask_array via store_ome_zarr."
+        ),
+    )
+    output_zarr_format: Literal["match", "2", "3"] = Field(
+        default="match",
+        description=(
+            "Zarr format for corrected/mask/probability outputs. 'match' uses "
+            "the input tile's format (v2 or v3); '2' or '3' force a format."
+        ),
+    )
+    mask_shard_size: tuple[int, int, int] | None = Field(
+        default=(1024, 1024, 1024),
+        description=(
+            "ZYX shard shape for the sparse mask and probability volumes, which are "
+            "always written as Zarr v3 so many tiny compressed chunks pack into one "
+            "shard object (fewer S3 objects). The shard is snapped up/down to a whole "
+            "multiple of the array's inner chunk. Set to null to disable sharding."
+        ),
+    )
+    probability_shard_size: tuple[int, int, int] | None = Field(
+        default=(512, 512, 512),
+        description=(
+            "ZYX shard shape for the always-v3 probability volume. Kept smaller than "
+            "mask_shard_size because the probability volume is float32 and, for binned "
+            "channels, full-resolution: each write task materializes a full shard "
+            "(~shard_volume x 4 bytes of RAM), so 1024^3 (~4 GiB) overflows the ~8 GB "
+            "per-worker budget in processes mode. The shard is snapped to a whole "
+            "multiple of the inner chunk. Set to null to disable sharding."
+        ),
+    )
+    corrected_shard_size: tuple[int, int, int] | None = Field(
+        default=(512, 512, 512),
+        description=(
+            "ZYX shard shape for the dense corrected output, applied only when the "
+            "output is Zarr v3 (output_zarr_format=3); ignored for v2. Sharding packs "
+            "many inner chunks into one shard object (fewer S3 objects). Note: each "
+            "write task materializes a full shard (~shard_volume x 2 bytes of RAM), so "
+            "keep this modest relative to worker memory. The shard is snapped to a whole "
+            "multiple of the tile's inner chunk. Set to null to disable sharding."
+        ),
+    )
+    corrected_rank: int = Field(
+        default=-2,
+        description=(
+            "Rank passed to windowed_rank when downsampling the corrected and "
+            "probability volumes (-2 is the second brightest voxel); masks use windowed_mode."
+        ),
     )
     use_reference_bkg: bool = Field(
         default=False,
