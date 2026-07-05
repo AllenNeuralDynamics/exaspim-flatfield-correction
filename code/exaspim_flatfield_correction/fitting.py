@@ -94,6 +94,12 @@ def generate_axis_fit(
     return fitted
 
 
+def _is_noop_limits(limits: "tuple[float, float] | None") -> bool:
+    """Limits of (1.0, 1.0) clamp the fitted curve to all-ones, making the
+    correction a no-op."""
+    return limits is not None and limits[0] == 1.0 and limits[1] == 1.0
+
+
 def compute_axis_fits(
     volume: "np.ndarray | da.Array",
     mask: "np.ndarray | da.Array",
@@ -127,7 +133,9 @@ def compute_axis_fits(
         Smoothing factor applied when resampling the correction profiles.
     limits_x, limits_y, limits_z : tuple of float or None, default=None
         Optional clamp bounds applied to the resampled profiles along each
-        axis.
+        axis. Limits of ``(1.0, 1.0)`` disable the correction for that axis:
+        its profile and fit are skipped entirely and the axis is omitted
+        from the returned mapping.
     weights : numpy.ndarray or None, optional
         Optional weighting array used for percentile calculations.
 
@@ -142,6 +150,19 @@ def compute_axis_fits(
         ("y", 1, full_shape[1], limits_y),
         ("z", 0, full_shape[0], limits_z),
     )
+
+    for axis_label, _, _, limits in axis_specs:
+        if _is_noop_limits(limits):
+            _LOGGER.info(
+                "Skipping correction for axis %s: limits %s clamp the fit to 1.0",
+                axis_label,
+                limits,
+            )
+    axis_specs = tuple(
+        spec for spec in axis_specs if not _is_noop_limits(spec[3])
+    )
+    if not axis_specs:
+        return {}
 
     axis_indices = [axis_idx for _, axis_idx, _, _ in axis_specs]
     profiles = masked_axis_profile(
