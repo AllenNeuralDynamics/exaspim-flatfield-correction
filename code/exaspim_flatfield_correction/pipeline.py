@@ -1401,8 +1401,16 @@ def main() -> None:
                 output_format=output_format,
             )
     finally:
-        # Remove local scratch caches (the shared fitting mask plus any
-        # strays) so they are not uploaded with the artifacts below.
+        # dask-temp is also the cluster's temporary-directory (worker scratch
+        # and spill space, see create_dask_client), so shut the workers down
+        # before deleting it; otherwise live workers lose their spill files
+        # and can recreate the directory in time for the artifact upload
+        # below. Removing the tree drops the local scratch caches (the shared
+        # fitting mask plus any strays) so they are not uploaded.
+        try:
+            client.shutdown()
+        except Exception:
+            _LOGGER.exception("Failed to shut down Dask client")
         shutil.rmtree(
             Path(results_dir) / "dask-temp", ignore_errors=True
         )
