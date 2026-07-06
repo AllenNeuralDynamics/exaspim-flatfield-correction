@@ -354,6 +354,38 @@ def cleanup_background_cache(cache_path: Path | None) -> None:
         shutil.rmtree(cache_path, ignore_errors=True)
 
 
+def _fitting_cache_dir(results_dir: str) -> Path:
+    """Local scratch directory for fitting-stage array caches."""
+
+    return Path(results_dir) / "dask-temp" / "fitting-cache"
+
+
+def _low_res_cache_path(results_dir: str, tile_name: str) -> Path:
+    """Cache location for a tile's background-subtracted fitting volume."""
+
+    return (
+        _fitting_cache_dir(results_dir)
+        / f"{_safe_dask_name(tile_name)}_low_res.zarr"
+    )
+
+
+def _cache_dask_array(
+    arr: da.Array, cache_path: Path, *, name: str
+) -> da.Array:
+    """Stream a dask array to a local Zarr cache and reopen it lazily.
+
+    Stands in for ``persist()`` so downstream ``compute()`` calls re-read the
+    array from local disk instead of recomputing its source graph, without
+    pinning the volume in worker memory.
+    """
+
+    if cache_path.exists():
+        shutil.rmtree(cache_path)
+    cache_path.parent.mkdir(parents=True, exist_ok=True)
+    da.to_zarr(arr, str(cache_path), overwrite=True)
+    return da.from_zarr(str(cache_path), name=name)
+
+
 def flatfield_reference(full_res: da.Array, flatfield_path: str) -> da.Array:
     """Apply reference flatfield correction using a precomputed image.
 
@@ -582,7 +614,18 @@ def _create_mask_artifacts(
         tile_name,
         chunks=mask_chunks,
     ).astype(bool)
+    # Cache the combined mask on local disk: it is reused across tiles and
+    # evaluated by both the global percentile and the axis profiles, so the
+    # lazy ``low_res != 0`` term would otherwise re-evaluate the tile volume
+    # on every use, while persist() would pin it in worker memory. main()
+    # removes the cache after all tiles are processed.
     initial_mask = initial_mask & (low_res != 0)
+    initial_mask = _cache_dask_array(
+        initial_mask,
+        _fitting_cache_dir(results_dir)
+        / f"{_safe_dask_name(tile_name)}_mask.zarr",
+        name=f"mask-cache-{_safe_dask_name(tile_name)}-{uuid.uuid4().hex}",
+    )
 
     probability_volume: da.Array | None = None
     if config.enable_gmm_refinement:
@@ -716,6 +759,20 @@ def flatfield_fitting(
             chunks=low_res.chunksize[1:],
         ),
     )
+    # Cache the fitting-resolution volume on local disk and read it back. It
+    # feeds several independent compute() calls below (mask artifacts, global
+    # percentile, profile smoothing), each of which would otherwise re-read
+    # the tile from storage and re-subtract the background. A disk cache
+    # (rather than persist()) keeps worker memory free for the mask upscaling
+    # stage; process_tile removes it once the tile is finished.
+    if results_dir is not None:
+        low_res = _cache_dask_array(
+            low_res,
+            _low_res_cache_path(results_dir, tile_name),
+            name=(
+                f"lowres-cache-{_safe_dask_name(tile_name)}-{uuid.uuid4().hex}"
+            ),
+        )
 
     if mask_artifacts is None:
         mask_artifacts = _create_mask_artifacts(
@@ -1167,6 +1224,12 @@ def process_tile(
             raise
         finally:
             cleanup_background_cache(background_cache_path)
+            # Remove this tile's fitting-volume cache; the shared mask cache
+            # lives until all tiles are processed (removed in main()).
+            shutil.rmtree(
+                _low_res_cache_path(results_dir, tile_name),
+                ignore_errors=True,
+            )
 
     return mask_artifacts
 
@@ -1318,23 +1381,30 @@ def main() -> None:
                 ", ".join(sorted(median_summary)),
             )
 
-    for tile_path in args.tile_paths:
-        mask_artifacts = process_tile(
-            tile_path,
-            args=args,
-            method=args.method,
-            res=args.res,
-            binned_channel=args.binned_channel,
-            binned_res=binned_res,
-            results_dir=results_dir,
-            out_path=args.output,
-            out_mask_path=out_mask_path,
-            out_probability_path=out_probability_path,
-            data_process=data_process,
-            fitting_config=fitting_config,
-            median_summary=median_summary,
-            mask_artifacts=mask_artifacts,
-            output_format=output_format,
+    try:
+        for tile_path in args.tile_paths:
+            mask_artifacts = process_tile(
+                tile_path,
+                args=args,
+                method=args.method,
+                res=args.res,
+                binned_channel=args.binned_channel,
+                binned_res=binned_res,
+                results_dir=results_dir,
+                out_path=args.output,
+                out_mask_path=out_mask_path,
+                out_probability_path=out_probability_path,
+                data_process=data_process,
+                fitting_config=fitting_config,
+                median_summary=median_summary,
+                mask_artifacts=mask_artifacts,
+                output_format=output_format,
+            )
+    finally:
+        # Remove local scratch caches (the shared fitting mask plus any
+        # strays) so they are not uploaded with the artifacts below.
+        shutil.rmtree(
+            Path(results_dir) / "dask-temp", ignore_errors=True
         )
 
     if artifacts_destination:
