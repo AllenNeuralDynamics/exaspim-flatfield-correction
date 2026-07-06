@@ -226,27 +226,6 @@ def apply_axis_corrections(
     """
     corrected = full_res
     if global_med != 0 and np.isfinite(global_med):
-        fit_x = axis_fits.get("x")
-        if fit_x is not None:
-            correction_x = fit_x.reshape(1, 1, -1)
-            corrected = da.where(
-                mask_upscaled, corrected / correction_x, corrected
-            )
-
-        fit_y = axis_fits.get("y")
-        if fit_y is not None:
-            correction_y = fit_y.reshape(1, -1, 1)
-            corrected = da.where(
-                mask_upscaled, corrected / correction_y, corrected
-            )
-
-        fit_z = axis_fits.get("z")
-        if fit_z is not None:
-            correction_z = fit_z.reshape(-1, 1, 1)
-            corrected = da.where(
-                mask_upscaled, corrected / correction_z, corrected
-            )
-
         ratio = global_factor / global_med
         if ratio_limits is not None:
             clamped_ratio = float(
@@ -266,7 +245,24 @@ def apply_axis_corrections(
             global_med,
             ratio,
         )
-        corrected = da.where(mask_upscaled, corrected * ratio, corrected)
+
+        # Fold the per-axis curves and the global ratio into a single scaled
+        # volume applied with one da.where, instead of one masked division per
+        # axis plus a masked ratio multiply (each a full-volume pass). The
+        # reciprocal of each tiny 1D curve is taken up front (in float32 so the
+        # full-resolution graph is never promoted to float64) to trade the
+        # broadcast divisions for multiplications.
+        axis_reshapes = (("x", (1, 1, -1)), ("y", (1, -1, 1)), ("z", (-1, 1, 1)))
+        scaled = corrected
+        for axis_label, reshape in axis_reshapes:
+            fit = axis_fits.get(axis_label)
+            if fit is not None:
+                inv_fit = np.reciprocal(np.asarray(fit, dtype=np.float32))
+                scaled = scaled * inv_fit.reshape(reshape)
+        if ratio != 1.0:
+            scaled = scaled * ratio
+        if scaled is not corrected:
+            corrected = da.where(mask_upscaled, scaled, corrected)
         corrected = da.clip(corrected, 0, clip_max)
     else:
         _LOGGER.warning(
