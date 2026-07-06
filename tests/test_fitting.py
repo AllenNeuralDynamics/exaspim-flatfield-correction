@@ -116,6 +116,71 @@ def test_compute_axis_fits_keeps_constant_non_unit_limits() -> None:
     np.testing.assert_array_equal(fits["x"], np.full(24, 0.5, np.float32))
 
 
+def test_compute_axis_fits_returns_float32_curves() -> None:
+    """Curves must be float32 so they never promote the volume to float64."""
+    volume, mask = _synthetic_volume_and_mask()
+
+    fits = compute_axis_fits(volume, mask, full_shape=(16, 20, 24))
+
+    assert set(fits) == {"x", "y", "z"}
+    for fit in fits.values():
+        assert fit.dtype == np.float32
+
+
+def test_apply_axis_corrections_stays_float32_with_float64_fits() -> None:
+    """Even float64 curves must not promote the corrected volume."""
+    shape = (8, 10, 12)
+    full_res = da.ones(shape, dtype=np.float32, chunks=shape)
+    mask = da.from_array(np.ones(shape, dtype=bool), chunks=shape)
+    fits = {
+        "x": np.linspace(0.8, 1.2, shape[2]),  # float64
+        "y": np.linspace(0.9, 1.1, shape[1]),  # float64
+    }
+
+    corrected = apply_axis_corrections(
+        full_res, mask, fits, global_factor=500.0, global_med=400.0
+    )
+
+    assert corrected.dtype == np.float32
+    assert corrected.compute().dtype == np.float32
+
+
+def test_apply_axis_corrections_values_and_mask_respected() -> None:
+    """Masked voxels get full * ratio / (fx*fy*fz); unmasked stay untouched."""
+    rng = np.random.default_rng(3)
+    shape = (6, 8, 10)
+    data = (rng.random(shape) * 1000).astype(np.float32)
+    mask_np = np.zeros(shape, dtype=bool)
+    mask_np[:, :4, :] = True
+    full_res = da.from_array(data, chunks=shape)
+    mask = da.from_array(mask_np, chunks=shape)
+    fit_x = np.linspace(0.8, 1.2, shape[2]).astype(np.float32)
+    fit_y = np.linspace(0.9, 1.1, shape[1]).astype(np.float32)
+    fit_z = np.linspace(0.7, 1.3, shape[0]).astype(np.float32)
+    global_factor, global_med = 500.0, 400.0
+
+    corrected = apply_axis_corrections(
+        full_res,
+        mask,
+        {"x": fit_x, "y": fit_y, "z": fit_z},
+        global_factor=global_factor,
+        global_med=global_med,
+    ).compute()
+
+    ratio = global_factor / global_med
+    expected = (
+        data
+        * ratio
+        / fit_z.reshape(-1, 1, 1)
+        / fit_y.reshape(1, -1, 1)
+        / fit_x.reshape(1, 1, -1)
+    )
+    expected = np.where(mask_np, expected, data)
+    expected = np.clip(expected, 0, 2**16 - 1)
+    np.testing.assert_allclose(corrected, expected, rtol=1e-5)
+    np.testing.assert_array_equal(corrected[~mask_np], data[~mask_np])
+
+
 def test_apply_axis_corrections_omitted_axis_matches_all_ones_fit() -> None:
     """Omitting an axis from axis_fits is equivalent to an all-ones fit."""
     rng = np.random.default_rng(7)
