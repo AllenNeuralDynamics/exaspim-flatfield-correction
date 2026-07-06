@@ -91,7 +91,9 @@ def generate_axis_fit(
     fitted = rescale_spline(x, profile_np, new_width, smoothing=smoothing)
     if limits is not None:
         fitted = np.clip(fitted, limits[0], limits[1])
-    return fitted
+    # splev returns float64; cast so dividing the float32 volume by the curve
+    # does not promote the whole full-resolution graph to float64.
+    return np.asarray(fitted, dtype=np.float32)
 
 
 def _is_noop_limits(limits: "tuple[float, float] | None") -> bool:
