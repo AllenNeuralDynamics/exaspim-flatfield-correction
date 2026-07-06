@@ -552,7 +552,7 @@ def _create_mask_artifacts(
     low_res: da.Array,
     z: zarr.Group,
     fitting_res: str,
-    mask_dir: str,
+    initial_mask: np.ndarray,
     tile_name: str,
     results_dir: str,
     config: FittingConfig,
@@ -575,8 +575,9 @@ def _create_mask_artifacts(
         Zarr hierarchy that contains the tile data.
     fitting_res : str
         Resolution key within ``z`` from which the mask is derived.
-    mask_dir : str
-        Directory containing raw mask files.
+    initial_mask : numpy.ndarray
+        Raw tile mask loaded from disk (see
+        :func:`~exaspim_flatfield_correction.utils.utils.load_mask_from_dir`).
     tile_name : str
         Identifier of the tile driving mask generation.
     results_dir : str
@@ -599,11 +600,6 @@ def _create_mask_artifacts(
     """
     _LOGGER.info("Creating mask artifacts using tile %s", tile_name)
     mask_chunks = array_chunks(low_res)
-    try:
-        initial_mask = load_mask_from_dir(mask_dir, tile_name)
-    except FileNotFoundError as e:
-        _LOGGER.warning(f"Mask does not exist for tile {tile_name}. Skipping correction.")
-        return None
     initial_mask = _preprocess_mask(
         binary_fill_holes(
             size_filter(
@@ -759,6 +755,19 @@ def flatfield_fitting(
             chunks=low_res.chunksize[1:],
         ),
     )
+    initial_mask: np.ndarray | None = None
+    if mask_artifacts is None:
+        # Load the tile mask before the cache write below: a tile without a
+        # mask skips correction entirely and must not pay the full-volume
+        # compute and disk write the cache costs.
+        try:
+            initial_mask = load_mask_from_dir(mask_dir, tile_name)
+        except FileNotFoundError:
+            _LOGGER.warning(
+                f"Mask does not exist for tile {tile_name}. Skipping correction."
+            )
+            return full_res, None, None
+
     # Cache the fitting-resolution volume on local disk and read it back. It
     # feeds several independent compute() calls below (mask artifacts, global
     # percentile, profile smoothing), each of which would otherwise re-read
@@ -779,7 +788,7 @@ def flatfield_fitting(
             low_res=low_res,
             z=z,
             fitting_res=fitting_res,
-            mask_dir=mask_dir,
+            initial_mask=initial_mask,
             tile_name=tile_name,
             results_dir=results_dir,
             config=config,
