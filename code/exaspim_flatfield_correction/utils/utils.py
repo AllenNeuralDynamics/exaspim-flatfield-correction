@@ -579,10 +579,13 @@ def weighted_percentile(
     else:
         hist_weights = mask.astype(np.float32)
 
-    data_min = int(data.min().compute())
-    data_max = int(data.max().compute())
+    # Compute both extrema in one pass; separate .compute() calls would each
+    # re-execute the full upstream graph (storage read, background subtraction).
+    data_min, data_max = da.compute(data.min(), data.max())
     if not np.isfinite(data_min) or not np.isfinite(data_max):
         raise ValueError("Encountered non-finite values while computing percentile range.")
+    data_min = int(data_min)
+    data_max = int(data_max)
     if data_min == data_max:
         return float(data_min)
 
