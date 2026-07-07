@@ -91,7 +91,15 @@ def generate_axis_fit(
     fitted = rescale_spline(x, profile_np, new_width, smoothing=smoothing)
     if limits is not None:
         fitted = np.clip(fitted, limits[0], limits[1])
-    return fitted
+    # splev returns float64; cast so dividing the float32 volume by the curve
+    # does not promote the whole full-resolution graph to float64.
+    return np.asarray(fitted, dtype=np.float32)
+
+
+def _is_noop_limits(limits: "tuple[float, float] | None") -> bool:
+    """Limits of (1.0, 1.0) clamp the fitted curve to all-ones, making the
+    correction a no-op."""
+    return limits is not None and limits[0] == 1.0 and limits[1] == 1.0
 
 
 def compute_axis_fits(
@@ -127,7 +135,9 @@ def compute_axis_fits(
         Smoothing factor applied when resampling the correction profiles.
     limits_x, limits_y, limits_z : tuple of float or None, default=None
         Optional clamp bounds applied to the resampled profiles along each
-        axis.
+        axis. Limits of ``(1.0, 1.0)`` disable the correction for that axis:
+        its profile and fit are skipped entirely and the axis is omitted
+        from the returned mapping.
     weights : numpy.ndarray or None, optional
         Optional weighting array used for percentile calculations.
 
@@ -142,6 +152,19 @@ def compute_axis_fits(
         ("y", 1, full_shape[1], limits_y),
         ("z", 0, full_shape[0], limits_z),
     )
+
+    for axis_label, _, _, limits in axis_specs:
+        if _is_noop_limits(limits):
+            _LOGGER.info(
+                "Skipping correction for axis %s: limits %s clamp the fit to 1.0",
+                axis_label,
+                limits,
+            )
+    axis_specs = tuple(
+        spec for spec in axis_specs if not _is_noop_limits(spec[3])
+    )
+    if not axis_specs:
+        return {}
 
     axis_indices = [axis_idx for _, axis_idx, _, _ in axis_specs]
     profiles = masked_axis_profile(
@@ -203,27 +226,6 @@ def apply_axis_corrections(
     """
     corrected = full_res
     if global_med != 0 and np.isfinite(global_med):
-        fit_x = axis_fits.get("x")
-        if fit_x is not None:
-            correction_x = fit_x.reshape(1, 1, -1)
-            corrected = da.where(
-                mask_upscaled, corrected / correction_x, corrected
-            )
-
-        fit_y = axis_fits.get("y")
-        if fit_y is not None:
-            correction_y = fit_y.reshape(1, -1, 1)
-            corrected = da.where(
-                mask_upscaled, corrected / correction_y, corrected
-            )
-
-        fit_z = axis_fits.get("z")
-        if fit_z is not None:
-            correction_z = fit_z.reshape(-1, 1, 1)
-            corrected = da.where(
-                mask_upscaled, corrected / correction_z, corrected
-            )
-
         ratio = global_factor / global_med
         if ratio_limits is not None:
             clamped_ratio = float(
@@ -243,7 +245,24 @@ def apply_axis_corrections(
             global_med,
             ratio,
         )
-        corrected = da.where(mask_upscaled, corrected * ratio, corrected)
+
+        # Fold the per-axis curves and the global ratio into a single scaled
+        # volume applied with one da.where, instead of one masked division per
+        # axis plus a masked ratio multiply (each a full-volume pass). The
+        # reciprocal of each tiny 1D curve is taken up front (in float32 so the
+        # full-resolution graph is never promoted to float64) to trade the
+        # broadcast divisions for multiplications.
+        axis_reshapes = (("x", (1, 1, -1)), ("y", (1, -1, 1)), ("z", (-1, 1, 1)))
+        scaled = corrected
+        for axis_label, reshape in axis_reshapes:
+            fit = axis_fits.get(axis_label)
+            if fit is not None:
+                inv_fit = np.reciprocal(np.asarray(fit, dtype=np.float32))
+                scaled = scaled * inv_fit.reshape(reshape)
+        if ratio != 1.0:
+            scaled = scaled * ratio
+        if scaled is not corrected:
+            corrected = da.where(mask_upscaled, scaled, corrected)
         corrected = da.clip(corrected, 0, clip_max)
     else:
         _LOGGER.warning(
