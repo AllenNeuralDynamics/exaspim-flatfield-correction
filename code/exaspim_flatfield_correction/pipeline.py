@@ -116,10 +116,16 @@ def safe_performance_report(filename: str):
 
 @dataclass
 class MaskArtifacts:
-    """Container for cached mask artifacts reused within the pipeline."""
+    """Container for the reusable foreground mask shared across a tile's channels.
+
+    Only the foreground mask is cached here: it describes the tile's physical
+    geometry and is therefore channel-agnostic. The probability weights, by
+    contrast, are intensity-derived and computed per channel (see
+    :func:`_create_probability_volume`), so they are intentionally not stored on
+    this container.
+    """
 
     mask_low_res: da.Array
-    probability_volume: da.Array | None = None
 
 
 def _save_local_zarr(
@@ -550,31 +556,20 @@ def _preprocess_mask(
 
 def _create_mask_artifacts(
     low_res: da.Array,
-    z: zarr.Group,
-    fitting_res: str,
     initial_mask: np.ndarray,
     tile_name: str,
     results_dir: str,
-    config: FittingConfig,
-    bkg_slice_indices: np.ndarray,
-    out_probability_path: str,
-    overwrite: bool,
-    output_zarr_format: int = 2,
-    io_backend: IOBackendName | ArrayIOBackend = "tensorstore",
-    corrected_rank: int = -2,
-    max_chunks_per_block: int | None = 16384,
-    probability_shards: OutputShards = "none",
 ) -> MaskArtifacts:
-    """Generate mask artifacts and optional probability volumes for a tile.
+    """Generate the reusable foreground mask for a tile.
+
+    The mask describes the tile's physical geometry and is therefore shared
+    across the tile's channels. The intensity-derived probability weights are
+    produced separately, per channel, by :func:`_create_probability_volume`.
 
     Parameters
     ----------
     low_res : dask.array.Array
         Low-resolution stack used for mask inference.
-    z : zarr.Group
-        Zarr hierarchy that contains the tile data.
-    fitting_res : str
-        Resolution key within ``z`` from which the mask is derived.
     initial_mask : numpy.ndarray
         Raw tile mask loaded from disk (see
         :func:`~exaspim_flatfield_correction.utils.utils.load_mask_from_dir`).
@@ -582,15 +577,6 @@ def _create_mask_artifacts(
         Identifier of the tile driving mask generation.
     results_dir : str
         Destination directory for persisted mask artifacts.
-    config : FittingConfig
-        Configuration controlling mask refinement and thresholds.
-    bkg_slice_indices : numpy.ndarray
-        Indices of background-dominant slices used when estimating background
-        statistics for the probability volume.
-    out_probability_path : str
-        Root path where probability volumes are stored.
-    overwrite : bool
-        Whether existing outputs may be replaced.
 
     Returns
     -------
@@ -623,62 +609,110 @@ def _create_mask_artifacts(
         name=f"mask-cache-{_safe_dask_name(tile_name)}-{uuid.uuid4().hex}",
     )
 
-    probability_volume: da.Array | None = None
-    if config.enable_gmm_refinement:
-        slice_indices = np.asarray(bkg_slice_indices, dtype=np.int64)
-        bg_reference = da.take(low_res, slice_indices, axis=0).compute()
+    return MaskArtifacts(mask_low_res=initial_mask)
 
-        _LOGGER.info(
-            "Computing percentile-based probability weights (low=%.1f, high=%.1f, eps=%.3f)",
-            config.probability_bg_low_percentile,
-            config.probability_bg_high_percentile,
-            config.probability_ramp_eps,
-        )
 
-        probability_volume = calc_percentile_weight(
-            low_res,
-            bg_reference,
-            low_percentile=config.probability_bg_low_percentile,
-            high_percentile=config.probability_bg_high_percentile,
-            eps=config.probability_ramp_eps,
-            smooth_sigma=config.probability_smooth_sigma,
-            start_frac=config.probability_ramp_start_frac,
-            nu=config.probability_ramp_nu,
-        ).astype(np.float32)
+def _create_probability_volume(
+    low_res: da.Array,
+    z: zarr.Group,
+    fitting_res: str,
+    tile_name: str,
+    out_probability_path: str,
+    config: FittingConfig,
+    bkg_slice_indices: np.ndarray,
+    overwrite: bool,
+    io_backend: IOBackendName | ArrayIOBackend = "tensorstore",
+    corrected_rank: int = -2,
+    max_chunks_per_block: int | None = 16384,
+    probability_shards: OutputShards = "none",
+) -> da.Array | None:
+    """Compute, persist, and reload this channel's probability volume.
 
-        probability_path = out_probability_path.rstrip("/") + f"/{tile_name}"
-        probability_transformations = parse_ome_zarr_transformations(
-            z, fitting_res
-        )
-        probability_scale = probability_transformations["scale"]
-        probability_translation = probability_transformations["translation"]
+    Unlike the foreground mask, which is shared across a tile's channels, the
+    probability weights are derived from the channel's own background-subtracted
+    ``low_res`` data. They are therefore recomputed and written for every tile
+    (including channels that reuse the cached mask) rather than reused, so each
+    channel gets its own ``probability/<tile>`` output.
 
-        _LOGGER.info("Storing probability volume at %s", probability_path)
-        store_ome_zarr(
-            probability_volume,
-            probability_path,
-            5,
-            tuple(probability_scale[-3:]),
-            tuple(probability_translation),
-            overwrite=overwrite,
-            # Always Zarr v3 so the sparse, highly-compressed probability volume
-            # can be sharded (many tiny chunks -> one shard object on S3).
-            zarr_format=3,
-            io_backend=io_backend,
-            reducer=partial(windowed_rank, rank=corrected_rank),
-            write_empty_chunks=True,
-            max_chunks_per_block=max_chunks_per_block,
-            output_shards=probability_shards,
-        )
-        # Do not materialize into memory until needed
-        probability_volume = read_zarr_array(
-            probability_path, component="0", io_backend=io_backend
-        ).squeeze()
+    Parameters
+    ----------
+    low_res : dask.array.Array
+        Background-subtracted low-resolution stack for this channel.
+    z : zarr.Group
+        Zarr hierarchy that contains the tile data.
+    fitting_res : str
+        Resolution key within ``z`` used for the probability transformations.
+    tile_name : str
+        Identifier of the channel/tile being processed.
+    out_probability_path : str
+        Root path where probability volumes are stored.
+    config : FittingConfig
+        Configuration controlling the percentile-weight computation.
+    bkg_slice_indices : numpy.ndarray
+        Indices of background-dominant slices used to build the background
+        reference for the probability computation.
+    overwrite : bool
+        Whether existing outputs may be replaced.
 
-    return MaskArtifacts(
-        mask_low_res=initial_mask,
-        probability_volume=probability_volume,
+    Returns
+    -------
+    dask.array.Array or None
+        The reloaded probability volume, or ``None`` when GMM refinement is
+        disabled.
+
+    """
+    if not config.enable_gmm_refinement:
+        return None
+
+    slice_indices = np.asarray(bkg_slice_indices, dtype=np.int64)
+    bg_reference = da.take(low_res, slice_indices, axis=0).compute()
+
+    _LOGGER.info(
+        "Computing percentile-based probability weights (low=%.1f, high=%.1f, eps=%.3f)",
+        config.probability_bg_low_percentile,
+        config.probability_bg_high_percentile,
+        config.probability_ramp_eps,
     )
+
+    probability_volume = calc_percentile_weight(
+        low_res,
+        bg_reference,
+        low_percentile=config.probability_bg_low_percentile,
+        high_percentile=config.probability_bg_high_percentile,
+        eps=config.probability_ramp_eps,
+        smooth_sigma=config.probability_smooth_sigma,
+        start_frac=config.probability_ramp_start_frac,
+        nu=config.probability_ramp_nu,
+    ).astype(np.float32)
+
+    probability_path = out_probability_path.rstrip("/") + f"/{tile_name}"
+    probability_transformations = parse_ome_zarr_transformations(
+        z, fitting_res
+    )
+    probability_scale = probability_transformations["scale"]
+    probability_translation = probability_transformations["translation"]
+
+    _LOGGER.info("Storing probability volume at %s", probability_path)
+    store_ome_zarr(
+        probability_volume,
+        probability_path,
+        5,
+        tuple(probability_scale[-3:]),
+        tuple(probability_translation),
+        overwrite=overwrite,
+        # Always Zarr v3 so the sparse, highly-compressed probability volume
+        # can be sharded (many tiny chunks -> one shard object on S3).
+        zarr_format=3,
+        io_backend=io_backend,
+        reducer=partial(windowed_rank, rank=corrected_rank),
+        write_empty_chunks=True,
+        max_chunks_per_block=max_chunks_per_block,
+        output_shards=probability_shards,
+    )
+    # Do not materialize into memory until needed
+    return read_zarr_array(
+        probability_path, component="0", io_backend=io_backend
+    ).squeeze()
 
 
 def flatfield_fitting(
@@ -786,20 +820,9 @@ def flatfield_fitting(
     if mask_artifacts is None:
         mask_artifacts = _create_mask_artifacts(
             low_res=low_res,
-            z=z,
-            fitting_res=fitting_res,
             initial_mask=initial_mask,
             tile_name=tile_name,
             results_dir=results_dir,
-            config=config,
-            bkg_slice_indices=bkg_slice_indices,
-            out_probability_path=out_probability_path,
-            overwrite=overwrite,
-            output_zarr_format=output_zarr_format,
-            io_backend=io_backend,
-            corrected_rank=corrected_rank,
-            max_chunks_per_block=max_chunks_per_block,
-            probability_shards=probability_shards,
         )
     else:
         _LOGGER.info(
@@ -860,7 +883,24 @@ def flatfield_fitting(
     profile_min_voxels = config.profile_min_voxels
     spline_smoothing = config.spline_smoothing
 
-    weights = mask_artifacts.probability_volume
+    # The foreground mask is shared across a tile's channels, but the
+    # probability weights are intensity-derived and must be computed and written
+    # per channel. Do this for every tile -- including channels that reuse the
+    # cached mask -- so each channel gets its own probability/<tile> output.
+    weights = _create_probability_volume(
+        low_res=low_res,
+        z=z,
+        fitting_res=fitting_res,
+        tile_name=tile_name,
+        out_probability_path=out_probability_path,
+        config=config,
+        bkg_slice_indices=bkg_slice_indices,
+        overwrite=overwrite,
+        io_backend=io_backend,
+        corrected_rank=corrected_rank,
+        max_chunks_per_block=max_chunks_per_block,
+        probability_shards=probability_shards,
+    )
 
     global_val = weighted_percentile(
         low_res.round().astype(np.uint16),
