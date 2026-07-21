@@ -7,6 +7,7 @@ import numpy as np
 
 from exaspim_flatfield_correction.pipeline import (
     _cache_dask_array,
+    _exclude_background_slices_from_mask,
     _fitting_cache_dir,
     _low_res_cache_path,
 )
@@ -69,3 +70,47 @@ def test_cache_paths_are_safe_and_scoped(tmp_path) -> None:
     # tile names with unsafe characters are sanitized
     weird = _low_res_cache_path(results_dir, "tile with/slash")
     assert "/" not in weird.name.replace(".zarr", "")
+
+
+def test_exclude_background_slices_from_mask() -> None:
+    mask_np = np.ones((6, 4, 5), dtype=bool)
+    mask_np[4, 1:, 2:] = False
+    mask = da.from_array(mask_np, chunks=(2, 2, 5))
+
+    filtered = _exclude_background_slices_from_mask(
+        mask,
+        np.asarray([1, 3, 3], dtype=np.int64),
+    )
+    expected = mask_np.copy()
+    expected[[1, 3]] = False
+
+    assert filtered.dtype == bool
+    assert filtered.chunks == mask.chunks
+    np.testing.assert_array_equal(filtered.compute(), expected)
+
+
+def test_background_slice_exclusion_does_not_mutate_shared_mask() -> None:
+    mask_np = np.ones((4, 3, 2), dtype=bool)
+    shared = da.from_array(mask_np, chunks=(2, 3, 2))
+
+    first_channel = _exclude_background_slices_from_mask(
+        shared, np.asarray([0])
+    )
+    second_channel = _exclude_background_slices_from_mask(
+        shared, np.asarray([2])
+    )
+
+    np.testing.assert_array_equal(shared.compute(), mask_np)
+    assert not first_channel[0].compute().any()
+    assert first_channel[2].compute().all()
+    assert second_channel[0].compute().all()
+    assert not second_channel[2].compute().any()
+
+
+def test_exclude_background_slices_rejects_out_of_range_indices() -> None:
+    mask = da.ones((4, 3, 2), chunks=(2, 3, 2), dtype=bool)
+
+    with np.testing.assert_raises_regex(
+        ValueError, "outside the fitting mask Z range"
+    ):
+        _exclude_background_slices_from_mask(mask, np.asarray([-1, 4]))

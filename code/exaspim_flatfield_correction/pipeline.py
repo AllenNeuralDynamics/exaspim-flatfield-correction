@@ -612,6 +612,61 @@ def _create_mask_artifacts(
     return MaskArtifacts(mask_low_res=initial_mask)
 
 
+def _exclude_background_slices_from_mask(
+    mask: da.Array,
+    bkg_slice_indices: np.ndarray,
+) -> da.Array:
+    """Remove background-estimation Z planes from a fitting mask.
+
+    The background indices and ``mask`` are both expressed in the fitting
+    resolution (resolution 0 for a binned channel and resolution 3 for an
+    unbinned channel).  The reusable mask artifact is deliberately left
+    unchanged: background slices are estimated per channel and may differ
+    between channels that share the same anatomical mask.
+
+    Parameters
+    ----------
+    mask : dask.array.Array
+        Three-dimensional fitting mask in ``(z, y, x)`` order.
+    bkg_slice_indices : numpy.ndarray
+        Z indices selected for background estimation.
+
+    Returns
+    -------
+    dask.array.Array
+        Boolean mask with every selected background plane set to ``False``.
+    """
+    if mask.ndim != 3:
+        raise ValueError(
+            "Fitting mask must be three-dimensional (z, y, x), "
+            f"received shape {mask.shape}"
+        )
+
+    slice_indices = np.asarray(bkg_slice_indices, dtype=np.int64).reshape(-1)
+    if slice_indices.size == 0:
+        return mask.astype(bool)
+
+    invalid = slice_indices[
+        (slice_indices < 0) | (slice_indices >= mask.shape[0])
+    ]
+    if invalid.size:
+        raise ValueError(
+            "Background slice indices are outside the fitting mask Z range "
+            f"[0, {mask.shape[0]}): {np.unique(invalid).tolist()}"
+        )
+
+    slice_indices = np.unique(slice_indices)
+    keep_z = np.ones(mask.shape[0], dtype=bool)
+    keep_z[slice_indices] = False
+    keep_z_da = da.from_array(keep_z, chunks=(mask.chunks[0],))
+
+    _LOGGER.info(
+        "Excluding %s background-estimation Z slices from the fitting mask",
+        slice_indices.size,
+    )
+    return mask.astype(bool) & keep_z_da[:, np.newaxis, np.newaxis]
+
+
 def _create_probability_volume(
     low_res: da.Array,
     z: zarr.Group,
@@ -832,7 +887,10 @@ def flatfield_fitting(
         _LOGGER.warning(f"mask_artifacts is None. Skipping correction for tile {tile_name}")
         return full_res, None, None
 
-    mask = mask_artifacts.mask_low_res
+    mask = _exclude_background_slices_from_mask(
+        mask_artifacts.mask_low_res,
+        bkg_slice_indices,
+    )
 
     if mask.shape == full_res.shape:
         _LOGGER.info("Mask already at full resolution, skipping upscaling.")
