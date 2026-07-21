@@ -2,7 +2,7 @@
 set -euo pipefail
 git clone https://github.com/AllenNeuralDynamics/exaspim-flatfield-correction.git
 cd exaspim-flatfield-correction
-git checkout c15dcb6
+git checkout 3b6cd4ba6a5ade3debbc2f82de27d20b702a1734
 pip install .
 
 curl "https://awscli.amazonaws.com/awscli-exe-linux-x86_64.zip" -o "awscliv2.zip"
