@@ -8,6 +8,7 @@ import numpy as np
 from exaspim_flatfield_correction.pipeline import (
     _cache_dask_array,
     _exclude_background_slices_from_mask,
+    _filtered_mask_cache_path,
     _fitting_cache_dir,
     _low_res_cache_path,
 )
@@ -70,47 +71,71 @@ def test_cache_paths_are_safe_and_scoped(tmp_path) -> None:
     # tile names with unsafe characters are sanitized
     weird = _low_res_cache_path(results_dir, "tile with/slash")
     assert "/" not in weird.name.replace(".zarr", "")
+    filtered_mask = _filtered_mask_cache_path(
+        results_dir, "tile with/slash"
+    )
+    assert _fitting_cache_dir(results_dir) in filtered_mask.parents
+    assert "/" not in filtered_mask.name.replace(".zarr", "")
 
 
 def test_exclude_background_slices_from_mask() -> None:
     mask_np = np.ones((6, 4, 5), dtype=bool)
     mask_np[4, 1:, 2:] = False
-    mask = da.from_array(mask_np, chunks=(2, 2, 5))
 
     filtered = _exclude_background_slices_from_mask(
-        mask,
+        mask_np,
         np.asarray([1, 3, 3], dtype=np.int64),
     )
     expected = mask_np.copy()
     expected[[1, 3]] = False
 
     assert filtered.dtype == bool
-    assert filtered.chunks == mask.chunks
-    np.testing.assert_array_equal(filtered.compute(), expected)
+    assert not np.shares_memory(filtered, mask_np)
+    np.testing.assert_array_equal(filtered, expected)
 
 
 def test_background_slice_exclusion_does_not_mutate_shared_mask() -> None:
     mask_np = np.ones((4, 3, 2), dtype=bool)
-    shared = da.from_array(mask_np, chunks=(2, 3, 2))
 
     first_channel = _exclude_background_slices_from_mask(
-        shared, np.asarray([0])
+        mask_np, np.asarray([0])
     )
     second_channel = _exclude_background_slices_from_mask(
-        shared, np.asarray([2])
+        mask_np, np.asarray([2])
     )
 
-    np.testing.assert_array_equal(shared.compute(), mask_np)
-    assert not first_channel[0].compute().any()
-    assert first_channel[2].compute().all()
-    assert second_channel[0].compute().all()
-    assert not second_channel[2].compute().any()
+    assert mask_np.all()
+    assert not first_channel[0].any()
+    assert first_channel[2].all()
+    assert second_channel[0].all()
+    assert not second_channel[2].any()
+
+
+def test_exclude_no_background_slices_returns_independent_mask() -> None:
+    mask = np.ones((2, 3, 4), dtype=np.uint8)
+
+    filtered = _exclude_background_slices_from_mask(
+        mask, np.asarray([], dtype=np.int64)
+    )
+
+    assert filtered.dtype == bool
+    assert not np.shares_memory(filtered, mask)
+    assert filtered.all()
 
 
 def test_exclude_background_slices_rejects_out_of_range_indices() -> None:
-    mask = da.ones((4, 3, 2), chunks=(2, 3, 2), dtype=bool)
+    mask = np.ones((4, 3, 2), dtype=bool)
 
     with np.testing.assert_raises_regex(
         ValueError, "outside the fitting mask Z range"
     ):
         _exclude_background_slices_from_mask(mask, np.asarray([-1, 4]))
+
+
+def test_exclude_background_slices_requires_3d_mask() -> None:
+    with np.testing.assert_raises_regex(
+        ValueError, "must be three-dimensional"
+    ):
+        _exclude_background_slices_from_mask(
+            np.ones((3, 4), dtype=bool), np.asarray([0])
+        )

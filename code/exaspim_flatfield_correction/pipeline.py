@@ -375,6 +375,15 @@ def _low_res_cache_path(results_dir: str, tile_name: str) -> Path:
     )
 
 
+def _filtered_mask_cache_path(results_dir: str, tile_name: str) -> Path:
+    """Cache location for a tile's background-filtered fitting mask."""
+
+    return (
+        _fitting_cache_dir(results_dir)
+        / f"{_safe_dask_name(tile_name)}_filtered_mask.zarr"
+    )
+
+
 def _cache_dask_array(
     arr: da.Array, cache_path: Path, *, name: str
 ) -> da.Array:
@@ -613,58 +622,57 @@ def _create_mask_artifacts(
 
 
 def _exclude_background_slices_from_mask(
-    mask: da.Array,
+    mask: np.ndarray,
     bkg_slice_indices: np.ndarray,
-) -> da.Array:
+) -> np.ndarray:
     """Remove background-estimation Z planes from a fitting mask.
 
     The background indices and ``mask`` are both expressed in the fitting
     resolution (resolution 0 for a binned channel and resolution 3 for an
-    unbinned channel).  The reusable mask artifact is deliberately left
-    unchanged: background slices are estimated per channel and may differ
-    between channels that share the same anatomical mask.
+    unbinned channel). The input is copied so the reusable mask artifact is
+    left unchanged: background slices are estimated per channel and may differ
+    between channels that share the same anatomical mask. Performing this
+    operation eagerly keeps the broadcast slice-selection operation out of the
+    Dask graph that is subsequently upscaled.
 
     Parameters
     ----------
-    mask : dask.array.Array
+    mask : numpy.ndarray
         Three-dimensional fitting mask in ``(z, y, x)`` order.
     bkg_slice_indices : numpy.ndarray
         Z indices selected for background estimation.
 
     Returns
     -------
-    dask.array.Array
+    numpy.ndarray
         Boolean mask with every selected background plane set to ``False``.
     """
-    if mask.ndim != 3:
+    mask_np = np.asarray(mask, dtype=bool)
+    if mask_np.ndim != 3:
         raise ValueError(
             "Fitting mask must be three-dimensional (z, y, x), "
-            f"received shape {mask.shape}"
+            f"received shape {mask_np.shape}"
         )
 
     slice_indices = np.asarray(bkg_slice_indices, dtype=np.int64).reshape(-1)
-    if slice_indices.size == 0:
-        return mask.astype(bool)
-
     invalid = slice_indices[
-        (slice_indices < 0) | (slice_indices >= mask.shape[0])
+        (slice_indices < 0) | (slice_indices >= mask_np.shape[0])
     ]
     if invalid.size:
         raise ValueError(
             "Background slice indices are outside the fitting mask Z range "
-            f"[0, {mask.shape[0]}): {np.unique(invalid).tolist()}"
+            f"[0, {mask_np.shape[0]}): {np.unique(invalid).tolist()}"
         )
 
     slice_indices = np.unique(slice_indices)
-    keep_z = np.ones(mask.shape[0], dtype=bool)
-    keep_z[slice_indices] = False
-    keep_z_da = da.from_array(keep_z, chunks=(mask.chunks[0],))
+    filtered_mask = mask_np.copy()
+    filtered_mask[slice_indices] = False
 
     _LOGGER.info(
         "Excluding %s background-estimation Z slices from the fitting mask",
         slice_indices.size,
     )
-    return mask.astype(bool) & keep_z_da[:, np.newaxis, np.newaxis]
+    return filtered_mask
 
 
 def _create_probability_volume(
@@ -887,10 +895,27 @@ def flatfield_fitting(
         _LOGGER.warning(f"mask_artifacts is None. Skipping correction for tile {tile_name}")
         return full_res, None, None
 
-    mask = _exclude_background_slices_from_mask(
-        mask_artifacts.mask_low_res,
+    mask_np = _exclude_background_slices_from_mask(
+        mask_artifacts.mask_low_res.compute(),
         bkg_slice_indices,
     )
+    mask_chunks = array_chunks(mask_artifacts.mask_low_res)
+    if results_dir is not None:
+        mask_cache_path = _filtered_mask_cache_path(results_dir, tile_name)
+        _save_local_zarr(str(mask_cache_path), mask_np, mask_chunks)
+        mask = da.from_zarr(
+            str(mask_cache_path),
+            name=(
+                f"filtered-mask-cache-{_safe_dask_name(tile_name)}-"
+                f"{uuid.uuid4().hex}"
+            ),
+        )
+    else:
+        # Preserve support for direct callers without a scratch directory.
+        # The production pipeline always supplies results_dir and uses the
+        # disk-backed branch above.
+        mask = da.from_array(mask_np, chunks=mask_chunks)
+    del mask_np
 
     if mask.shape == full_res.shape:
         _LOGGER.info("Mask already at full resolution, skipping upscaling.")
@@ -1331,10 +1356,15 @@ def process_tile(
             raise
         finally:
             cleanup_background_cache(background_cache_path)
-            # Remove this tile's fitting-volume cache; the shared mask cache
-            # lives until all tiles are processed (removed in main()).
+            # Remove this tile's fitting-volume and channel-specific filtered
+            # mask caches. The shared mask cache lives until all tiles are
+            # processed (removed in main()).
             shutil.rmtree(
                 _low_res_cache_path(results_dir, tile_name),
+                ignore_errors=True,
+            )
+            shutil.rmtree(
+                _filtered_mask_cache_path(results_dir, tile_name),
                 ignore_errors=True,
             )
 
