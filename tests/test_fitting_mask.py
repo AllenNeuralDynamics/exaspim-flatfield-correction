@@ -4,12 +4,15 @@ from __future__ import annotations
 
 import dask.array as da
 import numpy as np
+import pytest
 import zarr
 
 from exaspim_flatfield_correction import pipeline as pipeline_module
+from exaspim_flatfield_correction.background import subtract_bkg
 from exaspim_flatfield_correction.config import FittingConfig
 from exaspim_flatfield_correction.pipeline import (
     MaskArtifacts,
+    _create_mask_artifacts,
     _filtered_mask_cache_path,
     flatfield_fitting,
 )
@@ -127,3 +130,65 @@ def test_flatfield_fitting_excludes_background_slices_before_statistics(
     assert _filtered_mask_cache_path(
         str(tmp_path), "tile_ch_561.zarr"
     ).is_dir()
+
+
+def test_create_mask_artifacts_keeps_tissue_at_or_below_background(
+    tmp_path,
+) -> None:
+    """Only raw zeros are excluded, not tissue clipped to zero by subtraction.
+
+    ``subtract_bkg`` clips at zero, so testing the *subtracted* stack for
+    ``!= 0`` removes every voxel at or below the background estimate. Those
+    voxels are scattered through the tissue, so they became single-voxel holes
+    in the mask that the nearest-neighbour upscale then magnified.
+    """
+    low_shape = (4, 6, 6)
+    background_level = 10.0
+
+    raw = np.full(low_shape, 100.0, dtype=np.float32)
+    # Tissue sitting at or below the background estimate: nonzero in the raw
+    # stack, exactly zero after background subtraction.
+    dim_tissue = (slice(1, 3), slice(2, 4), slice(2, 4))
+    raw[dim_tissue] = background_level - 1.0
+    # Voxels the microscope never acquired: zero in the raw stack.
+    unacquired = (slice(None), slice(0, 1), slice(None))
+    raw[unacquired] = 0.0
+
+    raw_low_res = da.from_array(raw, chunks=(2, 3, 3))
+    low_res = subtract_bkg(
+        raw_low_res,
+        da.from_array(
+            np.full(low_shape[1:], background_level, dtype=np.float32),
+            chunks=(3, 3),
+        ),
+    )
+    # The two candidate tests disagree, otherwise this fixture proves nothing.
+    assert not np.array_equal(low_res.compute() != 0, raw != 0)
+
+    artifacts = _create_mask_artifacts(
+        low_res=low_res,
+        raw_low_res=raw_low_res,
+        initial_mask=np.ones(low_shape, dtype=np.uint8),
+        tile_name="tile_ch_561.zarr",
+        results_dir=str(tmp_path),
+    )
+
+    mask = artifacts.mask_low_res.compute()
+    np.testing.assert_array_equal(mask, raw != 0)
+    assert mask[dim_tissue].all()
+    assert not mask[unacquired].any()
+
+
+def test_create_mask_artifacts_rejects_mismatched_raw_shape(tmp_path) -> None:
+    """A raw stack that does not match ``low_res`` is a caller error."""
+    low_res = da.ones((4, 6, 6), chunks=(2, 3, 3), dtype=np.float32)
+    raw_low_res = da.ones((4, 6, 5), chunks=(2, 3, 3), dtype=np.float32)
+
+    with pytest.raises(ValueError, match="same shape"):
+        _create_mask_artifacts(
+            low_res=low_res,
+            raw_low_res=raw_low_res,
+            initial_mask=np.ones((4, 6, 6), dtype=np.uint8),
+            tile_name="tile_ch_561.zarr",
+            results_dir=str(tmp_path),
+        )

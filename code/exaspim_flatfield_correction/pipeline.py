@@ -565,6 +565,7 @@ def _preprocess_mask(
 
 def _create_mask_artifacts(
     low_res: da.Array,
+    raw_low_res: da.Array,
     initial_mask: np.ndarray,
     tile_name: str,
     results_dir: str,
@@ -579,6 +580,10 @@ def _create_mask_artifacts(
     ----------
     low_res : dask.array.Array
         Low-resolution stack used for mask inference.
+    raw_low_res : dask.array.Array
+        The same stack *before* background subtraction, used to exclude
+        unacquired (exactly zero) voxels from the mask. Must have the same
+        shape as ``low_res``.
     initial_mask : numpy.ndarray
         Raw tile mask loaded from disk (see
         :func:`~exaspim_flatfield_correction.utils.utils.load_mask_from_dir`).
@@ -605,12 +610,24 @@ def _create_mask_artifacts(
         tile_name,
         chunks=mask_chunks,
     ).astype(bool)
+    # Drop voxels the microscope never acquired. The test must run against the
+    # *raw* stack: ``low_res`` has already been through ``subtract_bkg``, which
+    # clips at zero, so ``low_res != 0`` really means ``raw > bkg`` and punches
+    # a single-voxel hole through the mask at every tissue voxel that happens to
+    # sit at or below the background estimate. Those holes survive to the final
+    # mask (``binary_fill_holes`` has already run, above) and are magnified by
+    # the nearest-neighbour upscale to full resolution.
+    if raw_low_res.shape != low_res.shape:
+        raise ValueError(
+            "raw_low_res and low_res must have the same shape, received "
+            f"{raw_low_res.shape} and {low_res.shape}"
+        )
+    initial_mask = initial_mask & (raw_low_res != 0)
     # Cache the combined mask on local disk: it is reused across tiles and
     # evaluated by both the global percentile and the axis profiles, so the
-    # lazy ``low_res != 0`` term would otherwise re-evaluate the tile volume
-    # on every use, while persist() would pin it in worker memory. main()
-    # removes the cache after all tiles are processed.
-    initial_mask = initial_mask & (low_res != 0)
+    # lazy ``raw_low_res != 0`` term would otherwise re-read the tile from
+    # storage on every use, while persist() would pin it in worker memory.
+    # main() removes the cache after all tiles are processed.
     initial_mask = _cache_dask_array(
         initial_mask,
         _fitting_cache_dir(results_dir)
@@ -841,15 +858,19 @@ def flatfield_fitting(
         ``axis_fits`` maps ``{"x", "y", "z"}`` to their correction curves.
     """
     fitting_res = "0" if is_binned_channel else "3"
-    low_res = read_zarr_array(
+    # Keep a handle on the pre-subtraction stack: _create_mask_artifacts needs
+    # the raw values to tell unacquired padding (exactly zero) apart from
+    # tissue that merely sits at or below the background estimate, which
+    # subtract_bkg's clip would also drive to exactly zero.
+    raw_low_res = read_zarr_array(
         z, component=fitting_res, io_backend=io_backend
     ).squeeze().astype(np.float32)
 
     low_res = subtract_bkg(
-        low_res,
+        raw_low_res,
         da.from_array(
-            resize(bkg.astype(np.float32, copy=False), low_res.shape[1:]),
-            chunks=low_res.chunksize[1:],
+            resize(bkg.astype(np.float32, copy=False), raw_low_res.shape[1:]),
+            chunks=raw_low_res.chunksize[1:],
         ),
     )
     initial_mask: np.ndarray | None = None
@@ -886,6 +907,7 @@ def flatfield_fitting(
             initial_mask=initial_mask,
             tile_name=tile_name,
             results_dir=results_dir,
+            raw_low_res=raw_low_res,
         )
     else:
         _LOGGER.info(
