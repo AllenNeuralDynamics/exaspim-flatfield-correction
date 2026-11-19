@@ -325,3 +325,98 @@ def upscale_mask_edt(
 
     # values >= 0 are considered inside the mask.
     return sdf_upscaled >= 0
+
+
+Grid = dict[str, list[float]]
+
+
+def grid_from_transformations(transformations: dict | None) -> Grid | None:
+    """ZYX ``scale`` and ``translation`` of one OME-Zarr level.
+
+    Takes the output of ``parse_ome_zarr_transformations``. Returns ``None`` when
+    the level has no scale; a missing translation means the origin.
+    """
+    if not transformations:
+        return None
+    scale = transformations.get("scale")
+    if scale is None or len(scale) < 3:
+        return None
+    translation = transformations.get("translation")
+    if translation is None or len(translation) < 3:
+        translation = [0.0, 0.0, 0.0]
+    return {
+        "scale": [float(v) for v in scale[-3:]],
+        "translation": [float(v) for v in translation[-3:]],
+    }
+
+
+def same_physical_extent(
+    source_shape: tuple[int, ...],
+    source_grid: Grid,
+    target_shape: tuple[int, ...],
+    target_grid: Grid,
+) -> bool:
+    """True when two ZYX grids cover the same box, to within one coarse voxel.
+
+    A resize by shape then lines a mask up with the target, as it does for a
+    binned channel against the other channel's level 3. It does not when the
+    channels were acquired over different z ranges, e.g. a 561 channel at an
+    8 um z step whose stack ends about 1 mm before the 488 stack at 2 um.
+    """
+    for axis in range(3):
+        source_scale = source_grid["scale"][axis]
+        target_scale = target_grid["scale"][axis]
+        source_start = source_grid["translation"][axis] - source_scale / 2
+        target_start = target_grid["translation"][axis] - target_scale / 2
+        source_stop = source_start + source_scale * source_shape[axis]
+        target_stop = target_start + target_scale * target_shape[axis]
+        tolerance = max(source_scale, target_scale)
+        if (
+            abs(source_start - target_start) > tolerance
+            or abs(source_stop - target_stop) > tolerance
+        ):
+            return False
+    return True
+
+
+def resample_mask_to_grid(
+    mask: np.ndarray,
+    source_grid: Grid,
+    target_shape: tuple[int, int, int],
+    target_grid: Grid,
+) -> np.ndarray:
+    """Resample a ZYX mask onto another grid by physical position (nearest).
+
+    Voxel centers are at ``translation + scale * index``, as in OME-NGFF. Each
+    target voxel takes the value of the source voxel nearest its center; target
+    voxels more than half a source voxel outside the source's extent are
+    ``False``.
+    """
+    mask = np.asarray(mask, dtype=bool)
+    if mask.ndim != 3 or len(target_shape) != 3:
+        raise ValueError(
+            "Expected 3D (z, y, x) shapes, received "
+            f"{mask.shape} and {tuple(target_shape)}"
+        )
+    result = mask
+    inside_by_axis = []
+    for axis in range(3):
+        source_size = mask.shape[axis]
+        centers = target_grid["translation"][axis] + target_grid["scale"][
+            axis
+        ] * np.arange(target_shape[axis])
+        position = (centers - source_grid["translation"][axis]) / source_grid[
+            "scale"
+        ][axis]
+        inside_by_axis.append(
+            (position >= -0.5) & (position <= source_size - 0.5)
+        )
+        index = np.clip(np.rint(position).astype(np.int64), 0, source_size - 1)
+        result = np.take(result, index, axis=axis)
+    inside_z, inside_y, inside_x = inside_by_axis
+    return (
+        result
+        & inside_z[:, None, None]
+        & inside_y[None, :, None]
+        & inside_x[None, None, :]
+    )

@@ -41,6 +41,10 @@ from exaspim_flatfield_correction.fitting import (
     calc_percentile_weight,
 )
 from exaspim_flatfield_correction.utils.mask_utils import (
+    Grid,
+    grid_from_transformations,
+    resample_mask_to_grid,
+    same_physical_extent,
     size_filter,
     upscale_mask_nearest,
 )
@@ -52,6 +56,8 @@ from exaspim_flatfield_correction.utils.utils import (
     array_chunks,
     chunks_2d,
     get_bkg_path,
+    extract_channel_from_tile_name,
+    find_mask_file,
     get_parent_s3_path,
     load_mask_from_dir,
     read_bkg_image,
@@ -123,9 +129,15 @@ class MaskArtifacts:
     contrast, are intensity-derived and computed per channel (see
     :func:`_create_probability_volume`), so they are intentionally not stored on
     this container.
+
+    ``grid`` is the ZYX scale and translation of ``mask_low_res``: the fitting
+    level of the channel the mask was made for. A channel whose fitting level has
+    another shape (for example 561 at an 8 um z step next to 488 at 2 um) gets
+    the mask mapped onto its own grid by physical position.
     """
 
     mask_low_res: da.Array
+    grid: Grid | None = None
 
 
 def _save_local_zarr(
@@ -530,6 +542,8 @@ def _preprocess_mask(
     tile_name: str,
     *,
     chunks: tuple[int, ...],
+    source_grid: Grid | None = None,
+    target_grid: Grid | None = None,
 ) -> da.Array:
     """Normalize mask shape and persist it as a reusable Zarr array.
 
@@ -545,6 +559,10 @@ def _preprocess_mask(
         Identifier used when naming the persisted mask.
     chunks : tuple of int
         Chunk specification matching the target low-resolution Dask array.
+    source_grid, target_grid : dict or None
+        ZYX scale and translation of ``mask`` and of the low-resolution volume.
+        When both are given and the two cover different physical extents, the
+        mask is mapped by physical position instead of being resized by shape.
 
     Returns
     -------
@@ -552,12 +570,29 @@ def _preprocess_mask(
         Dask array backed by the stored mask Zarr.
     """
     mask_name = str(Path(results_dir) / f"{tile_name}_mask_low_res.zarr")
-    if mask.shape != low_res_shape:
-        mask = upscale_mask_nearest(
-            da.from_array(mask, chunks=chunks),
-            low_res_shape,
-            chunks=chunks,
-        ).compute()
+    if mask.shape != tuple(low_res_shape):
+        if (
+            source_grid is not None
+            and target_grid is not None
+            and not same_physical_extent(
+                mask.shape, source_grid, low_res_shape, target_grid
+            )
+        ):
+            _LOGGER.info(
+                "Mask %s and fitting volume %s cover different extents; "
+                "mapping the mask by physical position",
+                mask.shape,
+                tuple(low_res_shape),
+            )
+            mask = resample_mask_to_grid(
+                mask, source_grid, low_res_shape, target_grid
+            )
+        else:
+            mask = upscale_mask_nearest(
+                da.from_array(mask, chunks=chunks),
+                low_res_shape,
+                chunks=chunks,
+            ).compute()
     mask = mask.astype(np.uint8)
     _save_local_zarr(str(mask_name), mask, chunks)
     return da.from_zarr(mask_name)
@@ -569,6 +604,8 @@ def _create_mask_artifacts(
     initial_mask: np.ndarray,
     tile_name: str,
     results_dir: str,
+    initial_mask_grid: Grid | None = None,
+    fitting_grid: Grid | None = None,
 ) -> MaskArtifacts:
     """Generate the reusable foreground mask for a tile.
 
@@ -591,6 +628,12 @@ def _create_mask_artifacts(
         Identifier of the tile driving mask generation.
     results_dir : str
         Destination directory for persisted mask artifacts.
+    initial_mask_grid : dict or None
+        ZYX scale and translation of ``initial_mask`` (the Mask Gen level it
+        was made at), if known.
+    fitting_grid : dict or None
+        ZYX scale and translation of ``low_res``. Stored on the artifacts so
+        another channel with a different fitting grid can map the mask.
 
     Returns
     -------
@@ -609,6 +652,8 @@ def _create_mask_artifacts(
         results_dir,
         tile_name,
         chunks=mask_chunks,
+        source_grid=initial_mask_grid,
+        target_grid=fitting_grid,
     ).astype(bool)
     # Drop voxels the microscope never acquired. The test must run against the
     # *raw* stack: ``low_res`` has already been through ``subtract_bkg``, which
@@ -635,7 +680,47 @@ def _create_mask_artifacts(
         name=f"mask-cache-{_safe_dask_name(tile_name)}-{uuid.uuid4().hex}",
     )
 
-    return MaskArtifacts(mask_low_res=initial_mask)
+    return MaskArtifacts(mask_low_res=initial_mask, grid=fitting_grid)
+
+
+def _mask_source_grid(
+    mask_path: str,
+    mask_shape: tuple[int, ...],
+    tile_paths: list[str] | None,
+) -> Grid | None:
+    """ZYX grid of a Mask Gen mask, or ``None`` when it cannot be determined.
+
+    Mask Gen names the mask after its inference channel and writes it at one
+    level of that channel (level 4, or level 1 of a binned channel). The level
+    is the one whose shape matches the mask.
+    """
+    channel = extract_channel_from_tile_name(Path(mask_path).name)
+    if channel is None or not tile_paths:
+        return None
+    source_paths = [
+        path
+        for path in tile_paths
+        if f"_ch_{channel}" in Path(path.rstrip("/")).name
+    ]
+    if len(source_paths) != 1:
+        return None
+    try:
+        group = open_group(source_paths[0], mode="r")
+        for level in sorted(
+            (key for key in group.array_keys() if key.isdigit()), key=int
+        ):
+            if tuple(group[level].shape[-3:]) == tuple(mask_shape):
+                return grid_from_transformations(
+                    parse_ome_zarr_transformations(group, level)
+                )
+    except Exception:  # noqa: BLE001 - fall back to a resize by shape
+        _LOGGER.warning(
+            "Could not read the grid of mask %s from %s",
+            mask_path,
+            source_paths[0],
+            exc_info=True,
+        )
+    return None
 
 
 def _exclude_background_slices_from_mask(
@@ -816,6 +901,7 @@ def flatfield_fitting(
     max_chunks_per_block: int | None = 16384,
     mask_shards: OutputShards = "none",
     probability_shards: OutputShards = "none",
+    tile_paths: list[str] | None = None,
 ) -> tuple[da.Array, dict[str, np.ndarray], MaskArtifacts | None]:
     """Run the fitting-based flatfield workflow for a single tile.
 
@@ -850,6 +936,9 @@ def flatfield_fitting(
         Directory used for storing intermediate artifacts.
     mask_artifacts : MaskArtifacts or None, default=None
         Previously computed mask artifacts to reuse across tiles.
+    tile_paths : list of str or None, default=None
+        Paths of all the tile's channels. Used to find the grid of the Mask Gen
+        mask, which is named after the channel it was made from.
 
     Returns
     -------
@@ -858,6 +947,9 @@ def flatfield_fitting(
         ``axis_fits`` maps ``{"x", "y", "z"}`` to their correction curves.
     """
     fitting_res = "0" if is_binned_channel else "3"
+    fitting_grid = grid_from_transformations(
+        parse_ome_zarr_transformations(z, fitting_res)
+    )
     # Keep a handle on the pre-subtraction stack: _create_mask_artifacts needs
     # the raw values to tell unacquired padding (exactly zero) apart from
     # tissue that merely sits at or below the background estimate, which
@@ -874,17 +966,28 @@ def flatfield_fitting(
         ),
     )
     initial_mask: np.ndarray | None = None
+    initial_mask_grid: Grid | None = None
     if mask_artifacts is None:
         # Load the tile mask before the cache write below: a tile without a
         # mask skips correction entirely and must not pay the full-volume
         # compute and disk write the cache costs.
         try:
-            initial_mask = load_mask_from_dir(mask_dir, tile_name)
+            mask_path = find_mask_file(mask_dir, tile_name)
         except FileNotFoundError:
             _LOGGER.warning(
                 f"Mask does not exist for tile {tile_name}. Skipping correction."
             )
             return full_res, None, None
+        initial_mask = tifffile.imread(mask_path)
+        initial_mask_grid = _mask_source_grid(
+            mask_path, initial_mask.shape, tile_paths
+        )
+        if initial_mask_grid is None:
+            _LOGGER.warning(
+                "Grid of mask %s unknown; resizing it to the fitting volume "
+                "by shape",
+                mask_path,
+            )
 
     # Cache the fitting-resolution volume on local disk and read it back. It
     # feeds several independent compute() calls below (mask artifacts, global
@@ -908,6 +1011,8 @@ def flatfield_fitting(
             tile_name=tile_name,
             results_dir=results_dir,
             raw_low_res=raw_low_res,
+            initial_mask_grid=initial_mask_grid,
+            fitting_grid=fitting_grid,
         )
     else:
         _LOGGER.info(
@@ -917,11 +1022,35 @@ def flatfield_fitting(
         _LOGGER.warning(f"mask_artifacts is None. Skipping correction for tile {tile_name}")
         return full_res, None, None
 
+    shared_mask = mask_artifacts.mask_low_res.compute()
+    mask_chunks = array_chunks(mask_artifacts.mask_low_res)
+    if shared_mask.shape != tuple(low_res.shape):
+        # The mask was made on another channel's fitting grid, and this channel
+        # is sampled differently (e.g. 561 at an 8 um z step next to 488 at
+        # 2 um). Map it by physical position; the channels' stacks can cover
+        # different z ranges, so a resize by shape would misplace it.
+        if mask_artifacts.grid is None or fitting_grid is None:
+            raise ValueError(
+                f"Shared mask has shape {shared_mask.shape} but the fitting "
+                f"volume of {tile_name} has shape {tuple(low_res.shape)}, and "
+                "the OME scale metadata needed to map it is missing."
+            )
+        _LOGGER.info(
+            "Mapping the shared mask %s onto the fitting grid %s of %s by "
+            "physical position",
+            shared_mask.shape,
+            tuple(low_res.shape),
+            tile_name,
+        )
+        shared_mask = resample_mask_to_grid(
+            shared_mask, mask_artifacts.grid, tuple(low_res.shape), fitting_grid
+        )
+        mask_chunks = array_chunks(low_res)
     mask_np = _exclude_background_slices_from_mask(
-        mask_artifacts.mask_low_res.compute(),
+        shared_mask,
         bkg_slice_indices,
     )
-    mask_chunks = array_chunks(mask_artifacts.mask_low_res)
+    del shared_mask
     if results_dir is not None:
         mask_cache_path = _filtered_mask_cache_path(results_dir, tile_name)
         _save_local_zarr(str(mask_cache_path), mask_np, mask_chunks)
@@ -1327,6 +1456,7 @@ def process_tile(
                         max_chunks_per_block=args.max_chunks_per_block,
                         mask_shards=mask_shards,
                         probability_shards=probability_shards,
+                        tile_paths=args.tile_paths,
                     )
                 else:
                     _LOGGER.error(f"Invalid method: {method}")
