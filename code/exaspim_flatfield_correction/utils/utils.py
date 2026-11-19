@@ -445,6 +445,18 @@ def chunks_2d(arr: da.Array) -> tuple[int, ...]:
 def load_mask_from_dir(mask_dir: str, tile_name: str) -> np.ndarray:
     """Load the binary mask that corresponds to ``tile_name``.
 
+    See :func:`find_mask_file` for how the file is chosen.
+    """
+    return tifffile.imread(find_mask_file(mask_dir, tile_name))
+
+
+def find_mask_file(mask_dir: str, tile_name: str) -> str:
+    """Path of the mask file that corresponds to ``tile_name``.
+
+    The match ignores the channel, so a tile's channels share the mask that
+    Mask Gen made from its inference channel; that channel stays in the file
+    name.
+
     Parameters
     ----------
     mask_dir : str
@@ -454,8 +466,8 @@ def load_mask_from_dir(mask_dir: str, tile_name: str) -> np.ndarray:
 
     Returns
     -------
-    numpy.ndarray
-        Mask stored on disk with shape compatible with the tile.
+    str
+        Path of the mask file.
 
     Raises
     ------
@@ -506,7 +518,7 @@ def load_mask_from_dir(mask_dir: str, tile_name: str) -> np.ndarray:
     if matches:
         maskp = sorted(matches)[0]  # deterministic choice if multiples exist
         _LOGGER.info(f"Found mask file: {maskp}")
-        return tifffile.imread(maskp)
+        return maskp
     raise FileNotFoundError(f"No mask file found for tile: {tile_name}")
 
 
